@@ -67,20 +67,18 @@ async function handleFetch(request, env, ctx) {
     }
 
     // ── 원본 자동 감지 ───────────────────────
-    const resolved = await resolveOrigin(request, url, env);
-    const origin   = resolved.origin;
+    const resolved          = await resolveOrigin(request, url, env);
+    const origin            = resolved.origin;
+    const canonicalCustomHost = resolved.canonicalCustomHost;
     if (!origin) {
-      // 자동 감지가 실패해도 사용자에게는 절대 502/에러 화면을 보여주지 않는다.
-      // 200 OK로 조용한 안내 페이지를 띄워, 사이트 자체는 "다운"으로 보이지
-      // 않게 하고, 운영자만 알아볼 수 있는 설정 안내를 본문에 남긴다.
       return buildSetupNoticeResponse(resolved.debug || []);
     }
 
     // ── 1. 정적 자산 / Feed → 원본 직통 ─────
     if (isPassthrough(path, url)) {
       try {
-        const resp = await proxyToOrigin(request, url, origin);
-        const sanitized = await sanitizeOriginResponse(resp, url, origin);
+        const resp = await proxyToOrigin(request, url, origin, canonicalCustomHost);
+        const sanitized = await sanitizeOriginResponse(resp, url, origin, canonicalCustomHost);
         if (sanitized.status >= 500) {
           return buildSetupNoticeResponse(['원본 응답 5xx (passthrough): ' + sanitized.status]);
         }
@@ -107,8 +105,8 @@ async function handleFetch(request, env, ctx) {
     // ── 4. Blogspot 원본 직접 Fetch ─────────
     let originResp;
     try {
-      const rawOriginResp = await proxyToOrigin(request, url, origin);
-      originResp = await sanitizeOriginResponse(rawOriginResp, url, origin);
+      const rawOriginResp = await proxyToOrigin(request, url, origin, canonicalCustomHost);
+      originResp = await sanitizeOriginResponse(rawOriginResp, url, origin, canonicalCustomHost);
     } catch (e) {
       // 원본(Blogger) 네트워크 장애 등 — 사용자에게 502 대신 안내 페이지
       return buildSetupNoticeResponse(['원본 fetch 예외: ' + e.message]);
@@ -193,91 +191,111 @@ ${debugComment}
 // ─────────────────────────────────────────────
 // Blogspot 원본 자동 감지
 // ─────────────────────────────────────────────
+// 반환값: { origin, canonicalCustomHost, debug }
+//   origin              — "https://xxxx.blogspot.com"
+//   canonicalCustomHost — Blogger에 등록된 정식 커스텀 호스트
+//                         (예: "www.jiwunin.co.kr", "blog.example.com")
+//                         설정/감지 안 되면 요청 호스트 그대로
 async function resolveOrigin(request, url, env) {
   const debug      = [];
   const customHost = url.hostname;
   const kvKey      = originKvKey(customHost);
+  const kvHostKey  = originKvKey(customHost) + ':host';
 
   // 0) BLOGSPOT_ORIGIN 환경 변수 / secret 확인
-  //    · vars(평문) 또는 `wrangler secret put BLOGSPOT_ORIGIN` 어느 쪽이든
-  //      런타임에 env.BLOGSPOT_ORIGIN 으로 동일하게 접근됩니다.
-  //    · 값 형식:
-  //        단일  → "xxxx.blogspot.com"
-  //        다중  → JSON 객체 문자열
-  //                {"내도메인1.com":"aaa.blogspot.com","내도메인2.com":"bbb.blogspot.com"}
+  //
+  //  형식 A — 단일 blogspot 주소:
+  //    "xxxx.blogspot.com"
+  //
+  //  형식 B — 다중 도메인, 단순 매핑:
+  //    {"jiwunin.co.kr":"aaa.blogspot.com"}
+  //
+  //  형식 C — 다중 도메인, 정식 커스텀 호스트 명시 (권장):
+  //    {"jiwunin.co.kr":{"blogspot":"aaa.blogspot.com","host":"www.jiwunin.co.kr"}}
+  //    host = Blogger 설정에 등록된 정식 커스텀 도메인 (루트도메인 리다이렉트 방지)
   const configured = (env.BLOGSPOT_ORIGIN || '').trim();
   if (configured) {
-    // 다중 도메인 JSON 파싱 시도
     if (configured.startsWith('{')) {
       try {
-        const map = JSON.parse(configured);
-        // 현재 요청의 커스텀 호스트와 매핑된 blogspot origin 찾기
-        const raw = map[customHost] || '';
-        if (raw) {
-          const normalized = normalizeBlogspotOrigin(raw);
-          if (normalized) {
-            try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
-            return { origin: normalized, debug };
+        const map   = JSON.parse(configured);
+        const entry = map[customHost];
+        if (entry) {
+          // 형식 C: {blogspot, host}
+          if (typeof entry === 'object' && entry.blogspot) {
+            const normalized    = normalizeBlogspotOrigin(entry.blogspot);
+            const canonicalHost = (entry.host || customHost).replace(/^https?:\/\//, '').split('/')[0];
+            if (normalized) {
+              try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
+              try { await env.SLUG_KV.put(kvHostKey, canonicalHost); } catch (_) {}
+              return { origin: normalized, canonicalCustomHost: canonicalHost, debug };
+            }
+            debug.push(`JSON 형식C: blogspot 값 오류: "${entry.blogspot}"`);
           }
-          debug.push(`BLOGSPOT_ORIGIN JSON: "${customHost}" 매핑 값이 올바르지 않음: "${raw}"`);
+          // 형식 B: 단순 문자열
+          if (typeof entry === 'string') {
+            const normalized = normalizeBlogspotOrigin(entry);
+            if (normalized) {
+              try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
+              return { origin: normalized, canonicalCustomHost: customHost, debug };
+            }
+            debug.push(`JSON 형식B: 값 오류: "${entry}"`);
+          }
         } else {
-          // JSON에 이 도메인 키가 없으면 자동 감지로 진행
-          debug.push(`BLOGSPOT_ORIGIN JSON: "${customHost}" 에 대한 매핑 없음 — 자동 감지 시도`);
+          debug.push(`BLOGSPOT_ORIGIN JSON: "${customHost}" 키 없음 — 자동 감지 시도`);
         }
       } catch (e) {
-        debug.push('BLOGSPOT_ORIGIN JSON 파싱 실패: ' + e.message + ' (값: ' + configured.slice(0, 100) + ')');
+        debug.push('BLOGSPOT_ORIGIN JSON 파싱 실패: ' + e.message);
       }
     } else {
-      // 단일 문자열 형식 — 모든 도메인에 공통 적용
+      // 형식 A: 단일 문자열
       const normalized = normalizeBlogspotOrigin(configured);
       if (normalized) {
         try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
-        return { origin: normalized, debug };
+        return { origin: normalized, canonicalCustomHost: customHost, debug };
       }
-      debug.push('BLOGSPOT_ORIGIN 값이 올바르지 않음: "' + configured + '" (예: xxxx.blogspot.com 또는 https://xxxx.blogspot.com)');
+      debug.push('BLOGSPOT_ORIGIN 값 오류: "' + configured + '"');
     }
   }
 
-  // 1) KV 캐시 확인 — 도메인별 키 사용 (가장 빠른 경로, 이후 모든 요청은 여기서 끝남)
+  // 1) KV 캐시 확인 — 도메인별 키 사용
   try {
-    const cached = await env.SLUG_KV.get(kvKey);
-    if (cached) return { origin: cached, debug };
+    const cached     = await env.SLUG_KV.get(kvKey);
+    const cachedHost = await env.SLUG_KV.get(kvHostKey);
+    if (cached) return { origin: cached, canonicalCustomHost: cachedHost || customHost, debug };
   } catch (e) { debug.push('KV get 실패: ' + e.message); }
 
-  // 2) 커스텀 도메인 자신에게 직접 요청 (X-Origin-Probe 헤더로 무한 루프 방지).
-  //    같은 zone에서 이 워커로 라우팅되어 있다면 위쪽 프로브 가드가 즉시
-  //    502를 돌려주므로 안전하게 "자기 호출이었다"고 판별하고 다음 단계로 넘어간다.
+  // 2) 커스텀 도메인 자신에게 직접 요청
   try {
     const r = await detectFromSelf(customHost);
     if (r.origin) {
       await env.SLUG_KV.put(kvKey, r.origin);
-      return { origin: r.origin, debug };
+      return { origin: r.origin, canonicalCustomHost: customHost, debug };
     }
     debug.push('Self: ' + r.reason);
   } catch (e) { debug.push('Self 예외: ' + e.message); }
 
-  // 3) Blogger 공식 API (byurl) — API 키 없으면 403으로 실패함 (참고용 백업)
+  // 3) Blogger 공식 API (byurl)
   try {
     const r = await detectFromBloggerApi(customHost);
     if (r.origin) {
       await env.SLUG_KV.put(kvKey, r.origin);
-      return { origin: r.origin, debug };
+      return { origin: r.origin, canonicalCustomHost: customHost, debug };
     }
     debug.push('BloggerAPI: ' + r.reason);
   } catch (e) { debug.push('BloggerAPI 예외: ' + e.message); }
 
-  // 4) ghs.google.com — Cloudflare 환경에서 막히는 경우가 많음 (참고용 백업)
+  // 4) ghs.google.com
   try {
     const r = await detectFromGhs(customHost);
     if (r.origin) {
       await env.SLUG_KV.put(kvKey, r.origin);
-      return { origin: r.origin, debug };
+      return { origin: r.origin, canonicalCustomHost: customHost, debug };
     }
     debug.push('GHS: ' + r.reason);
   } catch (e) { debug.push('GHS 예외: ' + e.message); }
 
-  debug.push('해결: BLOGSPOT_ORIGIN secret/vars 설정 방법은 wrangler.toml 주석 참고.');
-  return { origin: null, debug };
+  debug.push('해결: BLOGSPOT_ORIGIN secret 설정 방법은 wrangler.toml 주석 참고.');
+  return { origin: null, canonicalCustomHost: customHost, debug };
 }
 
 // customHost로 직접 요청해서, 응답 안에서 실제 blogspot.com 참조를 찾는다.
@@ -513,21 +531,21 @@ function extractBlogspotOriginFromContent(content) {
 // 브라우저가 그쪽으로 이동해버린다.
 // 해결: Host 헤더는 원래 커스텀 도메인(request의 Host)을 그대로 유지한 채,
 // 실제 네트워크 연결만 blogspot.com(origin)으로 보낸다.
-function proxyToOrigin(request, url, origin) {
-  // ?m=1 / ?m=0 파라미터 제거:
-  // Blogger가 모바일 감지용으로 붙이는 ?m=1 을 그대로 upstream에 보내면
-  // "이 블로그는 www.xxx.com 으로 이동했습니다" 리디렉션 경고 페이지가 반환된다.
-  // 워커가 이미 공통 HTML을 최적화해 서빙하므로 upstream 전송 전에 항상 제거한다.
+// proxyToOrigin: Blogger 백엔드로 요청 전달
+// canonicalCustomHost = Blogger에 등록된 정식 커스텀 호스트
+//   (예: "www.jiwunin.co.kr", "blog.example.com")
+// 요청자가 어떤 도메인으로 왔든 Blogger에는 정식 호스트를 Host 헤더로 보낸다.
+// 그래야 Blogger가 "이 도메인 모름 → 정식 도메인으로 리다이렉트" 루프를 안 만든다.
+function proxyToOrigin(request, url, origin, canonicalCustomHost) {
+  // ?m=1 / ?m=0 파라미터 제거
   const cleanedParams = new URLSearchParams(url.search);
   cleanedParams.delete('m');
   const cleanedSearch = cleanedParams.toString() ? '?' + cleanedParams.toString() : '';
 
   const targetUrl   = origin + url.pathname + cleanedSearch;
   const headers     = new Headers(request.headers);
-  const customHost  = url.hostname; // 사용자의 실제(커스텀) 도메인
-
-  // Host는 커스텀 도메인 그대로 — blogspot.com으로 절대 덮어쓰지 않는다.
-  headers.set('host', customHost);
+  // Blogger가 인식하는 정식 호스트 사용 (설정된 canonicalCustomHost 우선)
+  headers.set('host', canonicalCustomHost || url.hostname);
   headers.delete('cf-connecting-ip');
   headers.delete('cf-ipcountry');
   headers.delete('cf-ray');
@@ -537,8 +555,6 @@ function proxyToOrigin(request, url, origin) {
     method:   request.method,
     headers,
     body:     ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
-    // 원본에서 리다이렉트가 오더라도 우리가 직접 처리(아래 originResp 검사)하도록
-    // manual로 받아서, blogspot.com으로의 리다이렉트를 그대로 흘려보내지 않는다.
     redirect: 'manual',
   });
 }
@@ -552,16 +568,17 @@ function proxyToOrigin(request, url, origin) {
 // 워커가 직접 최대 5단계까지 리다이렉트를 추적해 최종 응답을 가져온다.
 // 단, 최종 목적지가 완전히 다른 외부 도메인(blogspot도 커스텀도 아닌 곳)이면
 // 그때만 브라우저에 리다이렉트를 넘긴다.
-async function sanitizeOriginResponse(resp, url, origin) {
+async function sanitizeOriginResponse(resp, url, origin, canonicalCustomHost) {
   const customHost = url.host;
   const originHost = (() => { try { return new URL(origin).host; } catch(_) { return ''; } })();
+  const bloggerHost = canonicalCustomHost || customHost;
 
   let current = resp;
   let currentUrl = url.toString();
 
   for (let i = 0; i < 5; i++) {
     const status = current.status;
-    if (status < 300 || status >= 400) break; // 3xx 아니면 그대로 반환
+    if (status < 300 || status >= 400) break;
 
     const location = current.headers.get('location') || '';
     if (!location) break;
@@ -572,7 +589,7 @@ async function sanitizeOriginResponse(resp, url, origin) {
     const nextHost = (() => { try { return new URL(nextUrl).host; } catch(_) { return ''; } })();
 
     // 완전히 외부 도메인이면 브라우저에 리다이렉트 위임
-    if (nextHost !== customHost && nextHost !== originHost) {
+    if (nextHost !== customHost && nextHost !== originHost && nextHost !== bloggerHost) {
       const h = new Headers(current.headers);
       h.set('location', nextUrl);
       return new Response(null, { status, headers: h });
@@ -583,15 +600,16 @@ async function sanitizeOriginResponse(resp, url, origin) {
       return buildSetupNoticeResponse(['자기참조 리다이렉트 감지: ' + nextUrl]);
     }
 
-    // 커스텀 도메인 또는 blogspot 도메인으로의 리다이렉트 → 워커가 직접 따라감
-    // ?m= 파라미터도 제거하면서 fetch
+    // 커스텀/blogspot 도메인 리다이렉트 → 워커가 직접 따라감, ?m= 제거
     const nextUrlObj = new URL(nextUrl);
     nextUrlObj.searchParams.delete('m');
     const targetUrl = origin + nextUrlObj.pathname + (nextUrlObj.search || '');
 
     try {
-      const headers = new Headers(url && url._reqHeaders ? url._reqHeaders : {});
-      headers.set('host', customHost);
+      const headers = new Headers();
+      // Blogger 정식 호스트로 요청 — 리다이렉트 루프 방지
+      headers.set('host', bloggerHost);
+      headers.set('user-agent', 'Mozilla/5.0');
       headers.delete('cf-connecting-ip');
       headers.delete('cf-ipcountry');
       headers.delete('cf-ray');
