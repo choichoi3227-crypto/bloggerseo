@@ -91,6 +91,23 @@ export default {
 async function resolveOrigin(url, env) {
   const debug = [];
 
+  // 0) wrangler.toml의 vars에 BLOGSPOT_ORIGIN을 직접 지정한 경우.
+  //    Blogger byurl API는 API 키 없이는 403으로 막혀 있고, ghs.google.com은
+  //    Cloudflare 엣지에서 SNI/Host 불일치로 TLS 단계(525)에서 막힌다.
+  //    즉 "키 없이 완전 자동 감지"는 구조적으로 불가능하므로, 이 경로가
+  //    사실상 유일하게 100% 신뢰할 수 있는 방법이다. 한 번만 입력해두면
+  //    이후 모든 요청에서 즉시 사용된다(추가 fetch 없음, 가장 빠름).
+  const configured = (env.BLOGSPOT_ORIGIN || '').trim();
+  if (configured) {
+    const normalized = normalizeBlogspotOrigin(configured);
+    if (normalized) {
+      // KV에도 동기화해두면 wrangler.toml을 바꿔도 캐시 일관성 유지
+      try { await env.SLUG_KV.put(ORIGIN_KV_KEY, normalized); } catch (_) {}
+      return { origin: normalized, debug };
+    }
+    debug.push('BLOGSPOT_ORIGIN 값이 올바르지 않음: "' + configured + '" (예: xxxx.blogspot.com 또는 https://xxxx.blogspot.com)');
+  }
+
   // 1) KV 캐시 확인 (가장 빠른 경로, 이후 모든 요청은 여기서 끝남)
   try {
     const cached = await env.SLUG_KV.get(ORIGIN_KV_KEY);
@@ -99,7 +116,7 @@ async function resolveOrigin(url, env) {
 
   const customHost = url.hostname;
 
-  // 2) Blogger 공식 API (byurl)
+  // 2) Blogger 공식 API (byurl) — API 키 없으면 403으로 실패함 (참고용 백업)
   try {
     const r = await detectFromBloggerApi(customHost);
     if (r.origin) {
@@ -109,7 +126,7 @@ async function resolveOrigin(url, env) {
     debug.push('BloggerAPI: ' + r.reason);
   } catch (e) { debug.push('BloggerAPI 예외: ' + e.message); }
 
-  // 3) ghs.google.com
+  // 3) ghs.google.com — Cloudflare 환경에서 TLS 단계(525)로 막히는 경우가 많음 (참고용 백업)
   try {
     const r = await detectFromGhs(customHost);
     if (r.origin) {
@@ -119,7 +136,20 @@ async function resolveOrigin(url, env) {
     debug.push('GHS: ' + r.reason);
   } catch (e) { debug.push('GHS 예외: ' + e.message); }
 
+  debug.push('해결: wrangler.toml [vars]에 BLOGSPOT_ORIGIN = "xxxx.blogspot.com" 을 추가하고 재배포하세요.');
   return { origin: null, debug };
+}
+
+// "xxxx.blogspot.com", "https://xxxx.blogspot.com", "https://xxxx.blogspot.com/" 등
+// 다양한 입력 형태를 'https://xxxx.blogspot.com' 형태로 정규화.
+function normalizeBlogspotOrigin(value) {
+  let v = value.trim();
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+  try {
+    const host = new URL(v).hostname;
+    if (/^[a-zA-Z0-9-]+\.blogspot\.com$/i.test(host)) return 'https://' + host;
+  } catch (_) {}
+  return null;
 }
 
 // Blogger 공식 API로 커스텀 도메인이 연결된 실제 blogspot.com 블로그를 조회.
@@ -144,10 +174,17 @@ async function detectFromBloggerApi(customHost) {
 }
 
 // ghs.google.com에 Host 헤더로 요청해서 실제 매핑된 blogspot 호스트를 찾는다.
+// 중요: HTTPS로 시도하면 SNI가 ghs.google.com인데 Host 헤더는 customHost라서
+// Cloudflare 엣지에서 SNI/Host 불일치로 TLS 핸드셰이크 자체가 거부되어
+// 525(SSL handshake failed)가 난다. HTTP(평문, 80번 포트)는 TLS 단계가 없어
+// 이 문제를 피할 수 있다 — Blogger 커스텀 도메인 CNAME 설정 자체가 원래
+// ghs.google.com으로의 평문 HTTP 요청을 전제로 하던 방식이라 호환된다.
 async function detectFromGhs(customHost) {
   let lastReason = '';
+
+  // 1) HTTP, manual redirect: Location 헤더에서 추출 (TLS 문제 없음)
   try {
-    const resp = await fetch('https://ghs.google.com/', {
+    const resp = await fetch('http://ghs.google.com/', {
       method:   'GET',
       redirect: 'manual',
       headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
@@ -155,13 +192,14 @@ async function detectFromGhs(customHost) {
     const location = resp.headers.get('location') || '';
     const m = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
     if (m) return { origin: 'https://' + m[1], reason: null };
-    lastReason = `manual status=${resp.status} location="${location}"`;
+    lastReason = `http manual status=${resp.status} location="${location}"`;
   } catch (e) {
-    lastReason = 'manual fetch 예외: ' + e.message;
+    lastReason = 'http manual fetch 예외: ' + e.message;
   }
 
+  // 2) HTTP, follow redirect: 최종 HTML 본문에서 추출
   try {
-    const resp = await fetch('https://ghs.google.com/', {
+    const resp = await fetch('http://ghs.google.com/', {
       method:   'GET',
       redirect: 'follow',
       headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
@@ -173,9 +211,24 @@ async function detectFromGhs(customHost) {
     const html = await resp.text();
     const origin = extractBlogspotOriginFromContent(html);
     if (origin) return { origin, reason: null };
-    lastReason += ` | follow status=${resp.status} finalUrl=${resp.url} bodyLen=${html.length}`;
+    lastReason += ` | http follow status=${resp.status} finalUrl=${resp.url} bodyLen=${html.length}`;
   } catch (e) {
-    lastReason += ' | follow fetch 예외: ' + e.message;
+    lastReason += ' | http follow fetch 예외: ' + e.message;
+  }
+
+  // 3) HTTPS 백업 (환경에 따라 525로 막힐 수 있음 — 그래도 시도는 해본다)
+  try {
+    const resp = await fetch('https://ghs.google.com/', {
+      method:   'GET',
+      redirect: 'manual',
+      headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
+    });
+    const location = resp.headers.get('location') || '';
+    const m = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
+    if (m) return { origin: 'https://' + m[1], reason: null };
+    lastReason += ` | https manual status=${resp.status} location="${location}"`;
+  } catch (e) {
+    lastReason += ' | https manual fetch 예외: ' + e.message;
   }
 
   return { origin: null, reason: lastReason };
