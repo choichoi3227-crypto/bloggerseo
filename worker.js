@@ -92,12 +92,11 @@ async function resolveOrigin(url, env) {
 
   const customHost = url.hostname;
 
-  // 2) 커스텀 도메인 자신에게 직접 요청 → 응답 HTML/헤더에서
-  //    "이 도메인이 실제로 연결된" blogspot.com 호스트를 역추적.
-  //    절대 도메인명을 추측하지 않고, 항상 응답 안에 실제로 박혀있는
-  //    참조(canonical, feed 링크, EditURI 등)만 사용한다.
+  // 2) Blogger 공식 API (byurl) — 가장 정확하고 신뢰도 높은 방법.
+  //    이 API는 "이 URL이 어떤 Blogger 블로그에 연결되어 있는지"를
+  //    Google이 직접 답해주므로 추측이나 자기 호출 위험이 전혀 없다.
   try {
-    const origin = await detectFromSelf(customHost);
+    const origin = await detectFromBloggerApi(customHost);
     if (origin) {
       await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
       return origin;
@@ -105,8 +104,7 @@ async function resolveOrigin(url, env) {
   } catch (_) {}
 
   // 3) ghs.google.com에 현재 Host로 직접 요청 (Blogger 커스텀 도메인 서빙 서버)
-  //    여기서 나오는 Location/HTML도 "이 customHost에 대한" 응답이므로
-  //    추측이 아니라 실제 매핑 결과다.
+  //    Blogger API가 막혀 있거나 실패할 경우의 백업 경로.
   try {
     const origin = await detectFromGhs(customHost);
     if (origin) {
@@ -121,32 +119,22 @@ async function resolveOrigin(url, env) {
   return null;
 }
 
-// customHost로 직접 요청해서, 응답 안에서 실제 blogspot.com 참조를 찾는다.
-async function detectFromSelf(customHost) {
-  const targetUrls = [
-    'https://' + customHost + '/',
-    'https://' + customHost + '/feeds/posts/default?alt=json&max-results=1',
-  ];
-
-  for (const targetUrl of targetUrls) {
-    try {
-      const resp = await fetch(targetUrl, {
-        method:   'GET',
-        redirect: 'follow',
-        headers:  { 'user-agent': 'Mozilla/5.0' },
-      });
-
-      // 리다이렉트가 blogspot.com으로 끝났다면 그게 바로 원본
-      try {
-        const finalHost = new URL(resp.url).hostname;
-        if (/\.blogspot\.com$/i.test(finalHost)) return 'https://' + finalHost;
-      } catch (_) {}
-
-      const text = await resp.text();
-      const origin = extractBlogspotOriginFromContent(text);
-      if (origin) return origin;
-    } catch (_) {}
-  }
+// Blogger 공식 API로 커스텀 도메인이 연결된 실제 blogspot.com 블로그를 조회.
+// 주의: 절대 customHost 자신에게 직접 fetch하지 않는다 — 그렇게 하면 이
+// 요청이 워커 자신에게 다시 들어와 무한 재귀/타임아웃이 발생한다.
+// googleapis.com은 별도 도메인이므로 안전하다.
+async function detectFromBloggerApi(customHost) {
+  const apiUrl = 'https://www.googleapis.com/blogger/v3/blogs/byurl?url='
+    + encodeURIComponent('https://' + customHost + '/');
+  try {
+    const resp = await fetch(apiUrl, { headers: { 'user-agent': 'Mozilla/5.0' } });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const blogUrl = data && data.url;
+    if (!blogUrl) return null;
+    const host = new URL(blogUrl).hostname;
+    if (/\.blogspot\.com$/i.test(host)) return 'https://' + host;
+  } catch (_) {}
   return null;
 }
 
