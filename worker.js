@@ -90,7 +90,7 @@ async function resolveOrigin(url, env) {
       headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
     });
     const location = resp.headers.get('location') || '';
-    const m = location.match(/https?://([a-zA-Z0-9-]+.blogspot.com)/);
+    const m = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/);
     if (m) {
       const origin = 'https://' + m[1];
       await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
@@ -106,7 +106,7 @@ async function resolveOrigin(url, env) {
       headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
     });
     const html = await resp.text();
-    const m    = html.match(/https?://([a-zA-Z0-9-]+.blogspot.com)/);
+    const m    = html.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/);
     if (m) {
       const origin = 'https://' + m[1];
       await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
@@ -116,7 +116,7 @@ async function resolveOrigin(url, env) {
 
   // 4) 최후 fallback: 도메인명으로 blogspot 서브도메인 추정
   try {
-    const subdomain = customHost.replace(/^www./, '').split('.')[0];
+    const subdomain = customHost.replace(/^www\./, '').split('.')[0];
     if (subdomain) {
       const guessed = 'https://' + subdomain + '.blogspot.com';
       const check   = await fetch(guessed + '/', { method: 'HEAD', redirect: 'manual' });
