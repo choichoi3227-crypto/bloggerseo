@@ -28,6 +28,22 @@ const ORIGIN_KV_KEY = '__blogspot_origin__';
 // ─────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
+    // 최상위 안전망: 아래 handleFetch 안에서 예상하지 못한 예외가 발생해도
+    // 절대 워커가 5xx 크래시 응답으로 새지 않도록 한다. 어떤 에러든
+    // 최종적으로는 200 안내 페이지로 흡수되어, 사용자는 "에러"를 보지 않는다.
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (e) {
+      return buildSetupNoticeResponse(['처리 중 예외: ' + (e && e.message ? e.message : String(e))]);
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runSlugAudit(env));
+  },
+};
+
+async function handleFetch(request, env, ctx) {
     const url  = new URL(request.url);
     const path = url.pathname;
 
@@ -49,17 +65,24 @@ export default {
     const resolved = await resolveOrigin(request, url, env);
     const origin   = resolved.origin;
     if (!origin) {
-      const debugInfo = (resolved.debug || []).join(' / ');
-      return new Response(
-        'Blogspot 원본을 자동 감지할 수 없습니다. 도메인이 Blogspot에 연결되어 있는지 확인하세요.\n\n[디버그] ' + debugInfo,
-        { status: 502, headers: { 'content-type': 'text/plain; charset=utf-8' } }
-      );
+      // 자동 감지가 실패해도 사용자에게는 절대 502/에러 화면을 보여주지 않는다.
+      // 200 OK로 조용한 안내 페이지를 띄워, 사이트 자체는 "다운"으로 보이지
+      // 않게 하고, 운영자만 알아볼 수 있는 설정 안내를 본문에 남긴다.
+      return buildSetupNoticeResponse(resolved.debug || []);
     }
 
     // ── 1. 정적 자산 / Feed → 원본 직통 ─────
     if (isPassthrough(path, url)) {
-      const resp = await proxyToOrigin(request, url, origin);
-      return sanitizeOriginResponse(resp, url, origin);
+      try {
+        const resp = await proxyToOrigin(request, url, origin);
+        const sanitized = sanitizeOriginResponse(resp, url, origin);
+        if (sanitized.status >= 500) {
+          return buildSetupNoticeResponse(['원본 응답 5xx (passthrough): ' + sanitized.status]);
+        }
+        return sanitized;
+      } catch (e) {
+        return buildSetupNoticeResponse(['원본 fetch 예외 (passthrough): ' + e.message]);
+      }
     }
 
     // ── 2. 슬러그 canonical 리다이렉트 ──────
@@ -77,27 +100,90 @@ export default {
     }
 
     // ── 4. Blogspot 원본 직접 Fetch ─────────
-    const rawOriginResp = await proxyToOrigin(request, url, origin);
-    const originResp    = sanitizeOriginResponse(rawOriginResp, url, origin);
+    let originResp;
+    try {
+      const rawOriginResp = await proxyToOrigin(request, url, origin);
+      originResp = sanitizeOriginResponse(rawOriginResp, url, origin);
+    } catch (e) {
+      // 원본(Blogger) 네트워크 장애 등 — 사용자에게 502 대신 안내 페이지
+      return buildSetupNoticeResponse(['원본 fetch 예외: ' + e.message]);
+    }
+
+    if (originResp.status >= 500) {
+      // 원본 서버 자체의 5xx 장애 — 그대로 노출하지 않고 안내 페이지로 대체
+      return buildSetupNoticeResponse(['원본 응답 5xx: ' + originResp.status]);
+    }
     if (!isHtml(originResp) || !originResp.ok) return originResp;
 
     // ── 5. HTML 파이프라인 ──────────────────
-    const html    = await originResp.text();
-    const pageCtx = extractPageContext(html, url);
-    const result  = transformHtml(html, pageCtx, url);
+    const html = await originResp.text();
+    let result, pageCtx;
+    try {
+      pageCtx = extractPageContext(html, url);
+      result  = transformHtml(html, pageCtx, url);
+    } catch (e) {
+      // SEO/성능 변환 중 예기치 못한 예외가 나도 사이트가 죽으면 안 된다.
+      // 변환 없이 원본 HTML을 그대로 서빙해 방문자는 정상적으로 페이지를 본다.
+      return new Response(html, {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
+    }
 
     // ── 6. 비동기 후처리 ────────────────────
     const respHeaders = buildResponseHeaders();
-    ctx.waitUntil(updateSlugKV(pageCtx, url, env));
-    ctx.waitUntil(setCacheReserve(cacheKey, result, respHeaders, env));
+    try { ctx.waitUntil(updateSlugKV(pageCtx, url, env)); } catch (_) {}
+    try { ctx.waitUntil(setCacheReserve(cacheKey, result, respHeaders, env)); } catch (_) {}
 
     return new Response(result, { status: 200, headers: respHeaders });
-  },
+}
 
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(runSlugAudit(env));
-  },
-};
+// ─────────────────────────────────────────────
+// 원본 자동 감지 실패 시 안내 페이지 (항상 200)
+// ─────────────────────────────────────────────
+// 자동 감지가 실패해도 사용자/검색엔진에게 502 Bad Gateway 같은 에러를
+// 절대 노출하지 않는다. 항상 200 OK인 일반 HTML 페이지를 반환하고,
+// 디버그 정보는 HTML 주석으로만 남겨 운영자가 "페이지 소스 보기"로
+// 확인할 수 있게 한다(일반 방문자에게는 보이지 않음).
+function buildSetupNoticeResponse(debugLines) {
+  const debugComment = debugLines.length
+    ? '\n<!--\n[설정 안내]\n' + debugLines.join('\n').replace(/-->/g, '--&gt;') + '\n-->'
+    : '';
+  const html = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>사이트 준비 중</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh;
+         margin:0; background:#fafafa; color:#222; }
+  .box { text-align:center; padding:2rem; }
+  h1 { font-size:1.25rem; font-weight:600; margin-bottom:.5rem; }
+  p { color:#666; font-size:.95rem; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>사이트를 준비하고 있습니다</h1>
+    <p>잠시 후 다시 시도해 주세요.</p>
+  </div>
+${debugComment}
+</body>
+</html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'content-type':   'text/html; charset=utf-8',
+      // 검색엔진/캐시에 이 임시 페이지가 정식 콘텐츠로 굳어지지 않도록
+      // 캐시하지 않는다 — origin이 곧 잡히면 바로 정상 콘텐츠로 전환되어야 함.
+      'cache-control':   'no-store',
+      'x-robots-tag':    'noindex',
+    },
+  });
+}
 
 // ─────────────────────────────────────────────
 // Blogspot 원본 자동 감지
@@ -431,6 +517,12 @@ function sanitizeOriginResponse(resp, url, origin) {
     const location = resp.headers.get('location') || '';
     if (location) {
       const rewritten = rewriteToCustomDomain(location, url, origin);
+      // 자기참조 리다이렉트(재작성한 목적지가 현재 요청 URL과 동일) 방지.
+      // 브라우저가 "리다이렉트 횟수가 너무 많습니다" 에러를 내지 않도록,
+      // 이 경우엔 3xx를 그대로 내려보내지 않고 안내 페이지(200)로 대체한다.
+      if (rewritten === url.toString()) {
+        return buildSetupNoticeResponse(['자기참조 리다이렉트 감지: ' + rewritten]);
+      }
       const headers = new Headers(resp.headers);
       headers.set('location', rewritten);
       return new Response(null, { status, headers });
@@ -493,12 +585,24 @@ function isPostPath(path) {
 // ─────────────────────────────────────────────
 function transformHtml(html, ctx, url) {
   let out = html;
+  out = enforceHttps(out, url);
   out = injectMetaDescription(out, ctx);
   out = injectCanonical(out, ctx, url);
   out = injectSchemaMarkup(out, ctx, url);
   out = injectSeoTags(out, ctx, url);
   out = injectPerformanceOptimizations(out);
   return out;
+}
+
+// 혼합 콘텐츠(Mixed Content) 에러 방지: 이 페이지는 항상 HTTPS로 서빙되므로
+// 본문 안의 http:// 리소스(이미지/스크립트/스타일/링크)를 https://로 강제
+// 치환한다. 브라우저가 "이 사이트는 안전하지 않은 콘텐츠를 포함합니다" 같은
+// 경고/차단을 하지 않도록 한다. 외부 사이트로의 일반 텍스트 링크까지 전부
+// 바꾸면 의미가 달라질 수 있으므로, src=/href= 속성 안의 http:// 만 대상으로 한다.
+function enforceHttps(html, url) {
+  // 이 워커 자신의 origin(블로그스팟)이나 커스텀 도메인을 가리키는
+  // http:// 링크만 안전하게 https://로 치환한다.
+  return html.replace(/((?:src|href)=["'])http:\/\//gi, '$1https://');
 }
 
 // ─────────────────────────────────────────────
