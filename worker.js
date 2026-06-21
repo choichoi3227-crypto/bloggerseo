@@ -21,7 +21,12 @@
 
 const CACHE_TTL     = 30 * 60;
 const SLUG_CHECK_MS = 6 * 30 * 24 * 3600 * 1000;
-const ORIGIN_KV_KEY = '__blogspot_origin__';
+
+// 다중 도메인 지원: 커스텀 도메인별로 별도 KV 키 사용
+// 예) "__blogspot_origin__:blog1.example.com"
+function originKvKey(hostname) {
+  return '__blogspot_origin__:' + hostname;
+}
 
 // ─────────────────────────────────────────────
 // 메인 핸들러
@@ -189,37 +194,63 @@ ${debugComment}
 // Blogspot 원본 자동 감지
 // ─────────────────────────────────────────────
 async function resolveOrigin(request, url, env) {
-  const debug = [];
+  const debug      = [];
+  const customHost = url.hostname;
+  const kvKey      = originKvKey(customHost);
 
-  // 0) wrangler.toml의 vars에 BLOGSPOT_ORIGIN을 직접 지정한 경우 (가장 빠르고 확실함)
+  // 0) BLOGSPOT_ORIGIN 환경 변수 / secret 확인
+  //    · vars(평문) 또는 `wrangler secret put BLOGSPOT_ORIGIN` 어느 쪽이든
+  //      런타임에 env.BLOGSPOT_ORIGIN 으로 동일하게 접근됩니다.
+  //    · 값 형식:
+  //        단일  → "xxxx.blogspot.com"
+  //        다중  → JSON 객체 문자열
+  //                {"내도메인1.com":"aaa.blogspot.com","내도메인2.com":"bbb.blogspot.com"}
   const configured = (env.BLOGSPOT_ORIGIN || '').trim();
   if (configured) {
-    const normalized = normalizeBlogspotOrigin(configured);
-    if (normalized) {
-      try { await env.SLUG_KV.put(ORIGIN_KV_KEY, normalized); } catch (_) {}
-      return { origin: normalized, debug };
+    // 다중 도메인 JSON 파싱 시도
+    if (configured.startsWith('{')) {
+      try {
+        const map = JSON.parse(configured);
+        // 현재 요청의 커스텀 호스트와 매핑된 blogspot origin 찾기
+        const raw = map[customHost] || '';
+        if (raw) {
+          const normalized = normalizeBlogspotOrigin(raw);
+          if (normalized) {
+            try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
+            return { origin: normalized, debug };
+          }
+          debug.push(`BLOGSPOT_ORIGIN JSON: "${customHost}" 매핑 값이 올바르지 않음: "${raw}"`);
+        } else {
+          // JSON에 이 도메인 키가 없으면 자동 감지로 진행
+          debug.push(`BLOGSPOT_ORIGIN JSON: "${customHost}" 에 대한 매핑 없음 — 자동 감지 시도`);
+        }
+      } catch (e) {
+        debug.push('BLOGSPOT_ORIGIN JSON 파싱 실패: ' + e.message + ' (값: ' + configured.slice(0, 100) + ')');
+      }
+    } else {
+      // 단일 문자열 형식 — 모든 도메인에 공통 적용
+      const normalized = normalizeBlogspotOrigin(configured);
+      if (normalized) {
+        try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
+        return { origin: normalized, debug };
+      }
+      debug.push('BLOGSPOT_ORIGIN 값이 올바르지 않음: "' + configured + '" (예: xxxx.blogspot.com 또는 https://xxxx.blogspot.com)');
     }
-    debug.push('BLOGSPOT_ORIGIN 값이 올바르지 않음: "' + configured + '" (예: xxxx.blogspot.com 또는 https://xxxx.blogspot.com)');
   }
 
-  // 1) KV 캐시 확인 (가장 빠른 경로, 이후 모든 요청은 여기서 끝남)
+  // 1) KV 캐시 확인 — 도메인별 키 사용 (가장 빠른 경로, 이후 모든 요청은 여기서 끝남)
   try {
-    const cached = await env.SLUG_KV.get(ORIGIN_KV_KEY);
+    const cached = await env.SLUG_KV.get(kvKey);
     if (cached) return { origin: cached, debug };
   } catch (e) { debug.push('KV get 실패: ' + e.message); }
-
-  const customHost = url.hostname;
 
   // 2) 커스텀 도메인 자신에게 직접 요청 (X-Origin-Probe 헤더로 무한 루프 방지).
   //    같은 zone에서 이 워커로 라우팅되어 있다면 위쪽 프로브 가드가 즉시
   //    502를 돌려주므로 안전하게 "자기 호출이었다"고 판별하고 다음 단계로 넘어간다.
-  //    반대로 Blogger가 직접 응답하면(이 도메인이 다른 라우팅을 거치는 경우,
-  //    또는 일부 환경에서 워커 라우팅 전에 오리진으로 먼저 가는 경우) 그 응답
-  //    안에서 실제 blogspot.com 참조를 추출한다.
   try {
     const r = await detectFromSelf(customHost);
     if (r.origin) {
-      await env.SLUG_KV.put(ORIGIN_KV_KEY, r.origin);
+      await env.SLUG_KV.put(kvKey, r.origin);
       return { origin: r.origin, debug };
     }
     debug.push('Self: ' + r.reason);
@@ -229,7 +260,7 @@ async function resolveOrigin(request, url, env) {
   try {
     const r = await detectFromBloggerApi(customHost);
     if (r.origin) {
-      await env.SLUG_KV.put(ORIGIN_KV_KEY, r.origin);
+      await env.SLUG_KV.put(kvKey, r.origin);
       return { origin: r.origin, debug };
     }
     debug.push('BloggerAPI: ' + r.reason);
@@ -239,13 +270,13 @@ async function resolveOrigin(request, url, env) {
   try {
     const r = await detectFromGhs(customHost);
     if (r.origin) {
-      await env.SLUG_KV.put(ORIGIN_KV_KEY, r.origin);
+      await env.SLUG_KV.put(kvKey, r.origin);
       return { origin: r.origin, debug };
     }
     debug.push('GHS: ' + r.reason);
   } catch (e) { debug.push('GHS 예외: ' + e.message); }
 
-  debug.push('해결: wrangler.toml [vars]에 BLOGSPOT_ORIGIN = "xxxx.blogspot.com" 을 추가하고 재배포하세요.');
+  debug.push('해결: BLOGSPOT_ORIGIN secret/vars 설정 방법은 wrangler.toml 주석 참고.');
   return { origin: null, debug };
 }
 
