@@ -166,43 +166,87 @@ async function resolveOrigin(request, url, env) {
 // customHost로 직접 요청해서, 응답 안에서 실제 blogspot.com 참조를 찾는다.
 // X-Origin-Probe 헤더를 반드시 동반하여, 이 요청이 같은 워커로 되돌아올 경우
 // 위쪽 가드가 즉시 502(probe-loop-detected)를 주고 무한 재귀를 끊는다.
+//
+// redirect:'manual'을 사용한다 — 'follow'를 쓰면 fetch가 내부적으로
+// 리다이렉트를 자동으로 계속 따라가다가 무한/과도한 리다이렉트 체인에
+// 걸려 "Too many redirects" 예외로 죽어버릴 수 있다(예: 워커 앞단의
+// www/https 강제 리다이렉트 규칙과 얽히는 경우). manual로 받아서
+// 단계마다 직접 검사하면 최대 5단계로 안전하게 제한할 수 있다.
 async function detectFromSelf(customHost) {
   const targetUrls = [
     'https://' + customHost + '/',
     'https://' + customHost + '/feeds/posts/default?alt=json&max-results=1',
   ];
 
-  for (const targetUrl of targetUrls) {
+  const reasons = [];
+
+  for (const startUrl of targetUrls) {
     try {
-      const resp = await fetch(targetUrl, {
-        method:   'GET',
-        redirect: 'follow',
-        headers:  {
-          'user-agent':      'Mozilla/5.0',
-          'x-origin-probe':  '1',
-        },
-      });
-
-      const text = await resp.text();
-
-      // 워커 자신이 응답한 경우 → 이 경로로는 원본을 알 수 없음, 다음 단계로
-      if (resp.status === 502 && text === 'probe-loop-detected') {
-        return { origin: null, reason: '자기 자신(워커)으로 라우팅됨 — 이 경로로는 감지 불가' };
-      }
-
-      // 리다이렉트가 blogspot.com으로 끝났다면 그게 바로 원본
-      try {
-        const finalHost = new URL(resp.url).hostname;
-        if (/\.blogspot\.com$/i.test(finalHost)) return { origin: 'https://' + finalHost, reason: null };
-      } catch (_) {}
-
-      const origin = extractBlogspotOriginFromContent(text);
-      if (origin) return { origin, reason: null };
+      const r = await followManually(startUrl);
+      if (r.origin) return r;
+      reasons.push(r.reason);
     } catch (e) {
-      return { origin: null, reason: 'fetch 예외: ' + e.message };
+      reasons.push('fetch 예외(' + startUrl + '): ' + e.message);
     }
   }
-  return { origin: null, reason: '응답에서 blogspot.com 참조를 찾지 못함' };
+  return { origin: null, reason: reasons.join(' | ') };
+}
+
+// redirect:'manual'로 최대 5단계까지 직접 리다이렉트를 따라가며,
+// 각 단계에서 (1) 워커 자기 호출 여부 (2) blogspot.com 직행 여부
+// (3) 응답 본문 안의 blogspot.com 참조를 검사한다.
+async function followManually(startUrl) {
+  let currentUrl = startUrl;
+  const chain = [];
+
+  for (let i = 0; i < 5; i++) {
+    let resp;
+    try {
+      resp = await fetch(currentUrl, {
+        method:   'GET',
+        redirect: 'manual',
+        headers:  { 'user-agent': 'Mozilla/5.0', 'x-origin-probe': '1' },
+      });
+    } catch (e) {
+      return { origin: null, reason: `[${chain.join(' -> ')}] fetch 예외: ${e.message}` };
+    }
+
+    chain.push(`${currentUrl} -> ${resp.status}`);
+
+    // 워커 자기 호출 감지
+    if (resp.status === 502) {
+      const text = await resp.text().catch(() => '');
+      if (text === 'probe-loop-detected') {
+        return { origin: null, reason: `자기 자신(워커) 라우팅 감지 [${chain.join(' | ')}]` };
+      }
+    }
+
+    // 3xx면 Location을 따라 다음 단계로
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get('location') || '';
+      if (!loc) return { origin: null, reason: `[${chain.join(' | ')}] 3xx인데 Location 없음` };
+      try {
+        const nextUrl = new URL(loc, currentUrl).toString();
+        const nextHost = new URL(nextUrl).hostname;
+        if (/\.blogspot\.com$/i.test(nextHost)) {
+          return { origin: 'https://' + nextHost, reason: null };
+        }
+        currentUrl = nextUrl;
+        continue;
+      } catch (e) {
+        return { origin: null, reason: `[${chain.join(' | ')}] Location 파싱 실패: ${loc}` };
+      }
+    }
+
+    // 최종 응답(2xx/4xx 등) — 본문에서 blogspot.com 참조 탐색
+    const text = await resp.text().catch(() => '');
+    const origin = extractBlogspotOriginFromContent(text);
+    if (origin) return { origin, reason: null };
+
+    return { origin: null, reason: `[${chain.join(' | ')}] 본문에서 blogspot.com 참조 없음 (len=${text.length})` };
+  }
+
+  return { origin: null, reason: `리다이렉트 5단계 초과 [${chain.join(' | ')}]` };
 }
 
 // "xxxx.blogspot.com", "https://xxxx.blogspot.com", "https://xxxx.blogspot.com/" 등
