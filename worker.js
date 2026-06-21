@@ -216,7 +216,7 @@ async function followManually(startUrl) {
       return { origin: null, reason: `[${chain.join(' -> ')}] fetch 예외: ${e.message}` };
     }
 
-    chain.push(`${currentUrl} -> ${resp.status}`);
+    chain.push(`${currentUrl} -> ${resp.status} loc="${resp.headers.get('location') || ''}"`);
 
     // 워커 자기 호출 감지
     if (resp.status === 502) {
@@ -235,6 +235,12 @@ async function followManually(startUrl) {
         const nextHost = new URL(nextUrl).hostname;
         if (/\.blogspot\.com$/i.test(nextHost)) {
           return { origin: 'https://' + nextHost, reason: null };
+        }
+        // 자기 자신과 완전히 동일한 URL로의 리다이렉트는 Cloudflare 레벨의
+        // 설정 문제(예: Redirect Rule이 같은 호스트를 다시 가리킴)이지,
+        // Blogger 응답이 아니다. 더 따라가도 의미가 없으니 즉시 종료한다.
+        if (nextUrl === currentUrl) {
+          return { origin: null, reason: `[${chain.join(' | ')}] 자기참조 301 — Cloudflare Redirect Rule/Always-HTTPS 설정 충돌 의심 (Blogger 응답 아님)` };
         }
         currentUrl = nextUrl;
         continue;
