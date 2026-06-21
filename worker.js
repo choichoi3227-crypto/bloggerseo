@@ -175,7 +175,12 @@ async function resolveOrigin(request, url, env) {
 async function detectFromSelf(customHost) {
   const targetUrls = [
     'https://' + customHost + '/',
+    'https://' + customHost + '/sitemap.xml',
+    'https://' + customHost + '/feeds/posts/default',
+    'https://' + customHost + '/feeds/posts/default?alt=rss',
     'https://' + customHost + '/feeds/posts/default?alt=json&max-results=1',
+    'https://' + customHost + '/atom.xml',
+    'https://' + customHost + '/rss.xml',
   ];
 
   const reasons = [];
@@ -246,7 +251,7 @@ async function followManually(startUrl) {
     return { origin: null, reason: `[${chain.join(' | ')}] 본문에서 blogspot.com 참조 없음 (len=${text.length})` };
   }
 
-  return { origin: null, reason: `리다이렉트 5단계 초과 [${chain.join(' | ')}]` };
+  return { origin: null, reason: `리다이렉트 5단계 초과 — chain=[${chain.join(' | ')}]` };
 }
 
 // "xxxx.blogspot.com", "https://xxxx.blogspot.com", "https://xxxx.blogspot.com/" 등
@@ -343,20 +348,30 @@ async function detectFromGhs(customHost) {
   return { origin: null, reason: lastReason };
 }
 
-// HTML/JSON 본문 안에서 신뢰할 수 있는 blogspot.com 참조를 추출.
-// canonical / feed 링크 / EditURI / og:url 등 Blogger가 자기 자신을
-// 가리키는 자리에서만 추출하여 무관한 외부 링크를 배제한다.
+// HTML/XML/JSON 본문 안에서 신뢰할 수 있는 blogspot.com 참조를 추출.
+// canonical / feed 링크 / EditURI / og:url / sitemap <loc> / Atom <id>,<link>
+// / RSS <link> 등 Blogger가 자기 자신을 가리키는 자리에서만 추출하여
+// 무관한 외부 링크를 배제한다.
 function extractBlogspotOriginFromContent(content) {
   const patterns = [
+    // HTML <head>
     /<link[^>]+rel=["']canonical["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
     /<link[^>]+rel=["']service\.post["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
     /<link[^>]+rel=["']EditURI["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
     /<meta[^>]+property=["']og:url["'][^>]+content=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    // sitemap.xml: <loc>https://xxxx.blogspot.com/...</loc>
+    /<loc>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/loc>/i,
+    // Atom feed: <id>...</id>, <link rel="alternate" href="...">
+    /<id>\s*(?:tag:blogger\.com,1999:blog-\d+\.[^,]+|https?:\/\/)?([a-zA-Z0-9-]+\.blogspot\.com)/i,
+    /<link[^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["'][^>]*\/?>/i,
+    // RSS: <link>https://xxxx.blogspot.com/...</link>
+    /<link>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/link>/i,
+    // JSON(byurl, feed alt=json 등)
     /"(?:id|url)"\s*:\s*"https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"]*"/i,
   ];
   for (const re of patterns) {
     const m = content.match(re);
-    if (m) return 'https://' + m[1];
+    if (m && m[1]) return 'https://' + m[1];
   }
   return null;
 }
