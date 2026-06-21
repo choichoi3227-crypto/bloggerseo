@@ -32,9 +32,14 @@ export default {
     const path = url.pathname;
 
     // ── 원본 자동 감지 ───────────────────────
-    const origin = await resolveOrigin(url, env);
+    const resolved = await resolveOrigin(url, env);
+    const origin   = resolved.origin;
     if (!origin) {
-      return new Response('Blogspot 원본을 자동 감지할 수 없습니다. 도메인이 Blogspot에 연결되어 있는지 확인하세요.', { status: 502 });
+      const debugInfo = (resolved.debug || []).join(' / ');
+      return new Response(
+        'Blogspot 원본을 자동 감지할 수 없습니다. 도메인이 Blogspot에 연결되어 있는지 확인하세요.\n\n[디버그] ' + debugInfo,
+        { status: 502, headers: { 'content-type': 'text/plain; charset=utf-8' } }
+      );
     }
 
     // ── 1. 정적 자산 / Feed → 원본 직통 ─────
@@ -84,63 +89,63 @@ export default {
 // Blogspot 원본 자동 감지
 // ─────────────────────────────────────────────
 async function resolveOrigin(url, env) {
+  const debug = [];
+
   // 1) KV 캐시 확인 (가장 빠른 경로, 이후 모든 요청은 여기서 끝남)
   try {
     const cached = await env.SLUG_KV.get(ORIGIN_KV_KEY);
-    if (cached) return cached;
-  } catch (_) {}
+    if (cached) return { origin: cached, debug };
+  } catch (e) { debug.push('KV get 실패: ' + e.message); }
 
   const customHost = url.hostname;
 
-  // 2) Blogger 공식 API (byurl) — 가장 정확하고 신뢰도 높은 방법.
-  //    이 API는 "이 URL이 어떤 Blogger 블로그에 연결되어 있는지"를
-  //    Google이 직접 답해주므로 추측이나 자기 호출 위험이 전혀 없다.
+  // 2) Blogger 공식 API (byurl)
   try {
-    const origin = await detectFromBloggerApi(customHost);
-    if (origin) {
-      await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
-      return origin;
+    const r = await detectFromBloggerApi(customHost);
+    if (r.origin) {
+      await env.SLUG_KV.put(ORIGIN_KV_KEY, r.origin);
+      return { origin: r.origin, debug };
     }
-  } catch (_) {}
+    debug.push('BloggerAPI: ' + r.reason);
+  } catch (e) { debug.push('BloggerAPI 예외: ' + e.message); }
 
-  // 3) ghs.google.com에 현재 Host로 직접 요청 (Blogger 커스텀 도메인 서빙 서버)
-  //    Blogger API가 막혀 있거나 실패할 경우의 백업 경로.
+  // 3) ghs.google.com
   try {
-    const origin = await detectFromGhs(customHost);
-    if (origin) {
-      await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
-      return origin;
+    const r = await detectFromGhs(customHost);
+    if (r.origin) {
+      await env.SLUG_KV.put(ORIGIN_KV_KEY, r.origin);
+      return { origin: r.origin, debug };
     }
-  } catch (_) {}
+    debug.push('GHS: ' + r.reason);
+  } catch (e) { debug.push('GHS 예외: ' + e.message); }
 
-  // 추측 기반 fallback은 두지 않는다.
-  // (도메인명 → blogspot 서브도메인 추정은 다른 사이트의 blogspot을
-  //  잘못 원본으로 채택할 수 있으므로 제거됨)
-  return null;
+  return { origin: null, debug };
 }
 
 // Blogger 공식 API로 커스텀 도메인이 연결된 실제 blogspot.com 블로그를 조회.
-// 주의: 절대 customHost 자신에게 직접 fetch하지 않는다 — 그렇게 하면 이
-// 요청이 워커 자신에게 다시 들어와 무한 재귀/타임아웃이 발생한다.
-// googleapis.com은 별도 도메인이므로 안전하다.
 async function detectFromBloggerApi(customHost) {
   const apiUrl = 'https://www.googleapis.com/blogger/v3/blogs/byurl?url='
     + encodeURIComponent('https://' + customHost + '/');
   try {
     const resp = await fetch(apiUrl, { headers: { 'user-agent': 'Mozilla/5.0' } });
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      return { origin: null, reason: `status=${resp.status} body=${body.slice(0, 200)}` };
+    }
     const data = await resp.json();
     const blogUrl = data && data.url;
-    if (!blogUrl) return null;
+    if (!blogUrl) return { origin: null, reason: 'url 필드 없음: ' + JSON.stringify(data).slice(0, 200) };
     const host = new URL(blogUrl).hostname;
-    if (/\.blogspot\.com$/i.test(host)) return 'https://' + host;
-  } catch (_) {}
-  return null;
+    if (/\.blogspot\.com$/i.test(host)) return { origin: 'https://' + host, reason: null };
+    return { origin: null, reason: 'blogspot.com 아님: ' + host };
+  } catch (e) {
+    return { origin: null, reason: 'fetch 예외: ' + e.message };
+  }
 }
 
 // ghs.google.com에 Host 헤더로 요청해서 실제 매핑된 blogspot 호스트를 찾는다.
 async function detectFromGhs(customHost) {
-  // manual redirect: Location 헤더에서 추출
+  let lastReason = '';
   try {
     const resp = await fetch('https://ghs.google.com/', {
       method:   'GET',
@@ -149,10 +154,12 @@ async function detectFromGhs(customHost) {
     });
     const location = resp.headers.get('location') || '';
     const m = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-    if (m) return 'https://' + m[1];
-  } catch (_) {}
+    if (m) return { origin: 'https://' + m[1], reason: null };
+    lastReason = `manual status=${resp.status} location="${location}"`;
+  } catch (e) {
+    lastReason = 'manual fetch 예외: ' + e.message;
+  }
 
-  // follow redirect: 최종 HTML 본문에서 추출
   try {
     const resp = await fetch('https://ghs.google.com/', {
       method:   'GET',
@@ -161,14 +168,17 @@ async function detectFromGhs(customHost) {
     });
     try {
       const finalHost = new URL(resp.url).hostname;
-      if (/\.blogspot\.com$/i.test(finalHost)) return 'https://' + finalHost;
+      if (/\.blogspot\.com$/i.test(finalHost)) return { origin: 'https://' + finalHost, reason: null };
     } catch (_) {}
     const html = await resp.text();
     const origin = extractBlogspotOriginFromContent(html);
-    if (origin) return origin;
-  } catch (_) {}
+    if (origin) return { origin, reason: null };
+    lastReason += ` | follow status=${resp.status} finalUrl=${resp.url} bodyLen=${html.length}`;
+  } catch (e) {
+    lastReason += ' | follow fetch 예외: ' + e.message;
+  }
 
-  return null;
+  return { origin: null, reason: lastReason };
 }
 
 // HTML/JSON 본문 안에서 신뢰할 수 있는 blogspot.com 참조를 추출.
