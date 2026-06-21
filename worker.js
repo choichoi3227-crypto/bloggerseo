@@ -31,8 +31,22 @@ export default {
     const url  = new URL(request.url);
     const path = url.pathname;
 
+    // ── 프로브 가드 (무한 루프 절대 방지) ────
+    // resolveOrigin의 detectFromSelf가 "이 커스텀 도메인 자신"에게 직접
+    // fetch를 보내 Blogger의 진짜 응답을 엿보려고 시도한다. 만약 그 도메인이
+    // 같은 zone에서 이 워커로 라우팅되어 있다면, 그 fetch는 워커 자신의
+    // fetch() 핸들러로 다시 들어온다. 이 경우 resolveOrigin → fetch →
+    // resolveOrigin → fetch → ... 무한 재귀가 발생할 수 있으므로,
+    // detectFromSelf는 요청에 X-Origin-Probe 헤더를 반드시 심어 보내고,
+    // 여기서 그 헤더를 발견하면 즉시 502를 돌려주어 재귀를 1회 안에 끊는다.
+    // (이 502는 detectFromSelf 입장에서 "자기 호출이었다"는 명확한 신호이며,
+    //  반대로 이 헤더 없이 정상 HTML이 오면 "Blogger가 직접 응답했다"는 뜻이다.)
+    if (request.headers.get('x-origin-probe') === '1') {
+      return new Response('probe-loop-detected', { status: 502 });
+    }
+
     // ── 원본 자동 감지 ───────────────────────
-    const resolved = await resolveOrigin(url, env);
+    const resolved = await resolveOrigin(request, url, env);
     const origin   = resolved.origin;
     if (!origin) {
       const debugInfo = (resolved.debug || []).join(' / ');
@@ -88,20 +102,14 @@ export default {
 // ─────────────────────────────────────────────
 // Blogspot 원본 자동 감지
 // ─────────────────────────────────────────────
-async function resolveOrigin(url, env) {
+async function resolveOrigin(request, url, env) {
   const debug = [];
 
-  // 0) wrangler.toml의 vars에 BLOGSPOT_ORIGIN을 직접 지정한 경우.
-  //    Blogger byurl API는 API 키 없이는 403으로 막혀 있고, ghs.google.com은
-  //    Cloudflare 엣지에서 SNI/Host 불일치로 TLS 단계(525)에서 막힌다.
-  //    즉 "키 없이 완전 자동 감지"는 구조적으로 불가능하므로, 이 경로가
-  //    사실상 유일하게 100% 신뢰할 수 있는 방법이다. 한 번만 입력해두면
-  //    이후 모든 요청에서 즉시 사용된다(추가 fetch 없음, 가장 빠름).
+  // 0) wrangler.toml의 vars에 BLOGSPOT_ORIGIN을 직접 지정한 경우 (가장 빠르고 확실함)
   const configured = (env.BLOGSPOT_ORIGIN || '').trim();
   if (configured) {
     const normalized = normalizeBlogspotOrigin(configured);
     if (normalized) {
-      // KV에도 동기화해두면 wrangler.toml을 바꿔도 캐시 일관성 유지
       try { await env.SLUG_KV.put(ORIGIN_KV_KEY, normalized); } catch (_) {}
       return { origin: normalized, debug };
     }
@@ -116,7 +124,22 @@ async function resolveOrigin(url, env) {
 
   const customHost = url.hostname;
 
-  // 2) Blogger 공식 API (byurl) — API 키 없으면 403으로 실패함 (참고용 백업)
+  // 2) 커스텀 도메인 자신에게 직접 요청 (X-Origin-Probe 헤더로 무한 루프 방지).
+  //    같은 zone에서 이 워커로 라우팅되어 있다면 위쪽 프로브 가드가 즉시
+  //    502를 돌려주므로 안전하게 "자기 호출이었다"고 판별하고 다음 단계로 넘어간다.
+  //    반대로 Blogger가 직접 응답하면(이 도메인이 다른 라우팅을 거치는 경우,
+  //    또는 일부 환경에서 워커 라우팅 전에 오리진으로 먼저 가는 경우) 그 응답
+  //    안에서 실제 blogspot.com 참조를 추출한다.
+  try {
+    const r = await detectFromSelf(customHost);
+    if (r.origin) {
+      await env.SLUG_KV.put(ORIGIN_KV_KEY, r.origin);
+      return { origin: r.origin, debug };
+    }
+    debug.push('Self: ' + r.reason);
+  } catch (e) { debug.push('Self 예외: ' + e.message); }
+
+  // 3) Blogger 공식 API (byurl) — API 키 없으면 403으로 실패함 (참고용 백업)
   try {
     const r = await detectFromBloggerApi(customHost);
     if (r.origin) {
@@ -126,7 +149,7 @@ async function resolveOrigin(url, env) {
     debug.push('BloggerAPI: ' + r.reason);
   } catch (e) { debug.push('BloggerAPI 예외: ' + e.message); }
 
-  // 3) ghs.google.com — Cloudflare 환경에서 TLS 단계(525)로 막히는 경우가 많음 (참고용 백업)
+  // 4) ghs.google.com — Cloudflare 환경에서 막히는 경우가 많음 (참고용 백업)
   try {
     const r = await detectFromGhs(customHost);
     if (r.origin) {
@@ -138,6 +161,48 @@ async function resolveOrigin(url, env) {
 
   debug.push('해결: wrangler.toml [vars]에 BLOGSPOT_ORIGIN = "xxxx.blogspot.com" 을 추가하고 재배포하세요.');
   return { origin: null, debug };
+}
+
+// customHost로 직접 요청해서, 응답 안에서 실제 blogspot.com 참조를 찾는다.
+// X-Origin-Probe 헤더를 반드시 동반하여, 이 요청이 같은 워커로 되돌아올 경우
+// 위쪽 가드가 즉시 502(probe-loop-detected)를 주고 무한 재귀를 끊는다.
+async function detectFromSelf(customHost) {
+  const targetUrls = [
+    'https://' + customHost + '/',
+    'https://' + customHost + '/feeds/posts/default?alt=json&max-results=1',
+  ];
+
+  for (const targetUrl of targetUrls) {
+    try {
+      const resp = await fetch(targetUrl, {
+        method:   'GET',
+        redirect: 'follow',
+        headers:  {
+          'user-agent':      'Mozilla/5.0',
+          'x-origin-probe':  '1',
+        },
+      });
+
+      const text = await resp.text();
+
+      // 워커 자신이 응답한 경우 → 이 경로로는 원본을 알 수 없음, 다음 단계로
+      if (resp.status === 502 && text === 'probe-loop-detected') {
+        return { origin: null, reason: '자기 자신(워커)으로 라우팅됨 — 이 경로로는 감지 불가' };
+      }
+
+      // 리다이렉트가 blogspot.com으로 끝났다면 그게 바로 원본
+      try {
+        const finalHost = new URL(resp.url).hostname;
+        if (/\.blogspot\.com$/i.test(finalHost)) return { origin: 'https://' + finalHost, reason: null };
+      } catch (_) {}
+
+      const origin = extractBlogspotOriginFromContent(text);
+      if (origin) return { origin, reason: null };
+    } catch (e) {
+      return { origin: null, reason: 'fetch 예외: ' + e.message };
+    }
+  }
+  return { origin: null, reason: '응답에서 blogspot.com 참조를 찾지 못함' };
 }
 
 // "xxxx.blogspot.com", "https://xxxx.blogspot.com", "https://xxxx.blogspot.com/" 등
