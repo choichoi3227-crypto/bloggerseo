@@ -72,49 +72,64 @@ export default {
 // Blogspot 원본 자동 감지
 // ─────────────────────────────────────────────
 async function resolveOrigin(url, env) {
-  // 1) KV 캐시 확인 (가장 빠른 경로)
+  // 1) KV 캐시 확인 (가장 빠른 경로, 이후 모든 요청은 여기서 끝남)
   try {
     const cached = await env.SLUG_KV.get(ORIGIN_KV_KEY);
     if (cached) return cached;
   } catch (_) {}
 
-  // 2) 자동 감지: 현재 도메인 루트에 HEAD 요청
-  //    Blogspot 커스텀 도메인은 blogspot.com 으로 리다이렉트하거나
-  //    응답 HTML에 blogspot 메타 정보를 포함함
+  const customHost = url.hostname;
+
+  // 2) ghs.google.com에 현재 Host로 직접 요청
+  //    워커를 거치지 않으므로 무한루프 없음
+  //    Blogspot 커스텀 도메인은 ghs.google.com이 실제 서버
   try {
-    const probeUrl = url.origin + '/';
-    const resp = await fetch(probeUrl, {
-      method:   'HEAD',
-      redirect: 'manual',   // 리다이렉트를 직접 읽음
+    const resp = await fetch('https://ghs.google.com/', {
+      method:   'GET',
+      redirect: 'manual',
+      headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
     });
-
-    // Location 헤더에서 blogspot.com 추출
     const location = resp.headers.get('location') || '';
-    const match    = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/);
-    if (match) {
-      const origin = 'https://' + match[1];
-      await env.SLUG_KV.put(ORIGIN_KV_KEY, origin); // 영구 저장
-      return origin;
-    }
-
-    // 3) 리다이렉트 없이 직접 응답하는 경우: GET으로 HTML 읽어서 추출
-    const getResp = await fetch(probeUrl, { redirect: 'follow' });
-    const html    = await getResp.text();
-
-    // og:url, canonical, 또는 blogger 메타에서 blogspot 도메인 추출
-    const blogspotMatch =
-      html.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/) ||
-      html.match(/content=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/);
-
-    if (blogspotMatch) {
-      const origin = 'https://' + blogspotMatch[1];
+    const m = location.match(/https?://([a-zA-Z0-9-]+.blogspot.com)/);
+    if (m) {
+      const origin = 'https://' + m[1];
       await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
       return origin;
     }
   } catch (_) {}
 
+  // 3) fallback: ghs.google.com redirect follow 후 HTML에서 추출
+  try {
+    const resp = await fetch('https://ghs.google.com/', {
+      method:   'GET',
+      redirect: 'follow',
+      headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
+    });
+    const html = await resp.text();
+    const m    = html.match(/https?://([a-zA-Z0-9-]+.blogspot.com)/);
+    if (m) {
+      const origin = 'https://' + m[1];
+      await env.SLUG_KV.put(ORIGIN_KV_KEY, origin);
+      return origin;
+    }
+  } catch (_) {}
+
+  // 4) 최후 fallback: 도메인명으로 blogspot 서브도메인 추정
+  try {
+    const subdomain = customHost.replace(/^www./, '').split('.')[0];
+    if (subdomain) {
+      const guessed = 'https://' + subdomain + '.blogspot.com';
+      const check   = await fetch(guessed + '/', { method: 'HEAD', redirect: 'manual' });
+      if (check.status < 500) {
+        await env.SLUG_KV.put(ORIGIN_KV_KEY, guessed);
+        return guessed;
+      }
+    }
+  } catch (_) {}
+
   return null;
 }
+
 
 // ─────────────────────────────────────────────
 // 원본으로 프록시 (호스트만 교체 → 워커 재진입 없음)
