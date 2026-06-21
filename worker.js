@@ -80,7 +80,7 @@ async function handleFetch(request, env, ctx) {
     if (isPassthrough(path, url)) {
       try {
         const resp = await proxyToOrigin(request, url, origin);
-        const sanitized = sanitizeOriginResponse(resp, url, origin);
+        const sanitized = await sanitizeOriginResponse(resp, url, origin);
         if (sanitized.status >= 500) {
           return buildSetupNoticeResponse(['원본 응답 5xx (passthrough): ' + sanitized.status]);
         }
@@ -108,7 +108,7 @@ async function handleFetch(request, env, ctx) {
     let originResp;
     try {
       const rawOriginResp = await proxyToOrigin(request, url, origin);
-      originResp = sanitizeOriginResponse(rawOriginResp, url, origin);
+      originResp = await sanitizeOriginResponse(rawOriginResp, url, origin);
     } catch (e) {
       // 원본(Blogger) 네트워크 장애 등 — 사용자에게 502 대신 안내 페이지
       return buildSetupNoticeResponse(['원본 fetch 예외: ' + e.message]);
@@ -514,7 +514,15 @@ function extractBlogspotOriginFromContent(content) {
 // 해결: Host 헤더는 원래 커스텀 도메인(request의 Host)을 그대로 유지한 채,
 // 실제 네트워크 연결만 blogspot.com(origin)으로 보낸다.
 function proxyToOrigin(request, url, origin) {
-  const targetUrl   = origin + url.pathname + url.search;
+  // ?m=1 / ?m=0 파라미터 제거:
+  // Blogger가 모바일 감지용으로 붙이는 ?m=1 을 그대로 upstream에 보내면
+  // "이 블로그는 www.xxx.com 으로 이동했습니다" 리디렉션 경고 페이지가 반환된다.
+  // 워커가 이미 공통 HTML을 최적화해 서빙하므로 upstream 전송 전에 항상 제거한다.
+  const cleanedParams = new URLSearchParams(url.search);
+  cleanedParams.delete('m');
+  const cleanedSearch = cleanedParams.toString() ? '?' + cleanedParams.toString() : '';
+
+  const targetUrl   = origin + url.pathname + cleanedSearch;
   const headers     = new Headers(request.headers);
   const customHost  = url.hostname; // 사용자의 실제(커스텀) 도메인
 
@@ -536,46 +544,68 @@ function proxyToOrigin(request, url, origin) {
 }
 
 // ─────────────────────────────────────────────
-// 원본 응답 정리: blogspot.com을 절대 노출하지 않는다
+// 원본 응답 정리: 리다이렉트를 워커가 직접 따라가 최종 콘텐츠를 반환
 // ─────────────────────────────────────────────
-// proxyToOrigin은 redirect:'manual'로 fetch하므로, Blogger가 자체적으로
-// 정식 도메인(blogspot.com)으로 리다이렉트를 내려주는 경우 그 Response가
-// 그대로 여기로 들어온다. 이 Location 헤더를 커스텀 도메인 기준으로
-// 재작성해서 브라우저가 절대 blogspot.com으로 이동하지 않도록 한다.
-function sanitizeOriginResponse(resp, url, origin) {
-  const status = resp.status;
-  if (status >= 300 && status < 400) {
-    const location = resp.headers.get('location') || '';
-    if (location) {
-      const rewritten = rewriteToCustomDomain(location, url, origin);
-      // 자기참조 리다이렉트(재작성한 목적지가 현재 요청 URL과 동일) 방지.
-      // 브라우저가 "리다이렉트 횟수가 너무 많습니다" 에러를 내지 않도록,
-      // 이 경우엔 3xx를 그대로 내려보내지 않고 안내 페이지(200)로 대체한다.
-      if (rewritten === url.toString()) {
-        return buildSetupNoticeResponse(['자기참조 리다이렉트 감지: ' + rewritten]);
-      }
-      const headers = new Headers(resp.headers);
-      headers.set('location', rewritten);
-      return new Response(null, { status, headers });
+// Blogger는 커스텀 도메인 요청에 대해 www 추가, https 강제, ?m= 제거 등
+// 다양한 이유로 3xx 리다이렉트를 내려준다. 이것을 브라우저에 그대로 넘기면
+// 브라우저 → 워커 → Blogger → 3xx → 브라우저 → 워커 → ... 무한 루프가 된다.
+// 워커가 직접 최대 5단계까지 리다이렉트를 추적해 최종 응답을 가져온다.
+// 단, 최종 목적지가 완전히 다른 외부 도메인(blogspot도 커스텀도 아닌 곳)이면
+// 그때만 브라우저에 리다이렉트를 넘긴다.
+async function sanitizeOriginResponse(resp, url, origin) {
+  const customHost = url.host;
+  const originHost = (() => { try { return new URL(origin).host; } catch(_) { return ''; } })();
+
+  let current = resp;
+  let currentUrl = url.toString();
+
+  for (let i = 0; i < 5; i++) {
+    const status = current.status;
+    if (status < 300 || status >= 400) break; // 3xx 아니면 그대로 반환
+
+    const location = current.headers.get('location') || '';
+    if (!location) break;
+
+    let nextUrl;
+    try { nextUrl = new URL(location, currentUrl).toString(); } catch(_) { break; }
+
+    const nextHost = (() => { try { return new URL(nextUrl).host; } catch(_) { return ''; } })();
+
+    // 완전히 외부 도메인이면 브라우저에 리다이렉트 위임
+    if (nextHost !== customHost && nextHost !== originHost) {
+      const h = new Headers(current.headers);
+      h.set('location', nextUrl);
+      return new Response(null, { status, headers: h });
+    }
+
+    // 자기참조(무한루프) 방지
+    if (nextUrl === currentUrl) {
+      return buildSetupNoticeResponse(['자기참조 리다이렉트 감지: ' + nextUrl]);
+    }
+
+    // 커스텀 도메인 또는 blogspot 도메인으로의 리다이렉트 → 워커가 직접 따라감
+    // ?m= 파라미터도 제거하면서 fetch
+    const nextUrlObj = new URL(nextUrl);
+    nextUrlObj.searchParams.delete('m');
+    const targetUrl = origin + nextUrlObj.pathname + (nextUrlObj.search || '');
+
+    try {
+      const headers = new Headers(url && url._reqHeaders ? url._reqHeaders : {});
+      headers.set('host', customHost);
+      headers.delete('cf-connecting-ip');
+      headers.delete('cf-ipcountry');
+      headers.delete('cf-ray');
+      headers.delete('cf-visitor');
+      current = await fetch(targetUrl, { method: 'GET', headers, redirect: 'manual' });
+      currentUrl = nextUrl;
+    } catch(e) {
+      return buildSetupNoticeResponse(['리다이렉트 추적 중 fetch 예외: ' + e.message]);
     }
   }
-  return resp;
+
+  return current;
 }
 
-// blogspot.com(혹은 원본 origin) 절대/상대 URL을 커스텀 도메인 기준으로 변환
-function rewriteToCustomDomain(targetUrl, url, origin) {
-  try {
-    const originHost = new URL(origin).host;
-    const abs = new URL(targetUrl, origin); // 상대 경로도 처리
-    if (abs.host === originHost) {
-      abs.protocol = url.protocol;
-      abs.host     = url.host;
-    }
-    return abs.toString();
-  } catch (_) {
-    return targetUrl;
-  }
-}
 
 // ─────────────────────────────────────────────
 // 라우트 판별
@@ -616,6 +646,7 @@ function isPostPath(path) {
 // ─────────────────────────────────────────────
 function transformHtml(html, ctx, url) {
   let out = html;
+  out = stripMobileParam(out);
   out = enforceHttps(out, url);
   out = injectMetaDescription(out, ctx);
   out = injectCanonical(out, ctx, url);
@@ -623,6 +654,21 @@ function transformHtml(html, ctx, url) {
   out = injectSeoTags(out, ctx, url);
   out = injectPerformanceOptimizations(out);
   return out;
+}
+
+// HTML 안의 ?m=1 / ?m=0 파라미터 제거:
+// Blogger는 내부적으로 모바일 전환용으로 ?m=1/?m=0 링크를 HTML 곳곳에 심는다.
+// 사용자가 이 링크를 클릭하면 워커를 통해 다시 요청이 오고, Blogger upstream에
+// ?m=1 이 그대로 전달되어 "리디렉션 경고" 페이지가 뜨게 된다.
+// href/src/action 속성 안의 ?m=숫자 를 모두 제거해 이 현상을 원천 차단한다.
+function stripMobileParam(html) {
+  // href="...?m=1"  → href="..."
+  // href="...?m=1&foo=bar" → href="...?foo=bar"
+  // href="...?foo=bar&m=1" → href="...?foo=bar"
+  return html
+    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+&/gi, '$1?')   // ?m=X& (앞에 위치)
+    .replace(/((?:href|src|action)=["'][^"']*)&m=\d+/gi,  '$1')      // &m=X  (뒤에 위치)
+    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+/gi, '$1');     // ?m=X  (단독)
 }
 
 // 혼합 콘텐츠(Mixed Content) 에러 방지: 이 페이지는 항상 HTTPS로 서빙되므로
