@@ -1,0 +1,31 @@
+# wrangler.toml
+# Blogspot SEO & Performance Optimization Worker 설정
+
+name = "blogspot-seo-worker"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ─── KV 네임스페이스 ───────────────────────────────────────
+# 배포 전 `wrangler kv:namespace create SLUG_KV` 실행 후 id 입력
+# 배포 전 `wrangler kv:namespace create CACHE_RESERVE_KV` 실행 후 id 입력
+[[kv_namespaces]]
+binding = "SLUG_KV"
+id      = "YOUR_SLUG_KV_ID"
+
+[[kv_namespaces]]
+binding = "CACHE_RESERVE_KV"
+id      = "YOUR_CACHE_RESERVE_KV_ID"
+
+# ─── 라우트 (블로그 도메인으로 교체) ───────────────────────
+[[routes]]
+pattern = "yourblog.com/*"
+zone_name = "yourblog.com"
+
+# ─── 스케줄드 트리거 (6개월마다 슬러그 감사) ───────────────
+[triggers]
+crons = ["0 0 1 */6 *"]
+
+# ─── 성능 설정 ─────────────────────────────────────────────
+[limits]
+cpu_ms = 50   # CPU 제한 (ms)
