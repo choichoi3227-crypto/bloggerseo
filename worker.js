@@ -5,16 +5,16 @@
  *
  * ┌─ 핵심 동작 원리 ───────────────────────────────────────────────┐
  * │  요청 호스트의 CNAME이 ghs.google.com인지 1.1.1.1 DoH로 검증. │
- * │  검증된 커스텀 도메인으로 그대로 fetch → Blogger 직접 응답.    │
- * │  blogspot.com 원본 도메인 탐지 불필요.                         │
+ * │  검증된 커스텀 도메인 → ghs.google.com 직접 연결,             │
+ * │  Host 헤더만 커스텀 도메인으로 설정 → Blogger 콘텐츠 반환.    │
  * │                                                                  │
  * │  CNAME 검증 결과는 KV에 캐시 (24h) → 이후 요청 즉시 통과.     │
- * │  검증 실패 시 → 502 Bad Gateway (사이트 준비 중 페이지 없음).  │
+ * │  검증 실패 시 → 502 Bad Gateway.                               │
  * └──────────────────────────────────────────────────────────────────┘
  *
  * ┌─ Feed / Sitemap / RSS / Atom ─────────────────────────────────┐
  * │  /feeds/*, /sitemap.xml, /atom.xml, /rss.xml 등 모두          │
- * │  커스텀 도메인으로 직접 fetch → 그대로 반환.                   │
+ * │  ghs.google.com으로 직접 fetch → 그대로 반환.                  │
  * └───────────────────────────────────────────────────────────────┘
  *
  * ┌─ 로드 밸런싱 (자체 구현, CF 유료 기능 불사용) ─────────────────┐
@@ -32,16 +32,15 @@ const SLUG_CHECK_MS    = 6 * 30 * 24 * 3600 * 1000;
 const LB_RTT_DECAY     = 0.25;
 const LB_RTT_TTL       = 60;
 const GHS_CNAME_TARGET = 'ghs.google.com';
+const GHS_FETCH_HOST   = 'https://ghs.google.com';
 const DOH_URL          = 'https://1.1.1.1/dns-query';
 
 // ─────────────────────────────────────────────
 // KV 키 헬퍼
 // ─────────────────────────────────────────────
-const kvCname     = h => 'cname_ok:'       + h;
-const kvCanonical = h => 'canonical:host:' + h;
-const kvRtt       = o => 'lb:rtt:'         + o;
-const kvBw        = o => 'lb:bw:'          + o;
-const kvRr        = h => 'lb:rr:'          + h;
+const kvCname = h => 'cname_ok:' + h;
+const kvRtt   = o => 'lb:rtt:'   + o;
+const kvBw    = o => 'lb:bw:'    + o;
 
 // ─────────────────────────────────────────────
 // 메인 핸들러
@@ -135,9 +134,8 @@ async function isBloggerDomain(host, env, ctx) {
     if (raw !== null) {
       const parsed = JSON.parse(raw);
       if (Date.now() - parsed.ts < CNAME_CACHE_TTL) {
-        return true; // 캐시에 있으면 항상 true (실패는 저장 안 함)
+        return true;
       }
-      // 만료된 캐시 삭제
       env.SLUG_KV.delete(kvCname(host)).catch(() => {});
     }
   } catch (_) {}
@@ -158,20 +156,18 @@ async function isBloggerDomain(host, env, ctx) {
   return ok;
 }
 
-// Cloudflare 프록시 IP 대역 (오렌지 클라우드 상태이면 A 레코드가 이 대역)
+// Cloudflare 프록시 IP 대역
 // https://www.cloudflare.com/ips/
 const CF_IP_RANGES_V4 = [
-  [0x67100000, 20], // 103.16.0.0/20  (103.16.x.x)  — 실제론 아래 대역이 주요
   [0x671503FC, 22], // 103.21.244.0/22
   [0x671603C8, 22], // 103.22.200.0/22
   [0x671F0400, 22], // 103.31.4.0/22
   [0x68100000, 13], // 104.16.0.0/13
   [0x68180000, 14], // 104.24.0.0/14
   [0x6CA2C000, 18], // 108.162.192.0/18
-  [0x830048, 22],   // 131.0.72.0/22
-  [0x8D650000, 18], // 141.101.64.0/18 — skip (불필요 복잡)
+  [0x830048,   22], // 131.0.72.0/22
   [0xA29E0000, 15], // 162.158.0.0/15
-  [0xAC400000, 13], // 172.64.0.0/13   ← 172.67.x.x 포함
+  [0xAC400000, 13], // 172.64.0.0/13  ← 172.67.x.x 포함
   [0xADF53000, 20], // 173.245.48.0/20
   [0xBC720000, 20], // 188.114.96.0/20
   [0xBE5DF000, 20], // 190.93.240.0/20
@@ -184,7 +180,6 @@ function ipToInt(ip) {
 }
 
 function isCfIp(ip) {
-  // IPv6이면 일단 CF로 간주 (2606:4700::/32 대역)
   if (ip.includes(':')) return ip.toLowerCase().startsWith('2606:4700') || ip.toLowerCase().startsWith('2400:cb00');
   const n = ipToInt(ip);
   for (const [base, prefix] of CF_IP_RANGES_V4) {
@@ -194,7 +189,7 @@ function isCfIp(ip) {
   return false;
 }
 
-// DoH로 A 레코드 조회 → 모두 Cloudflare IP이면 프록시 상태
+// DoH로 A 레코드 조회 → 모두 Cloudflare IP이면 프록시(오렌지 클라우드) 상태
 async function isProxiedByCf(host) {
   try {
     const resp = await fetch(
@@ -206,14 +201,13 @@ async function isProxiedByCf(host) {
     if (!data || !Array.isArray(data.Answer)) return false;
     const aRecs = data.Answer.filter(r => r.type === 1).map(r => String(r.data));
     if (aRecs.length === 0) return false;
-    // 모든 A 레코드가 CF IP 대역이면 프록시 상태
     return aRecs.every(ip => isCfIp(ip));
   } catch (_) { return false; }
 }
 
 // 1.1.1.1 DoH CNAME 체인 추적 → ghs.google.com 포함 여부 반환
 // Cloudflare 프록시(오렌지 클라우드) 상태에서는 CNAME이 외부에서 안 보임.
-// 이 경우 A 레코드가 전부 CF IP 대역이면 → 해당 존의 Worker가 이미 실행 중 = 신뢰.
+// 이 경우 A 레코드가 전부 CF IP 대역이면 → 신뢰.
 async function checkCnameGhs(host) {
   // Case 1: CNAME 체인 직접 추적 (회색 클라우드 / CF 외부 DNS)
   let current = host;
@@ -230,8 +224,8 @@ async function checkCnameGhs(host) {
   }
 
   // Case 2: Cloudflare 프록시(오렌지 클라우드) 상태
-  // → CNAME이 숨겨지고 A 레코드가 CF IP로만 노출됨.
-  // → A 레코드 전체가 CF IP 대역이면 프록시 통과 상태 = 이 Worker가 해당 존에서 동작 중 = Blogger 도메인으로 신뢰.
+  // → CNAME이 숨겨지고 A 레코드가 CF IP로만 노출됨
+  // → A 레코드 전체가 CF IP 대역이면 이 Worker가 해당 존에서 동작 중 = 신뢰
   const proxied = await isProxiedByCf(host);
   if (proxied) return true;
 
@@ -257,78 +251,27 @@ async function dnsCname(host) {
 // ─────────────────────────────────────────────
 // Blogger fetch
 //
-// 전략: blogspot.com 원본 URL로 직접 fetch.
+// 전략: ghs.google.com:443으로 직접 TCP 연결 (SNI = ghs.google.com)
+//       Host 헤더만 커스텀 도메인으로 설정
+//       → Blogger가 Host를 보고 해당 블로그 콘텐츠 반환
 //
-// 이유:
-//  - 커스텀 도메인으로 fetch → CF Worker 자신 재호출 → 무한 루프
-//  - ghs.google.com + Host override → SSL 525 또는 404 (host_not_allowed)
-//    (Google이 외부 IP에서 오는 Host override 요청을 차단)
+// 이전 방식(blogspot.com 원본 탐지)의 문제:
+//  - 커스텀 도메인으로 HEAD 요청 → CF Worker 자신 재호출 → 무한루프
+//  - HEAD → 301 Location 파싱이 실패하는 케이스 다수
 //
-// 해결:
-//  커스텀 도메인으로 HEAD 요청(redirect:manual) → 301 Location에서
-//  blogspot.com 원본 URL 추출 → 해당 URL로 직접 fetch.
-//  blogspot.com URL로 직접 오면 Blogger는 커스텀도메인으로 리다이렉트
-//  하지 않고 콘텐츠를 바로 반환함.
-//  추출한 origin은 KV에 캐시해서 이후 요청은 탐지 없이 즉시 사용.
+// 현재 방식의 원리:
+//  - CF Workers fetch()는 URL의 호스트(SNI)와 Host 헤더를 독립 처리
+//  - SNI = ghs.google.com → SSL 핸드셰이크 정상
+//  - Host = 커스텀 도메인 → Blogger가 블로그 식별
 //
 // ?m=1 제거 (Blogger 모바일 파라미터)
 // ─────────────────────────────────────────────
-async function getOriginUrl(host, env) {
-  // KV 캐시 확인
-  const kvKey = 'origin:' + host;
-  try {
-    if (env.SLUG_KV) {
-      const cached = await env.SLUG_KV.get(kvKey);
-      if (cached) return cached;
-    }
-  } catch (_) {}
-
-  // 커스텀 도메인으로 HEAD → 301 Location에서 blogspot URL 추출
-  let origin = null;
-  try {
-    const resp = await fetch('https://' + host + '/', {
-      method: 'HEAD',
-      redirect: 'manual',
-      headers: { 'user-agent': 'Mozilla/5.0' },
-    });
-    const loc = resp.headers.get('location') || '';
-    const m   = loc.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-    if (m) origin = 'https://' + m[1];
-  } catch (_) {}
-
-  // fallback: feeds API 통해 추출
-  if (!origin) {
-    try {
-      const resp = await fetch('https://' + host + '/feeds/posts/default?alt=json&max-results=1', {
-        redirect: 'follow',
-        headers: { 'user-agent': 'Mozilla/5.0' },
-      });
-      const text = await resp.text().catch(() => '');
-      const m = text.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-      if (m) origin = 'https://' + m[1];
-    } catch (_) {}
-  }
-
-  // KV에 저장 (성공 시만)
-  if (origin) {
-    try {
-      if (env.SLUG_KV) await env.SLUG_KV.put(kvKey, origin, { expirationTtl: 86400 * 30 });
-    } catch (_) {}
-  }
-
-  return origin;
-}
-
 async function bloggerFetch(url, method, reqHeaders, body, env) {
   const params = new URLSearchParams(url.search);
   params.delete('m');
   const qs = params.toString() ? '?' + params.toString() : '';
 
-  // blogspot origin 가져오기
-  const origin = await getOriginUrl(url.hostname, env);
-  if (!origin) throw new Error('blogspot origin 탐지 실패: ' + url.hostname);
-
-  const targetUrl = origin + url.pathname + qs;
+  const targetUrl = GHS_FETCH_HOST + url.pathname + qs;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
@@ -339,6 +282,8 @@ async function bloggerFetch(url, method, reqHeaders, body, env) {
     if (kl === 'x-real-ip')       continue;
     headers.set(k, v);
   }
+  // Host를 커스텀 도메인으로 지정 → Blogger가 어떤 블로그인지 식별
+  headers.set('host', url.hostname);
   headers.set('user-agent', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
 
   return fetch(targetUrl, {
@@ -350,20 +295,34 @@ async function bloggerFetch(url, method, reqHeaders, body, env) {
 }
 
 // ─────────────────────────────────────────────
-// 디버그: blogspot origin 탐지 결과 확인
+// 디버그: ghs.google.com 연결 확인
 // ─────────────────────────────────────────────
 async function bloggerDebug(url, env) {
-  const host   = url.hostname;
-  const origin = await getOriginUrl(host, env);
-  const info   = {
+  const host = url.hostname;
+  let status = 0, ok = false, errorMsg = null;
+  try {
+    const resp = await fetch(GHS_FETCH_HOST + '/', {
+      method: 'HEAD',
+      headers: { host },
+    });
+    status = resp.status;
+    ok = resp.ok || resp.status === 301 || resp.status === 302;
+  } catch (e) {
+    errorMsg = String(e.message);
+  }
+  const info = {
     host,
-    detectedOrigin: origin,
-    message: origin
-      ? 'OK: blogspot origin 탐지 성공'
-      : 'FAIL: blogspot origin 탐지 실패. Blogger 커스텀 도메인 설정을 확인하세요.',
+    ghsStatus: status,
+    ok,
+    ...(errorMsg ? { error: errorMsg } : {}),
+    message: errorMsg
+      ? 'ERROR: ghs.google.com 연결 실패: ' + errorMsg
+      : ok
+        ? 'OK: ghs.google.com이 Host=' + host + ' 요청에 정상 응답'
+        : 'FAIL: ghs.google.com 응답 이상 (status=' + status + '). Blogger 커스텀 도메인 설정을 확인하세요.',
   };
   return new Response(JSON.stringify(info, null, 2), {
-    status: origin ? 200 : 502,
+    status: ok ? 200 : 502,
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
   });
 }
@@ -390,7 +349,7 @@ function stripInternalHeaders(resp) {
 }
 
 // ─────────────────────────────────────────────
-// 에러 응답 (사이트 준비 중 페이지 없음)
+// 에러 응답
 // ─────────────────────────────────────────────
 function errResp(status, message) {
   return new Response(message, {
@@ -407,14 +366,11 @@ function errResp(status, message) {
 // 라우트 판별
 // ─────────────────────────────────────────────
 function isPassthrough(path, url) {
-  // Feed: /feeds/*, /atom.xml, /rss.xml, /sitemap.xml, /sitemap-*.xml
-  if (path.startsWith('/feeds/'))          return true;
-  if (path === '/atom.xml')                return true;
-  if (path === '/rss.xml')                 return true;
+  if (path.startsWith('/feeds/'))               return true;
+  if (path === '/atom.xml')                     return true;
+  if (path === '/rss.xml')                      return true;
   if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return true;
-  // ?alt=json/rss 파라미터
-  if (url.searchParams.has('alt'))         return true;
-  // 정적 자산
+  if (url.searchParams.has('alt'))              return true;
   if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|xml|txt|json)$/i.test(path)) return true;
   return false;
 }
@@ -512,7 +468,7 @@ async function runSlugAudit(env) {
         const newSlug = generateSlug(data.title);
         if (newSlug !== data.slug) {
           const op = data.path.replace(/[^/]+\.html$/, data.slug   + '.html');
-          const np = data.path.replace(/[^/]+\.html$/, newSlug + '.html');
+          const np = data.path.replace(/[^/]+\.html$/, newSlug     + '.html');
           if (op !== np) await env.SLUG_KV.put('canonical:' + op, np);
         }
         await env.SLUG_KV.put(key.name, JSON.stringify({ ...data, slug: newSlug, checkedAt: now }));
@@ -647,8 +603,8 @@ function detectPageType(url) {
   if (p === '/' || p === '')                   return 'home';
   if (/\/\d{4}\/\d{2}\/[^/]+\.html$/.test(p)) return 'post';
   if (/^\/p\//.test(p))                        return 'page';
-  if (p.startsWith('/search/label/'))           return 'label';
-  if (p.startsWith('/search'))                  return 'search';
+  if (p.startsWith('/search/label/'))          return 'label';
+  if (p.startsWith('/search'))                 return 'search';
   return 'other';
 }
 
@@ -767,7 +723,7 @@ function buildMetaDescription(bodyText, title) {
 
 function extractFirstImage(html)  { return (html.match(/<img[^>]+src=["']([^"']+)["']/i) || [])[1] || ''; }
 function extractSiteName(html)    { return extractMeta(html, 'og:site_name') || extractTagContent(html, /<title[^>]*>([^<|]+)/i) || ''; }
-function extractLogoUrl(html)     {
+function extractLogoUrl(html) {
   return (
     html.match(/<img[^>]+id=["']Header1_headerimg["'][^>]+src=["']([^"']+)["']/i) ||
     html.match(/<link[^>]+rel=["']icon["'][^>]+href=["']([^"']+)["']/i) ||
