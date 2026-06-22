@@ -1,14 +1,12 @@
 # wrangler.toml
-# Blogspot SEO & Performance Optimization Worker 설정
+# Blogspot SEO & Performance Optimization Worker
 
 name = "blogspot-seo-worker"
 main = "worker.js"
 compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
 
 # ─── KV 네임스페이스 ───────────────────────────────────────
-# 아래 id 값은 본인의 Cloudflare 계정 KV ID로 교체하세요.
-# wrangler kv:namespace create SLUG_KV
-# wrangler kv:namespace create CACHE_RESERVE_KV
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "dee1ee21fe4c44559bce049b53cf4d0a"
@@ -17,19 +15,10 @@ id      = "dee1ee21fe4c44559bce049b53cf4d0a"
 binding = "CACHE_RESERVE_KV"
 id      = "7153daa4c5874bc581670f75adf66a22"
 
-# ─── Secret 설정 (필수 1개) ────────────────────────────────
-# Cloudflare 대시보드 → Workers & Pages → 해당 워커
-# → Settings → Variables and Secrets 에서 아래를 Secret으로 추가:
-#
-#   BLOGGER_API_KEY   Google Cloud Console에서 발급한 Blogger API 키
-#                     (APIs & Services → Credentials → API key)
-#                     Blogger API v3 활성화 필요
-#
-# ※ 이것만 설정하면 blogspot origin이 자동으로 탐지됩니다.
-
 # ─── 스케줄드 트리거 ────────────────────────────────────────
 [triggers]
 crons = ["0 * * * *"]
+
 
 [observability]
 enabled = false
@@ -45,3 +34,18 @@ invocation_logs = true
 enabled = false
 persist = true
 head_sampling_rate = 1
+
+
+# ─── 선택적 환경 변수 (Workers 대시보드 Settings에서 추가) ──
+# 아래는 모두 선택사항. 설정 안 해도 기본값으로 동작.
+#
+# LB_ALGO      로드밸런싱 알고리즘 (기본: least_rtt)
+#              선택값: least_rtt | round_robin | weighted_rr |
+#                      least_connections | least_bandwidth | ip_hash | geo
+#
+# LB_WEIGHTS   가중 라운드로빈용 JSON (LB_ALGO=weighted_rr 일 때만 사용)
+#              예: {"https://aaa.blogspot.com":3,"https://bbb.blogspot.com":1}
+#
+# LB_GEO_MAP   지역 라우팅 맵 JSON (LB_ALGO=geo 일 때만 사용)
+#              예: {"APAC":"https://aaa.blogspot.com","NA":"https://bbb.blogspot.com"}
+#              지역코드: APAC | NA | EU | SA | MEA
