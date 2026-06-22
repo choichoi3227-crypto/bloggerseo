@@ -1,36 +1,30 @@
 /**
  * Blogspot SEO & Performance Optimization Worker
  * ─────────────────────────────────────────────────
- * 설정 제로 — Route 추가만 하면 끝
- *
- * ┌─ 핵심 동작 원리 ───────────────────────────────────────────────┐
- * │  요청 호스트의 CNAME이 ghs.google.com인지 1.1.1.1 DoH로 검증. │
- * │  검증된 커스텀 도메인 → ghs.google.com HEAD로 blogspot URL    │
- * │  추출 → blogspot.com으로 직접 fetch → 콘텐츠 반환.            │
- * │                                                                  │
- * │  CNAME 검증 결과는 KV에 캐시 (24h) → 이후 요청 즉시 통과.     │
- * │  origin URL은 KV에 캐시 (30d) → 탐지는 최초 1회만.            │
- * │  검증 실패 시 → 502 Bad Gateway.                               │
- * └──────────────────────────────────────────────────────────────────┘
+ * - blogspot.com 원본 탐지 없음
+ * - 리다이렉트 추적 없음 (redirect: 'manual')
+ * - cf.resolveOverride: 'ghs.google.com' 으로 DNS 우회
+ * - CNAME 검증 실패해도 차단하지 않음 (soft 검증)
+ * - 525 등 SSL 에러 방지
  */
 
 // ─────────────────────────────────────────────
 // 상수
 // ─────────────────────────────────────────────
-const CACHE_TTL        = 30 * 60;
-const CNAME_CACHE_TTL  = 24 * 3600 * 1000;
-const SLUG_CHECK_MS    = 6 * 30 * 24 * 3600 * 1000;
-const LB_RTT_DECAY     = 0.25;
-const LB_RTT_TTL       = 60;
-const GHS_CNAME_TARGET = 'ghs.google.com';
-const DOH_URL          = 'https://1.1.1.1/dns-query';
+const CACHE_TTL       = 30 * 60;
+const CNAME_CACHE_TTL = 24 * 3600 * 1000;
+const SLUG_CHECK_MS   = 6 * 30 * 24 * 3600 * 1000;
+const LB_RTT_DECAY    = 0.25;
+const LB_RTT_TTL      = 60;
+const GHS_TARGET      = 'ghs.google.com';
+const DOH_URL         = 'https://1.1.1.1/dns-query';
 
 // ─────────────────────────────────────────────
 // KV 키 헬퍼
 // ─────────────────────────────────────────────
 const kvCname = h => 'cname_ok:' + h;
-const kvRtt   = o => 'lb:rtt:'   + o;
-const kvBw    = o => 'lb:bw:'    + o;
+const kvRtt   = h => 'lb:rtt:'   + h;
+const kvBw    = h => 'lb:bw:'    + h;
 
 // ─────────────────────────────────────────────
 // 메인 핸들러
@@ -58,11 +52,9 @@ async function handleFetch(request, env, ctx) {
     return bloggerDebug(url, env);
   }
 
-  // ── CNAME 검증 ────────────────────────────────
-  const isValid = await isBloggerDomain(host, env, ctx);
-  if (!isValid) {
-    return errResp(502, 'CNAME validation failed: ' + host + ' does not point to ghs.google.com');
-  }
+  // ── CNAME 검증 (soft: 실패해도 차단 안 함, 로그만) ──
+  // blogspot.com 추적 없이 ghs.google.com resolveOverride만 사용
+  ctx.waitUntil(warmCnameCache(host, env));
 
   // ── 1. 정적 자산 / Feed / Sitemap 직통 ──────
   if (isPassthrough(path, url)) {
@@ -84,12 +76,17 @@ async function handleFetch(request, env, ctx) {
   let originResp;
   const t0 = Date.now();
   try {
-    originResp = await bloggerFetch(url, 'GET', request.headers, null, env);
+    originResp = await bloggerFetch(url, 'GET', request.headers);
   } catch (e) {
     return errResp(502, 'Fetch failed: ' + e.message);
   }
   const rtt = Date.now() - t0;
   ctx.waitUntil(lbRecordRtt(host, rtt, env));
+
+  // 3xx: 리다이렉트 그대로 반환 (루프 방지)
+  if (originResp.status >= 300 && originResp.status < 400) {
+    return stripInternalHeaders(originResp);
+  }
 
   if (originResp.status >= 500) return errResp(originResp.status, 'Origin error ' + originResp.status);
   if (!isHtml(originResp) || !originResp.ok) return stripInternalHeaders(originResp);
@@ -114,79 +111,29 @@ async function handleFetch(request, env, ctx) {
 }
 
 // ─────────────────────────────────────────────
-// CNAME 검증
+// CNAME 캐시 워밍 (soft, 차단 안 함)
 // ─────────────────────────────────────────────
-async function isBloggerDomain(host, env, ctx) {
+async function warmCnameCache(host, env) {
+  if (!env.SLUG_KV) return;
   try {
-    const raw = env.SLUG_KV ? await env.SLUG_KV.get(kvCname(host)) : null;
+    const raw = await env.SLUG_KV.get(kvCname(host));
     if (raw !== null) {
       const parsed = JSON.parse(raw);
-      if (Date.now() - parsed.ts < CNAME_CACHE_TTL) return true;
+      if (Date.now() - parsed.ts < CNAME_CACHE_TTL) return;
       env.SLUG_KV.delete(kvCname(host)).catch(() => {});
     }
-  } catch (_) {}
-
-  const ok = await checkCnameGhs(host);
-
-  if (ok) {
-    try {
-      if (env.SLUG_KV) {
-        ctx.waitUntil(
-          env.SLUG_KV.put(kvCname(host), JSON.stringify({ ok: true, ts: Date.now() }), { expirationTtl: 86400 })
-        );
-      }
-    } catch (_) {}
-  }
-
-  return ok;
-}
-
-const CF_IP_RANGES_V4 = [
-  [0x671503FC, 22],
-  [0x671603C8, 22],
-  [0x671F0400, 22],
-  [0x68100000, 13],
-  [0x68180000, 14],
-  [0x6CA2C000, 18],
-  [0x830048,   22],
-  [0xA29E0000, 15],
-  [0xAC400000, 13],
-  [0xADF53000, 20],
-  [0xBC720000, 20],
-  [0xBE5DF000, 20],
-  [0xC5EAF000, 22],
-  [0xC6298000, 17],
-];
-
-function ipToInt(ip) {
-  return ip.split('.').reduce((acc, o) => (acc << 8) + parseInt(o, 10), 0) >>> 0;
-}
-
-function isCfIp(ip) {
-  if (ip.includes(':')) return ip.toLowerCase().startsWith('2606:4700') || ip.toLowerCase().startsWith('2400:cb00');
-  const n = ipToInt(ip);
-  for (const [base, prefix] of CF_IP_RANGES_V4) {
-    const mask = prefix === 32 ? 0xFFFFFFFF : ~((1 << (32 - prefix)) - 1) >>> 0;
-    if ((n & mask) === (base & mask)) return true;
-  }
-  return false;
-}
-
-async function isProxiedByCf(host) {
-  try {
-    const resp = await fetch(
-      `${DOH_URL}?name=${encodeURIComponent(host)}&type=A`,
-      { headers: { accept: 'application/dns-json' }, cf: { cacheTtl: 60, cacheEverything: true } }
+    const ok = await checkCnameGhs(host);
+    await env.SLUG_KV.put(
+      kvCname(host),
+      JSON.stringify({ ok, ts: Date.now() }),
+      { expirationTtl: 86400 }
     );
-    if (!resp.ok) return false;
-    const data = await resp.json();
-    if (!data || !Array.isArray(data.Answer)) return false;
-    const aRecs = data.Answer.filter(r => r.type === 1).map(r => String(r.data));
-    if (aRecs.length === 0) return false;
-    return aRecs.every(ip => isCfIp(ip));
-  } catch (_) { return false; }
+  } catch (_) {}
 }
 
+// ─────────────────────────────────────────────
+// CNAME 확인 (DoH)
+// ─────────────────────────────────────────────
 async function checkCnameGhs(host) {
   let current = host;
   const seen  = new Set();
@@ -197,11 +144,9 @@ async function checkCnameGhs(host) {
     try { cname = await dnsCname(current); } catch (_) { break; }
     if (!cname) break;
     const normalized = cname.replace(/\.$/, '').toLowerCase();
-    if (normalized === GHS_CNAME_TARGET) return true;
+    if (normalized === GHS_TARGET) return true;
     current = normalized;
   }
-  const proxied = await isProxiedByCf(host);
-  if (proxied) return true;
   return false;
 }
 
@@ -218,76 +163,23 @@ async function dnsCname(host) {
 }
 
 // ─────────────────────────────────────────────
-// Blogger origin 탐지 + fetch
+// Blogger fetch
 //
-// ghs.google.com에 HEAD + Host: 커스텀도메인
-// → Google이 301 Location: https://xxx.blogspot.com/ 반환
-// → 해당 blogspot.com URL로 실제 콘텐츠 fetch
-//
-// - Worker 재호출 없음 (SNI = ghs.google.com, 525 없음)
-// - blogspot.com fetch 시 Google이 커스텀도메인으로 리다이렉트 안 함
-// - origin URL은 KV에 30일 캐시 → 탐지는 최초 1회만
+// 커스텀 도메인 URL 그대로 fetch.
+// cf.resolveOverride: 'ghs.google.com' 으로
+// DNS 해석만 ghs IP로 우회.
+// SNI와 Host 헤더는 커스텀 도메인 그대로 유지
+// → SSL 정상 (525 없음)
+// → Blogger가 Host로 블로그 식별
+// → blogspot.com 탐지/추적 없음
+// → redirect: 'manual' 로 리다이렉트 루프 방지
 // ─────────────────────────────────────────────
-async function getOriginUrl(host, env) {
-  const kvKey = 'origin:' + host;
-  try {
-    if (env.SLUG_KV) {
-      const cached = await env.SLUG_KV.get(kvKey);
-      if (cached) return cached;
-    }
-  } catch (_) {}
-
-  let origin = null;
-
-  // 1차: ghs.google.com HEAD → 301 Location
-  try {
-    const resp = await fetch('https://ghs.google.com/', {
-      method: 'HEAD',
-      redirect: 'manual',
-      headers: {
-        'host':       host,
-        'user-agent': 'Mozilla/5.0',
-      },
-    });
-    const loc = resp.headers.get('location') || '';
-    const m   = loc.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-    if (m) origin = 'https://' + m[1];
-  } catch (_) {}
-
-  // 2차 fallback: ghs.google.com feeds 요청
-  if (!origin) {
-    try {
-      const resp = await fetch('https://ghs.google.com/feeds/posts/default?alt=json&max-results=1', {
-        redirect: 'follow',
-        headers: {
-          'host':       host,
-          'user-agent': 'Mozilla/5.0',
-        },
-      });
-      const text = await resp.text().catch(() => '');
-      const m = text.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-      if (m) origin = 'https://' + m[1];
-    } catch (_) {}
-  }
-
-  if (origin) {
-    try {
-      if (env.SLUG_KV) await env.SLUG_KV.put(kvKey, origin, { expirationTtl: 86400 * 30 });
-    } catch (_) {}
-  }
-
-  return origin;
-}
-
-async function bloggerFetch(url, method, reqHeaders, body, env) {
+async function bloggerFetch(url, method, reqHeaders) {
   const params = new URLSearchParams(url.search);
   params.delete('m');
   const qs = params.toString() ? '?' + params.toString() : '';
 
-  const origin = await getOriginUrl(url.hostname, env);
-  if (!origin) throw new Error('blogspot origin 탐지 실패: ' + url.hostname);
-
-  const targetUrl = origin + url.pathname + qs;
+  const targetUrl = url.origin + url.pathname + qs;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
@@ -303,8 +195,11 @@ async function bloggerFetch(url, method, reqHeaders, body, env) {
   return fetch(targetUrl, {
     method,
     headers,
-    body: ['GET', 'HEAD'].includes(method) ? undefined : body,
-    redirect: 'follow',
+    body: ['GET', 'HEAD'].includes(method) ? undefined : null,
+    redirect: 'manual',   // 리다이렉트 추적 안 함 → 루프 없음
+    cf: {
+      resolveOverride: GHS_TARGET,  // DNS만 ghs IP로 우회, SNI/Host는 커스텀도메인 유지
+    },
   });
 }
 
@@ -312,17 +207,44 @@ async function bloggerFetch(url, method, reqHeaders, body, env) {
 // 디버그
 // ─────────────────────────────────────────────
 async function bloggerDebug(url, env) {
-  const host   = url.hostname;
-  const origin = await getOriginUrl(host, env);
-  const info   = {
+  const host = url.hostname;
+  let status = 0, ok = false, errorMsg = null;
+  try {
+    const resp = await fetch(url.origin + '/', {
+      method: 'HEAD',
+      headers: { 'user-agent': 'Mozilla/5.0' },
+      redirect: 'manual',
+      cf: { resolveOverride: GHS_TARGET },
+    });
+    status = resp.status;
+    ok = resp.ok || resp.status === 301 || resp.status === 302;
+  } catch (e) {
+    errorMsg = String(e.message);
+  }
+
+  let cnameOk = null;
+  if (env.SLUG_KV) {
+    try {
+      const raw = await env.SLUG_KV.get(kvCname(host));
+      if (raw) cnameOk = JSON.parse(raw).ok;
+    } catch (_) {}
+  }
+
+  const info = {
     host,
-    detectedOrigin: origin,
-    message: origin
-      ? 'OK: blogspot origin 탐지 성공'
-      : 'FAIL: blogspot origin 탐지 실패. Blogger 커스텀 도메인 설정을 확인하세요.',
+    resolveOverride: GHS_TARGET,
+    ghsStatus: status,
+    ok,
+    cnamePointsToGhs: cnameOk,
+    ...(errorMsg ? { error: errorMsg } : {}),
+    message: errorMsg
+      ? 'ERROR: fetch 실패: ' + errorMsg
+      : ok
+        ? 'OK: ghs.google.com resolveOverride 정상 동작'
+        : 'FAIL: 응답 이상 (status=' + status + '). Blogger 커스텀 도메인 설정을 확인하세요.',
   };
   return new Response(JSON.stringify(info, null, 2), {
-    status: origin ? 200 : 502,
+    status: ok ? 200 : 502,
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
   });
 }
@@ -332,7 +254,8 @@ async function bloggerDebug(url, env) {
 // ─────────────────────────────────────────────
 async function proxyPass(url, request, env) {
   try {
-    const resp = await bloggerFetch(url, request.method, request.headers, request.body, env);
+    const resp = await bloggerFetch(url, request.method, request.headers);
+    // 정적 자산 리다이렉트도 그대로 통과
     return stripInternalHeaders(resp);
   } catch (e) {
     return errResp(502, 'Proxy fetch failed: ' + e.message);
@@ -466,7 +389,7 @@ async function runSlugAudit(env) {
         const newSlug = generateSlug(data.title);
         if (newSlug !== data.slug) {
           const op = data.path.replace(/[^/]+\.html$/, data.slug + '.html');
-          const np = data.path.replace(/[^/]+\.html$/, newSlug   + '.html');
+          const np = data.path.replace(/[^/]+\.html$/, newSlug  + '.html');
           if (op !== np) await env.SLUG_KV.put('canonical:' + op, np);
         }
         await env.SLUG_KV.put(key.name, JSON.stringify({ ...data, slug: newSlug, checkedAt: now }));
