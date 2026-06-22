@@ -263,7 +263,7 @@ async function bloggerFetch(url, method, reqHeaders, body) {
   const qs        = params.toString() ? '?' + params.toString() : '';
 
   // ghs.google.com으로 직접 TCP 연결, Host는 커스텀 도메인 유지
-  const targetUrl = 'https://ghs.google.com' + url.pathname + qs;
+  const targetUrl = 'http://ghs.google.com' + url.pathname + qs;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
