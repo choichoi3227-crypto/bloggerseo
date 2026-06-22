@@ -64,6 +64,11 @@ async function handleFetch(request, env, ctx) {
   const host = url.hostname;
   const path = url.pathname;
 
+  // ── 디버그 엔드포인트 /__blogger_debug ────────
+  if (path === '/__blogger_debug') {
+    return bloggerDebug(url, env);
+  }
+
   // ── CNAME 검증 (ghs.google.com 여부) ────────
   const isValid = await isBloggerDomain(host, env, ctx);
   if (!isValid) {
@@ -90,7 +95,7 @@ async function handleFetch(request, env, ctx) {
   let originResp;
   const t0 = Date.now();
   try {
-    originResp = await bloggerFetch(url, 'GET', request.headers, null);
+    originResp = await bloggerFetch(url, 'GET', request.headers, null, env);
   } catch (e) {
     return errResp(502, 'Fetch failed: ' + e.message);
   }
@@ -124,27 +129,31 @@ async function handleFetch(request, env, ctx) {
 // ghs.google.com을 최종적으로 가리키면 true
 // ─────────────────────────────────────────────
 async function isBloggerDomain(host, env, ctx) {
-  // KV 캐시 먼저 확인
+  // KV 캐시 확인 (성공 결과만 캐시됨)
   try {
     const raw = env.SLUG_KV ? await env.SLUG_KV.get(kvCname(host)) : null;
     if (raw !== null) {
       const parsed = JSON.parse(raw);
       if (Date.now() - parsed.ts < CNAME_CACHE_TTL) {
-        return parsed.ok;
+        return true; // 캐시에 있으면 항상 true (실패는 저장 안 함)
       }
+      // 만료된 캐시 삭제
+      env.SLUG_KV.delete(kvCname(host)).catch(() => {});
     }
   } catch (_) {}
 
   const ok = await checkCnameGhs(host);
 
-  // KV에 저장
-  try {
-    if (env.SLUG_KV) {
-      ctx.waitUntil(
-        env.SLUG_KV.put(kvCname(host), JSON.stringify({ ok, ts: Date.now() }), { expirationTtl: 86400 })
-      );
-    }
-  } catch (_) {}
+  // 성공한 경우만 KV에 저장 (실패는 캐시하지 않음 — 재시도 가능하도록)
+  if (ok) {
+    try {
+      if (env.SLUG_KV) {
+        ctx.waitUntil(
+          env.SLUG_KV.put(kvCname(host), JSON.stringify({ ok: true, ts: Date.now() }), { expirationTtl: 86400 })
+        );
+      }
+    } catch (_) {}
+  }
 
   return ok;
 }
@@ -246,36 +255,90 @@ async function dnsCname(host) {
 }
 
 // ─────────────────────────────────────────────
-// Blogger fetch: ghs.google.com으로 직접 요청
+// Blogger fetch
 //
-// 커스텀 도메인으로 fetch하면 Cloudflare Worker 자신을 다시 거쳐
-// 무한 리다이렉트 루프 발생 (Too many redirects).
-// → ghs.google.com에 Host: 커스텀도메인 헤더로 직접 요청.
+// 전략: blogspot.com 원본 URL로 직접 fetch.
 //
-// CF Workers의 fetch()는 서브리퀘스트에서 Host 헤더 override 가능.
-// ghs.google.com TCP 연결 + Host: 커스텀도메인 → Blogger 직접 응답.
+// 이유:
+//  - 커스텀 도메인으로 fetch → CF Worker 자신 재호출 → 무한 루프
+//  - ghs.google.com + Host override → SSL 525 또는 404 (host_not_allowed)
+//    (Google이 외부 IP에서 오는 Host override 요청을 차단)
+//
+// 해결:
+//  커스텀 도메인으로 HEAD 요청(redirect:manual) → 301 Location에서
+//  blogspot.com 원본 URL 추출 → 해당 URL로 직접 fetch.
+//  blogspot.com URL로 직접 오면 Blogger는 커스텀도메인으로 리다이렉트
+//  하지 않고 콘텐츠를 바로 반환함.
+//  추출한 origin은 KV에 캐시해서 이후 요청은 탐지 없이 즉시 사용.
 //
 // ?m=1 제거 (Blogger 모바일 파라미터)
 // ─────────────────────────────────────────────
-async function bloggerFetch(url, method, reqHeaders, body) {
+async function getOriginUrl(host, env) {
+  // KV 캐시 확인
+  const kvKey = 'origin:' + host;
+  try {
+    if (env.SLUG_KV) {
+      const cached = await env.SLUG_KV.get(kvKey);
+      if (cached) return cached;
+    }
+  } catch (_) {}
+
+  // 커스텀 도메인으로 HEAD → 301 Location에서 blogspot URL 추출
+  let origin = null;
+  try {
+    const resp = await fetch('https://' + host + '/', {
+      method: 'HEAD',
+      redirect: 'manual',
+      headers: { 'user-agent': 'Mozilla/5.0' },
+    });
+    const loc = resp.headers.get('location') || '';
+    const m   = loc.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
+    if (m) origin = 'https://' + m[1];
+  } catch (_) {}
+
+  // fallback: feeds API 통해 추출
+  if (!origin) {
+    try {
+      const resp = await fetch('https://' + host + '/feeds/posts/default?alt=json&max-results=1', {
+        redirect: 'follow',
+        headers: { 'user-agent': 'Mozilla/5.0' },
+      });
+      const text = await resp.text().catch(() => '');
+      const m = text.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
+      if (m) origin = 'https://' + m[1];
+    } catch (_) {}
+  }
+
+  // KV에 저장 (성공 시만)
+  if (origin) {
+    try {
+      if (env.SLUG_KV) await env.SLUG_KV.put(kvKey, origin, { expirationTtl: 86400 * 30 });
+    } catch (_) {}
+  }
+
+  return origin;
+}
+
+async function bloggerFetch(url, method, reqHeaders, body, env) {
   const params = new URLSearchParams(url.search);
   params.delete('m');
-  const qs        = params.toString() ? '?' + params.toString() : '';
+  const qs = params.toString() ? '?' + params.toString() : '';
 
-  // ghs.google.com으로 직접 TCP 연결, Host는 커스텀 도메인 유지
-  const targetUrl = 'http://ghs.google.com' + url.pathname + qs;
+  // blogspot origin 가져오기
+  const origin = await getOriginUrl(url.hostname, env);
+  if (!origin) throw new Error('blogspot origin 탐지 실패: ' + url.hostname);
+
+  const targetUrl = origin + url.pathname + qs;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
     const kl = k.toLowerCase();
+    if (kl === 'host')            continue;
     if (kl.startsWith('cf-'))     continue;
     if (kl === 'x-forwarded-for') continue;
     if (kl === 'x-real-ip')       continue;
     headers.set(k, v);
   }
-  // Host를 커스텀 도메인으로 설정 → Blogger가 해당 블로그 콘텐츠 반환
-  headers.set('host', url.hostname);
-  // Googlebot UA (Blogger 최적 응답)
   headers.set('user-agent', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
 
   return fetch(targetUrl, {
@@ -286,10 +349,29 @@ async function bloggerFetch(url, method, reqHeaders, body) {
   });
 }
 
+// ─────────────────────────────────────────────
+// 디버그: blogspot origin 탐지 결과 확인
+// ─────────────────────────────────────────────
+async function bloggerDebug(url, env) {
+  const host   = url.hostname;
+  const origin = await getOriginUrl(host, env);
+  const info   = {
+    host,
+    detectedOrigin: origin,
+    message: origin
+      ? 'OK: blogspot origin 탐지 성공'
+      : 'FAIL: blogspot origin 탐지 실패. Blogger 커스텀 도메인 설정을 확인하세요.',
+  };
+  return new Response(JSON.stringify(info, null, 2), {
+    status: origin ? 200 : 502,
+    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+  });
+}
+
 // Feed/Sitemap 등 직통 프록시 (HTML 처리 없이 그대로 반환)
 async function proxyPass(url, request, env) {
   try {
-    const resp = await bloggerFetch(url, request.method, request.headers, request.body);
+    const resp = await bloggerFetch(url, request.method, request.headers, request.body, env);
     return stripInternalHeaders(resp);
   } catch (e) {
     return errResp(502, 'Proxy fetch failed: ' + e.message);
