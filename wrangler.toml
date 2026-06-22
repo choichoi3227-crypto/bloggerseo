@@ -36,3 +36,18 @@ id      = "7153daa4c5874bc581670f75adf66a22"
 # (탐지 완료 후엔 KV 캐시가 있으므로 실제 탐지는 새 도메인에만 발생)
 [triggers]
 crons = ["0 * * * *"]
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
