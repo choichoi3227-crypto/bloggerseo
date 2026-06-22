@@ -103,6 +103,28 @@ async function handleFetch(request, env, ctx) {
   const url  = new URL(request.url);
   const path = url.pathname;
 
+  // ── 탐지용 probe 요청은 루프 방지를 위해 KV 조회만 하고 직통 ──
+  // detectViaDirectFetch()의 시도 2(홈페이지 fetch)가 다시 이 Worker를
+  // 타면 무한 루프가 생기므로, x-blogspot-probe 헤더가 있으면
+  // KV에 이미 저장된 origin으로만 직통 프록시한다.
+  if (request.headers.get('x-blogspot-probe') === '1') {
+    try {
+      const raw = await env.SLUG_KV.get(kvOrigin(url.hostname));
+      if (raw) {
+        const origins = JSON.parse(raw);
+        const canonicalHost = (await env.SLUG_KV.get(kvCanonical(url.hostname))) || url.hostname;
+        const origin = origins[0];
+        const probeResp = await fetch(origin + url.pathname + url.search, {
+          method: 'GET', redirect: 'follow',
+          headers: { 'user-agent': 'Mozilla/5.0 (compatible; BlogspotSEOWorker/1.0)' },
+        });
+        return probeResp;
+      }
+    } catch (_) {}
+    // KV에 없으면 notice 대신 404 반환 (탐지 중에만 발생)
+    return new Response('probe: origin not cached', { status: 404 });
+  }
+
   // ── Origin 조회 ──────────────────────────
   const resolved = await resolveOrigin(url.hostname, env);
   if (!resolved) return notice(['Origin 탐지 실패 — 잠시 후 재시도하거나 Route 설정을 확인하세요.']);
@@ -173,12 +195,18 @@ async function handleFetch(request, env, ctx) {
 // ─────────────────────────────────────────────
 // Origin 자동 탐지 & 캐시
 // ─────────────────────────────────────────────
-// CF 인프라 내에서 외부 API 없이 완전 자동으로 탐지.
-// ghs.google.com 은 Blogger 커스텀 도메인의 실제 CNAME 목적지이므로,
-// HTTP + Host 헤더로 요청하면 Blogger가 blogspot.com 주소로 301 반환.
-// 이 Location에서 실제 origin을 추출 → KV 영구 저장.
+// Workers에서 fetch()는 host 헤더를 임의로 변경할 수 없으므로
+// ghs.google.com 방식은 동작하지 않는다.
+//
+// 대신 커스텀 도메인 자체에 직접 HTTPS 요청을 보내
+// 응답 HTML 또는 feed에서 blogspot origin을 추출한다.
+// Workers Route가 걸려 있으면 자기 자신을 호출하는 루프가 생길 수 있으므로
+// 요청 URL을 https://커스텀도메인/feeds/posts/default?alt=rss 로 보내
+// feed XML(HTML보다 가볍고 항상 blogspot URL을 포함)에서 추출한다.
+// feed는 isPassthrough()에서 Worker를 거치지 않고 origin으로 직통하므로
+// 루프가 발생하지 않는다.
 async function resolveOrigin(host, env) {
-  // 1) KV 캐시 우선 (정상 경로 — 속도 제로)
+  // 1) KV 캐시 우선
   try {
     const raw = await env.SLUG_KV.get(kvOrigin(host));
     if (raw) {
@@ -189,7 +217,7 @@ async function resolveOrigin(host, env) {
   } catch (_) {}
 
   // 2) 첫 요청 시 실시간 탐지
-  const result = await detectViaGhs(host);
+  const result = await detectViaDirectFetch(host);
   if (!result) return null;
 
   try {
@@ -200,73 +228,60 @@ async function resolveOrigin(host, env) {
   return result;
 }
 
-// ghs.google.com 으로 HTTP 요청하여 origin 탐지
-// 반환: { origins: ["https://xxxx.blogspot.com"], canonicalHost: "www.xxx.com" }
-async function detectViaGhs(host) {
-  const ghsUrl = 'http://ghs.google.com/';
+// 커스텀 도메인에 직접 요청해서 blogspot origin 탐지
+// 반환: { origins: ["https://xxxx.blogspot.com"], canonicalHost: "www.xxx.com" } | null
+async function detectViaDirectFetch(host) {
+  const ua = 'Mozilla/5.0 (compatible; BlogspotSEOWorker/1.0)';
 
-  // 시도 1: HTTP manual — Location에서 직접 추출
+  // 시도 1: RSS feed — 가장 가볍고 항상 blogspot URL을 포함
+  // isPassthrough()가 /feeds/ 경로를 Worker 없이 직통시키므로 루프 없음
   try {
-    const resp = await fetch(ghsUrl, {
-      method: 'GET', redirect: 'manual',
-      headers: { host, 'user-agent': 'Mozilla/5.0' },
+    const resp = await fetch(`https://${host}/feeds/posts/default?alt=rss&max-results=1`, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { 'user-agent': ua, accept: 'application/rss+xml, text/xml, */*' },
     });
-    const loc = resp.headers.get('location') || '';
-
-    // Location이 같은 도메인 계열로의 리다이렉트이면 → 정식 호스트 확인 후 재시도
-    const canonical = sameRootHost(loc, host);
-    if (canonical && canonical !== host) {
-      const resp2 = await fetch(ghsUrl, {
-        method: 'GET', redirect: 'manual',
-        headers: { host: canonical, 'user-agent': 'Mozilla/5.0' },
-      });
-      const loc2   = resp2.headers.get('location') || '';
-      const origin = blogspotFromUrl(loc2);
-      if (origin) return { origins: [origin], canonicalHost: canonical };
+    if (resp.ok || resp.status === 301 || resp.status === 302) {
+      // 최종 redirect URL이 blogspot이면 바로 사용
+      try {
+        const fh = new URL(resp.url).hostname;
+        if (/\.blogspot\.com$/i.test(fh)) {
+          return { origins: ['https://' + fh], canonicalHost: host };
+        }
+      } catch (_) {}
+      // 본문에서 추출
+      const xml    = await resp.text().catch(() => '');
+      const origin = extractBlogspotFromContent(xml);
+      if (origin) return { origins: [origin], canonicalHost: host };
     }
-
-    const origin = blogspotFromUrl(loc);
-    if (origin) return { origins: [origin], canonicalHost: host };
   } catch (_) {}
 
-  // 시도 2: HTTP follow — 최종 URL 또는 본문에서 추출
+  // 시도 2: 홈페이지 HTML — feed 실패 시 폴백
+  // Workers Route는 HTML 페이지에도 걸리므로, 여기서 루프가 생길 수 있음.
+  // 루프 방지를 위해 X-Probe 헤더를 붙이고, handleFetch에서
+  // 이 헤더가 있으면 탐지 fetch임을 인식해 resolveOrigin을 건너뛰고 origin으로 직통.
   try {
-    const resp = await fetch(ghsUrl, {
-      method: 'GET', redirect: 'follow',
-      headers: { host, 'user-agent': 'Mozilla/5.0' },
+    const resp = await fetch(`https://${host}/`, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { 'user-agent': ua, 'x-blogspot-probe': '1' },
     });
     try {
       const fh = new URL(resp.url).hostname;
-      if (/\.blogspot\.com$/i.test(fh)) return { origins: ['https://' + fh], canonicalHost: host };
+      if (/\.blogspot\.com$/i.test(fh)) {
+        return { origins: ['https://' + fh], canonicalHost: host };
+      }
     } catch (_) {}
-    const html   = await resp.text().catch(() => '');
-    const origin = extractBlogspotFromContent(html);
-    if (origin) return { origins: [origin], canonicalHost: host };
+    if (resp.ok) {
+      const html   = await resp.text().catch(() => '');
+      const origin = extractBlogspotFromContent(html);
+      if (origin) return { origins: [origin], canonicalHost: host };
+    }
   } catch (_) {}
 
   return null;
 }
 
-// Location URL이 같은 루트 도메인이면 해당 호스트 반환, 아니면 null
-function sameRootHost(location, originalHost) {
-  if (!location) return null;
-  try {
-    const lh = new URL(location).hostname;
-    // co.kr 같은 2단계 ccTLD를 감안해 뒤 3부분 비교
-    const root = h => h.split('.').slice(-3).join('.');
-    if (lh !== originalHost &&
-       (lh.endsWith('.' + originalHost) ||
-        originalHost.endsWith('.' + lh) ||
-        root(lh) === root(originalHost))) return lh;
-  } catch (_) {}
-  return null;
-}
-
-function blogspotFromUrl(url) {
-  if (!url) return null;
-  const m = url.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-  return m ? 'https://' + m[1] : null;
-}
 
 // ─────────────────────────────────────────────
 // 로드 밸런서
