@@ -1,29 +1,17 @@
 /**
  * Blogspot SEO & Performance Optimization Worker
  * ─────────────────────────────────────────────────
- * 설정 제로 — Route 추가만 하면 끝
+ * 필수 Secret: BLOGGER_API_KEY (Google Cloud Console Blogger API v3 키)
  *
- * ┌─ 자동 Origin 탐지 ──────────────────────────────────────────────┐
- * │  Route 추가 → 첫 요청 시 ghs.google.com 방식으로 탐지           │
- * │  (HTTP + Host헤더 → Blogger 301 Location → blogspot 주소 추출)  │
- * │  탐지 결과를 KV에 영구 저장 → 이후 모든 요청은 KV 즉시 조회     │
- * │  CF API / secret / 수동 입력 완전 불필요                         │
- * └─────────────────────────────────────────────────────────────────┘
- *
- * ┌─ 자체 로드 밸런싱 (CF 유료 기능 불사용) ───────────────────────┐
- * │  알고리즘 (요청마다 자동 선택):                                  │
- * │    1. Round Robin        — 순서대로 균등 분배                    │
- * │    2. Weighted RR        — 도메인별 가중치 비례 분배             │
- * │    3. Least RTT          — 최근 응답속도 가장 빠른 origin        │
- * │    4. Least Connections  — 현재 연결 수 가장 적은 origin         │
- * │    5. IP Hash            — 동일 사용자 → 동일 origin (세션 유지) │
- * │    6. Least Bandwidth    — 처리 바이트 가장 적은 origin          │
- * │    7. PoP Geo Routing    — cf-ray 공항코드로 가장 가까운 origin  │
- * │  단일 블로그면 LB 없이 직통 (오버헤드 제로)                     │
+ * ┌─ Origin 탐지 순서 ──────────────────────────────────────────────┐
+ * │  1. KV 캐시 조회 (가장 빠름)                                     │
+ * │  2. Blogger API v3 로 blogspot URL 확인 (BLOGGER_API_KEY 사용)  │
+ * │  3. HTTP fetch 폴백 탐지 (301 Location / 본문 파싱)              │
+ * │  4. BLOGSPOT_ORIGIN 환경변수 (수동 설정 최후 수단)               │
  * └─────────────────────────────────────────────────────────────────┘
  *
  * KV 키 구조:
- *   origin:{host}          → "https://xxxx.blogspot.com"
+ *   origin:{host}          → ["https://xxxx.blogspot.com"]  (JSON 배열)
  *   canonical:host:{host}  → Blogger 정식 커스텀 호스트
  *   lb:rtt:{origin}        → 최근 RTT ms (JSON)
  *   lb:conn:{origin}       → 현재 active 연결 수 (숫자 문자열)
@@ -32,16 +20,14 @@
  *   slug:*, canonical:*    → SEO slug 관련
  */
 
-import { connect } from 'cloudflare:sockets';
-
 // ─────────────────────────────────────────────
 // 상수
 // ─────────────────────────────────────────────
 const CACHE_TTL       = 30 * 60;          // 30분
 const SLUG_CHECK_MS   = 6 * 30 * 24 * 3600 * 1000;
-const LB_RTT_DECAY    = 0.25;             // EWMA 가중치 (새 샘플 반영 비율)
-const LB_RTT_TTL      = 60;              // RTT 측정 캐시 60초
-const LB_ALGO_DEFAULT = 'least_rtt';     // 기본 알고리즘
+const LB_RTT_DECAY    = 0.25;
+const LB_RTT_TTL      = 60;
+const LB_ALGO_DEFAULT = 'least_rtt';
 
 // ─────────────────────────────────────────────
 // KV 키 헬퍼
@@ -55,26 +41,20 @@ const kvRr        = h => 'lb:rr:'          + h;
 
 // ─────────────────────────────────────────────
 // CF PoP 공항코드 → 대륙/지역 매핑
-// (cf-ray: "xxxx-ICN" 에서 "ICN" 추출)
 // ─────────────────────────────────────────────
 const POP_REGION = {
-  // 아시아태평양
   ICN:'APAC', NRT:'APAC', KIX:'APAC', TPE:'APAC', HKG:'APAC',
   SIN:'APAC', KUL:'APAC', BKK:'APAC', SGN:'APAC', MNL:'APAC',
   CGK:'APAC', DEL:'APAC', BOM:'APAC', MAA:'APAC', HYD:'APAC',
   SYD:'APAC', MEL:'APAC', AKL:'APAC', PER:'APAC', BNE:'APAC',
   PVG:'APAC', PEK:'APAC', CAN:'APAC', CTU:'APAC',
-  // 북미
-  LAX:'NA', SJC:'NA', SEA:'NA', PDX:'NA', DEN:'NA', DFW:'NA',
-  ORD:'NA', ATL:'NA', MIA:'NA', IAD:'NA', EWR:'NA', JFK:'NA',
-  BOS:'NA', YYZ:'NA', YVR:'NA', YUL:'NA', SFO:'NA',
-  // 유럽
-  LHR:'EU', AMS:'EU', CDG:'EU', FRA:'EU', MUC:'EU', ZRH:'EU',
-  MAD:'EU', BCN:'EU', FCO:'EU', MXP:'EU', ARN:'EU', CPH:'EU',
-  HEL:'EU', WAW:'EU', PRG:'EU', VIE:'EU', BRU:'EU', DUB:'EU',
-  // 남미
-  GRU:'SA', BOG:'SA', LIM:'SA', SCL:'SA', EZE:'SA',
-  // 중동/아프리카
+  LAX:'NA',  SJC:'NA',  SEA:'NA',  PDX:'NA',  DEN:'NA',  DFW:'NA',
+  ORD:'NA',  ATL:'NA',  MIA:'NA',  IAD:'NA',  EWR:'NA',  JFK:'NA',
+  BOS:'NA',  YYZ:'NA',  YVR:'NA',  YUL:'NA',  SFO:'NA',
+  LHR:'EU',  AMS:'EU',  CDG:'EU',  FRA:'EU',  MUC:'EU',  ZRH:'EU',
+  MAD:'EU',  BCN:'EU',  FCO:'EU',  MXP:'EU',  ARN:'EU',  CPH:'EU',
+  HEL:'EU',  WAW:'EU',  PRG:'EU',  VIE:'EU',  BRU:'EU',  DUB:'EU',
+  GRU:'SA',  BOG:'SA',  LIM:'SA',  SCL:'SA',  EZE:'SA',
   DXB:'MEA', AUH:'MEA', DOH:'MEA', NBO:'MEA', JNB:'MEA', CAI:'MEA',
 };
 
@@ -105,7 +85,7 @@ async function handleFetch(request, env, ctx) {
   const url  = new URL(request.url);
   const path = url.pathname;
 
-  // ── Origin 조회 (KV 캐시 → TCP 탐지 → HTTP 폴백 → 수동 설정 순) ──
+  // ── Origin 조회 ──
   const resolved = await resolveOrigin(url.hostname, env);
   if (!resolved) {
     const debugMsg = [
@@ -113,12 +93,14 @@ async function handleFetch(request, env, ctx) {
       '호스트: ' + url.hostname,
       '',
       '해결 방법:',
-      '1. KV 수동 설정: SLUG_KV에 origin:' + url.hostname + ' 키로 blogspot URL 배열을 JSON 저장',
+      '1. Cloudflare Workers Settings → Variables and Secrets 에서',
+      '   BLOGGER_API_KEY 를 Secret으로 추가 (Google Cloud Console에서 발급)',
+      '2. 또는 BLOGSPOT_ORIGIN=https://xxxx.blogspot.com 를 Secret으로 추가',
+      '3. 또는 SLUG_KV에 origin:' + url.hostname + ' 키로 JSON 배열 저장',
       '   예) ["https://xxxx.blogspot.com"]',
-      '2. 또는 환경변수 BLOGSPOT_ORIGIN=https://xxxx.blogspot.com 설정',
-      '3. 도메인 DNS가 ghs.google.com을 CNAME하고 있는지 확인',
       '',
-      '현재 환경변수 BLOGSPOT_ORIGIN: ' + (env.BLOGSPOT_ORIGIN ? '설정됨' : '미설정'),
+      'BLOGGER_API_KEY 상태: ' + (env.BLOGGER_API_KEY ? '설정됨' : '미설정'),
+      'BLOGSPOT_ORIGIN 상태: ' + (env.BLOGSPOT_ORIGIN ? '설정됨' : '미설정'),
     ];
     return notice(debugMsg, 15);
   }
@@ -188,9 +170,9 @@ async function handleFetch(request, env, ctx) {
 // ─────────────────────────────────────────────
 // 탐지 순서:
 //   1. KV 캐시 조회 (가장 빠름)
-//   2. TCP Socket으로 ghs.google.com:80 탐지 (Workers TCP Socket 지원 시)
-//   3. HTTP fetch 폴백 탐지 (TCP 실패 시)
-//   4. 현재 호스트를 직접 blogspot 주소로 변환 시도 (최후 수단)
+//   2. Blogger API v3 (BLOGGER_API_KEY 사용)
+//   3. HTTP fetch 폴백 탐지 (301 Location / 본문 파싱)
+//   4. BLOGSPOT_ORIGIN 환경변수 (수동 설정)
 async function resolveOrigin(host, env) {
   // 1. KV 캐시 — 가장 빠른 경로
   try {
@@ -202,23 +184,26 @@ async function resolveOrigin(host, env) {
     }
   } catch (_) {}
 
-  // 2. TCP Socket 탐지 시도
   let result = null;
-  try {
-    result = await detectViaGhsTcp(host);
-  } catch (_) {}
 
-  // 3. TCP 실패 시 HTTP fetch 폴백
+  // 2. Blogger API v3 탐지 (BLOGGER_API_KEY 사용)
+  if (!result && env.BLOGGER_API_KEY) {
+    try {
+      result = await detectViaBloggerApi(host, env.BLOGGER_API_KEY);
+    } catch (_) {}
+  }
+
+  // 3. HTTP fetch 폴백 탐지
   if (!result) {
     try {
       result = await detectViaHttpFetch(host);
     } catch (_) {}
   }
 
-  // 4. 탐지 실패 시 — env에 수동 설정된 origin 사용
+  // 4. 수동 설정된 origin 사용 (BLOGSPOT_ORIGIN)
   if (!result) {
     try {
-      const manualOrigin = env.BLOGSPOT_ORIGIN; // 예: "https://xxxx.blogspot.com"
+      const manualOrigin = env.BLOGSPOT_ORIGIN;
       if (manualOrigin && /\.blogspot\.com$/i.test(manualOrigin)) {
         result = { origins: [manualOrigin.replace(/\/$/, '')], canonicalHost: host };
       }
@@ -236,84 +221,100 @@ async function resolveOrigin(host, env) {
   return result;
 }
 
-async function detectViaGhsTcp(host) {
+// ─────────────────────────────────────────────
+// Blogger API v3 탐지
+// ─────────────────────────────────────────────
+// Blogger API로 커스텀 도메인에 연결된 blogspot URL을 가져온다.
+// GET https://www.googleapis.com/blogger/v3/blogs/byurl?url=https://{host}/&key={BLOGGER_API_KEY}
+async function detectViaBloggerApi(host, apiKey) {
   const candidates = [host];
   if (host.startsWith('www.')) candidates.push(host.slice(4));
   else candidates.push('www.' + host);
 
   for (const h of candidates) {
-    const origin = await ghsTcpRequest(h);
-    if (origin) return { origins: [origin], canonicalHost: h };
+    try {
+      const apiUrl = `https://www.googleapis.com/blogger/v3/blogs/byurl?url=https://${h}/&key=${encodeURIComponent(apiKey)}`;
+      const resp = await fetch(apiUrl, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+      });
+
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+
+      // data.url: 블로그의 공식 URL (blogspot.com 또는 커스텀 도메인)
+      // data.selfLink 등에서 blogspot 주소 추출
+      let blogspotOrigin = null;
+
+      // 방법 A: data.url이 직접 blogspot 주소인 경우
+      if (data.url) {
+        const m = data.url.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
+        if (m) blogspotOrigin = 'https://' + m[1];
+      }
+
+      // 방법 B: data.id로 Blogger 기본 도메인 구성
+      // Blogger는 {blogid}.blogspot.com 형태를 사용하지 않으므로
+      // data.url 에서 직접 추출해야 한다.
+      // data.url이 커스텀 도메인인 경우 posts feed에서 blogspot URL 추출
+      if (!blogspotOrigin && data.id) {
+        try {
+          const feedUrl = `https://www.googleapis.com/blogger/v3/blogs/${data.id}/posts?maxResults=1&key=${encodeURIComponent(apiKey)}`;
+          const feedResp = await fetch(feedUrl, { headers: { 'Accept': 'application/json' } });
+          if (feedResp.ok) {
+            const feedData = await feedResp.json();
+            // 포스트 URL에서 blogspot 주소 추출
+            const items = feedData.items || [];
+            for (const item of items) {
+              const postUrl = item.url || '';
+              const bm = postUrl.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
+              if (bm) { blogspotOrigin = 'https://' + bm[1]; break; }
+            }
+            // 포스트 없으면 블로그 자체 URL 재확인
+            if (!blogspotOrigin && feedData.blog && feedData.blog.id) {
+              // selfLink에서 추출 시도
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (blogspotOrigin) {
+        return { origins: [blogspotOrigin], canonicalHost: h };
+      }
+    } catch (_) {}
   }
   return null;
 }
 
-// TCP Socket으로 ghs.google.com:80 에 raw HTTP GET 전송
-// Host 헤더에 커스텀 도메인을 넣어 Blogger의 301 Location을 받아낸다.
-async function ghsTcpRequest(host) {
-  let socket;
-  try {
-    socket = connect({ hostname: 'ghs.google.com', port: 80 });
-    const writer = socket.writable.getWriter();
-    const enc    = new TextEncoder();
-
-    const req = `GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n`;
-    await writer.write(enc.encode(req));
-    await writer.close();
-
-    // 응답 읽기 — 헤더만 필요하므로 최대 4KB
-    const reader = socket.readable.getReader();
-    const chunks = [];
-    let total    = 0;
-    // 타임아웃: 최대 3초
-    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
-    while (total < 4096) {
-      const chunk = await Promise.race([reader.read(), timeout]);
-      if (!chunk || chunk.done) break;
-      chunks.push(chunk.value);
-      total += chunk.value.byteLength;
-    }
-    reader.releaseLock();
-
-    const text     = new TextDecoder().decode(concatUint8(chunks));
-    const location = extractRawHeader(text, 'location');
-    return blogspotFromUrl(location);
-  } catch (_) {
-    return null;
-  } finally {
-    try { if (socket) await socket.close(); } catch (_) {}
-  }
-}
-
-// HTTP fetch 폴백 — ghs.google.com으로 fetch 요청 (redirect: 'manual' 로 301 Location 추출)
-// TCP Socket이 작동하지 않는 환경(로컬 dev, 일부 Workers plan)에서 사용
+// ─────────────────────────────────────────────
+// HTTP fetch 폴백 탐지
+// ─────────────────────────────────────────────
 async function detectViaHttpFetch(host) {
   const candidates = [host];
   if (host.startsWith('www.')) candidates.push(host.slice(4));
   else candidates.push('www.' + host);
 
   for (const h of candidates) {
-    // 방법 A: 실제 도메인으로 직접 fetch (redirect:manual → Location 헤더 확인)
+    // 방법 A: HTTP redirect:manual → Location 헤더에서 blogspot 추출
     try {
       const resp = await fetch(`http://${h}/`, {
         method: 'GET',
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' },
         redirect: 'manual',
       });
-      // 301/302 Location이 blogspot이면 성공
-      const loc = resp.headers.get('location') || '';
+      const loc    = resp.headers.get('location') || '';
       const origin = blogspotFromUrl(loc);
       if (origin) return { origins: [origin], canonicalHost: h };
 
-      // 응답 본문에서 blogspot 주소 추출 시도
+      // 본문에서 blogspot URL 추출
       if (resp.ok || resp.status === 200) {
-        const text = await resp.text().catch(() => '');
+        const text      = await resp.text().catch(() => '');
         const extracted = extractBlogspotFromContent(text);
         if (extracted) return { origins: [extracted], canonicalHost: h };
       }
     } catch (_) {}
 
-    // 방법 B: https로 시도
+    // 방법 B: HTTPS follow → 본문에서 blogspot URL 추출
     try {
       const resp = await fetch(`https://${h}/`, {
         method: 'GET',
@@ -321,7 +322,7 @@ async function detectViaHttpFetch(host) {
         redirect: 'follow',
       });
       if (resp.ok) {
-        const text = await resp.text().catch(() => '');
+        const text      = await resp.text().catch(() => '');
         const extracted = extractBlogspotFromContent(text);
         if (extracted) return { origins: [extracted], canonicalHost: h };
       }
@@ -330,18 +331,23 @@ async function detectViaHttpFetch(host) {
   return null;
 }
 
-function concatUint8(arrays) {
-  const total  = arrays.reduce((s, a) => s + a.byteLength, 0);
-  const result = new Uint8Array(total);
-  let   offset = 0;
-  for (const a of arrays) { result.set(a, offset); offset += a.byteLength; }
-  return result;
-}
-
-function extractRawHeader(rawHttp, name) {
-  const re = new RegExp(`^${name}:\\s*(.+)$`, 'im');
-  const m  = rawHttp.match(re);
-  return m ? m[1].trim() : null;
+// ─────────────────────────────────────────────
+// blogspot HTML/feed 본문에서 origin 추출 (보조)
+// ─────────────────────────────────────────────
+function extractBlogspotFromContent(content) {
+  const patterns = [
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    /<link[^>]+rel=["']EditURI["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    /<meta[^>]+property=["']og:url["'][^>]+content=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    /<loc>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/loc>/i,
+    /<link>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/link>/i,
+    /"(?:id|url)"\s*:\s*"https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"]*"/i,
+  ];
+  for (const re of patterns) {
+    const m = content.match(re);
+    if (m && m[1]) return 'https://' + m[1];
+  }
+  return null;
 }
 
 function blogspotFromUrl(url) {
@@ -350,13 +356,9 @@ function blogspotFromUrl(url) {
   return m ? 'https://' + m[1] : null;
 }
 
-
 // ─────────────────────────────────────────────
 // 로드 밸런서
 // ─────────────────────────────────────────────
-// origins 배열이 1개면 즉시 반환 (오버헤드 제로)
-// 2개 이상이면 7가지 알고리즘을 상황에 맞게 선택
-
 async function lbSelect(origins, host, request, env) {
   if (origins.length === 1) return origins[0];
 
@@ -374,7 +376,6 @@ async function lbSelect(origins, host, request, env) {
   }
 }
 
-// 1. 라운드 로빈 — KV 카운터로 순서 보장
 async function lbRoundRobin(origins, host, env) {
   try {
     const key = kvRr(host);
@@ -385,16 +386,12 @@ async function lbRoundRobin(origins, host, env) {
   } catch (_) { return origins[0]; }
 }
 
-// 2. 가중 라운드 로빈 — env.LB_WEIGHTS JSON 예: {"https://a.blogspot.com":3,"https://b.blogspot.com":1}
 async function lbWeightedRR(origins, host, env) {
   let weights = {};
   try { weights = JSON.parse(env.LB_WEIGHTS || '{}'); } catch (_) {}
-
-  // 가중치 없으면 일반 RR
   const pool = [];
   for (const o of origins) pool.push(...Array(weights[o] || 1).fill(o));
   if (!pool.length) return origins[0];
-
   try {
     const key = kvRr(host) + ':w';
     const cur = parseInt(await env.SLUG_KV.get(key) || '0', 10);
@@ -404,7 +401,6 @@ async function lbWeightedRR(origins, host, env) {
   } catch (_) { return origins[0]; }
 }
 
-// 3. 최소 RTT — EWMA 기반 (새 측정마다 LB_RTT_DECAY 비율로 갱신)
 async function lbLeastRtt(origins, env) {
   const rtts = await Promise.all(origins.map(async o => {
     try {
@@ -416,7 +412,6 @@ async function lbLeastRtt(origins, env) {
   return rtts[0].o;
 }
 
-// 4. 최소 연결 수
 async function lbLeastConn(origins, env) {
   const conns = await Promise.all(origins.map(async o => {
     try {
@@ -428,7 +423,6 @@ async function lbLeastConn(origins, env) {
   return conns[0].o;
 }
 
-// 5. IP Hash — 같은 IP → 같은 origin (세션 고정)
 function lbIpHash(origins, request) {
   const ip = request.headers.get('cf-connecting-ip') || '0';
   let hash = 0;
@@ -436,7 +430,6 @@ function lbIpHash(origins, request) {
   return origins[hash % origins.length];
 }
 
-// 6. 최소 대역폭 (누적 처리 바이트 기준)
 async function lbLeastBw(origins, env) {
   const bws = await Promise.all(origins.map(async o => {
     try {
@@ -448,8 +441,6 @@ async function lbLeastBw(origins, env) {
   return bws[0].o;
 }
 
-// 7. PoP 지역 라우팅 — cf-ray 공항코드로 사용자와 가장 가까운 데이터센터 기준
-// env.LB_GEO_MAP JSON 예: {"APAC":"https://a.blogspot.com","NA":"https://b.blogspot.com"}
 function lbGeo(origins, request, env) {
   const ray    = request.headers.get('cf-ray') || '';
   const region = popRegion(ray);
@@ -458,11 +449,9 @@ function lbGeo(origins, request, env) {
   if (region && geoMap[region] && origins.includes(geoMap[region])) {
     return geoMap[region];
   }
-  // 매핑 없으면 least_rtt 폴백
   return lbLeastRtt(origins, env);
 }
 
-// RTT 측정 결과 EWMA로 KV 갱신 (비동기, 요청 지연 없음)
 async function lbRecordRtt(origin, rttMs, env) {
   try {
     const prev = await env.SLUG_KV.get(kvRtt(origin), { type: 'json' });
@@ -473,18 +462,15 @@ async function lbRecordRtt(origin, rttMs, env) {
   } catch (_) {}
 }
 
-// origin fetch 실패 시 RTT를 매우 높게 설정 (해당 origin 기피)
 async function lbRecordFailure(origin, env) {
   try {
     await env.SLUG_KV.put(kvRtt(origin), JSON.stringify({ rtt: 99999, ts: Date.now() }), { expirationTtl: LB_RTT_TTL });
   } catch (_) {}
 }
 
-// 처리 바이트 누적 (주기적으로 가장 적게 쓴 origin을 선택하기 위함)
 async function lbRecordBandwidth(origin, bytes, env) {
   try {
     const prev = parseInt(await env.SLUG_KV.get(kvBw(origin)) || '0', 10);
-    // 오버플로우 방지: 1TB 초과 시 리셋
     const next = (prev + bytes) > 1e12 ? bytes : prev + bytes;
     await env.SLUG_KV.put(kvBw(origin), String(next), { expirationTtl: 86400 });
   } catch (_) {}
@@ -494,15 +480,12 @@ async function lbRecordBandwidth(origin, bytes, env) {
 // Origin 프록시
 // ─────────────────────────────────────────────
 function proxyFetch(request, url, origin, canonicalHost) {
-  // ?m=1/?m=0 제거 (Blogger 모바일 리다이렉트 경고 방지)
   const p = new URLSearchParams(url.search);
   p.delete('m');
   const qs        = p.toString() ? '?' + p.toString() : '';
   const targetUrl = origin + url.pathname + qs;
 
   const headers = new Headers(request.headers);
-  // Blogger가 인식하는 정식 커스텀 호스트로 Host 헤더 설정
-  // → "이 도메인 모름" 리다이렉트 루프 방지
   headers.set('host', canonicalHost);
   headers.delete('cf-connecting-ip');
   headers.delete('cf-ipcountry');
@@ -518,10 +501,8 @@ function proxyFetch(request, url, origin, canonicalHost) {
 }
 
 // ─────────────────────────────────────────────
-// 응답 정리 — 리다이렉트를 워커가 직접 추적
+// 응답 정리 — 리다이렉트를 워커가 직접 추적 (최대 5단계)
 // ─────────────────────────────────────────────
-// Blogger가 3xx를 내리면 브라우저에 그대로 넘기지 않고 워커가 최대 5단계까지
-// 직접 따라가 최종 콘텐츠를 가져온다 (무한 루프 완전 차단).
 async function sanitize(resp, url, origin, canonicalHost) {
   const originHost  = (() => { try { return new URL(origin).host; } catch(_) { return ''; } })();
   const customHost  = url.host;
@@ -569,13 +550,12 @@ async function sanitize(resp, url, origin, canonicalHost) {
 }
 
 // ─────────────────────────────────────────────
-// 안내 페이지 (탐지 실패 시 — 503으로 변경하여 캐시 방지)
+// 안내 페이지 (503 — 캐시 방지)
 // ─────────────────────────────────────────────
 function notice(lines = [], retryAfter = 10) {
   const comment = lines.length
     ? '\n<!--\n' + lines.join('\n').replace(/-->/g, '--&gt;') + '\n-->'
     : '';
-  // 5초 후 자동 새로고침 + retry 버튼 포함
   const html = `<!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8">
 <meta name="robots" content="noindex,nofollow">
@@ -610,7 +590,6 @@ ${comment}
 </body></html>`;
 
   return new Response(html, {
-    // 503 사용: CDN/브라우저가 캐시하지 않으며, Retry-After로 재시도 안내
     status: 503,
     headers: {
       'content-type':   'text/html; charset=utf-8',
@@ -664,7 +643,7 @@ function isPostPath(path) {
 function transformHtml(html, ctx, url) {
   let o = html;
   o = stripMobileParam(o);
-  o = enforceHttps(o, url);
+  o = enforceHttps(o);        // ← 버그 수정: url 파라미터 제거 (html만 사용)
   o = injectMetaDescription(o, ctx);
   o = injectCanonical(o, ctx, url);
   o = injectSchemaMarkup(o, ctx, url);
@@ -680,6 +659,8 @@ function stripMobileParam(html) {
     .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+/gi, '$1');
 }
 
+// 버그 수정: 원본은 enforceHttps(o, url) 로 호출했지만 함수 정의가 html만 받음
+// → 파라미터 통일
 function enforceHttps(html) {
   return html.replace(/((?:src|href)=["'])http:\/\//gi, '$1https://');
 }
@@ -881,25 +862,6 @@ async function runSlugAudit(env) {
       } catch (_) {}
     }
   } catch (_) {}
-}
-
-// ─────────────────────────────────────────────
-// blogspot HTML/feed 본문에서 origin 추출 (보조)
-// ─────────────────────────────────────────────
-function extractBlogspotFromContent(content) {
-  const patterns = [
-    /<link[^>]+rel=["']canonical["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    /<link[^>]+rel=["']EditURI["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    /<meta[^>]+property=["']og:url["'][^>]+content=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    /<loc>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/loc>/i,
-    /<link>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/link>/i,
-    /"(?:id|url)"\s*:\s*"https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"]*"/i,
-  ];
-  for (const re of patterns) {
-    const m = content.match(re);
-    if (m && m[1]) return 'https://' + m[1];
-  }
-  return null;
 }
 
 // ─────────────────────────────────────────────
