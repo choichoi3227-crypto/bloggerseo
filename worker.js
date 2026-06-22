@@ -105,9 +105,23 @@ async function handleFetch(request, env, ctx) {
   const url  = new URL(request.url);
   const path = url.pathname;
 
-  // ── Origin 조회 (TCP Socket으로 ghs.google.com 탐지, KV 캐시) ──
+  // ── Origin 조회 (KV 캐시 → TCP 탐지 → HTTP 폴백 → 수동 설정 순) ──
   const resolved = await resolveOrigin(url.hostname, env);
-  if (!resolved) return notice(['Origin 탐지 실패 — Route 설정을 확인하세요.']);
+  if (!resolved) {
+    const debugMsg = [
+      'Origin 탐지 실패',
+      '호스트: ' + url.hostname,
+      '',
+      '해결 방법:',
+      '1. KV 수동 설정: SLUG_KV에 origin:' + url.hostname + ' 키로 blogspot URL 배열을 JSON 저장',
+      '   예) ["https://xxxx.blogspot.com"]',
+      '2. 또는 환경변수 BLOGSPOT_ORIGIN=https://xxxx.blogspot.com 설정',
+      '3. 도메인 DNS가 ghs.google.com을 CNAME하고 있는지 확인',
+      '',
+      '현재 환경변수 BLOGSPOT_ORIGIN: ' + (env.BLOGSPOT_ORIGIN ? '설정됨' : '미설정'),
+    ];
+    return notice(debugMsg, 15);
+  }
 
   const { origins, canonicalHost } = resolved;
   const origin = await lbSelect(origins, url.hostname, request, env);
@@ -172,12 +186,13 @@ async function handleFetch(request, env, ctx) {
 // ─────────────────────────────────────────────
 // Origin 자동 탐지 & 캐시
 // ─────────────────────────────────────────────
-// TCP Socket으로 ghs.google.com:80 에 raw HTTP 요청을 직접 작성.
-// fetch()의 host 헤더 제한을 완전히 우회 — Workers TCP Socket API는
-// 임의 호스트로 raw 바이트를 보낼 수 있으므로 Host 헤더를 자유롭게 설정 가능.
-// ghs.google.com 은 Blogger 커스텀 도메인의 CNAME 목적지이므로
-// Host: 커스텀도메인 으로 요청하면 301 Location: https://xxxx.blogspot.com/ 반환.
+// 탐지 순서:
+//   1. KV 캐시 조회 (가장 빠름)
+//   2. TCP Socket으로 ghs.google.com:80 탐지 (Workers TCP Socket 지원 시)
+//   3. HTTP fetch 폴백 탐지 (TCP 실패 시)
+//   4. 현재 호스트를 직접 blogspot 주소로 변환 시도 (최후 수단)
 async function resolveOrigin(host, env) {
+  // 1. KV 캐시 — 가장 빠른 경로
   try {
     const raw = await env.SLUG_KV.get(kvOrigin(host));
     if (raw) {
@@ -187,9 +202,32 @@ async function resolveOrigin(host, env) {
     }
   } catch (_) {}
 
-  const result = await detectViaGhsTcp(host);
+  // 2. TCP Socket 탐지 시도
+  let result = null;
+  try {
+    result = await detectViaGhsTcp(host);
+  } catch (_) {}
+
+  // 3. TCP 실패 시 HTTP fetch 폴백
+  if (!result) {
+    try {
+      result = await detectViaHttpFetch(host);
+    } catch (_) {}
+  }
+
+  // 4. 탐지 실패 시 — env에 수동 설정된 origin 사용
+  if (!result) {
+    try {
+      const manualOrigin = env.BLOGSPOT_ORIGIN; // 예: "https://xxxx.blogspot.com"
+      if (manualOrigin && /\.blogspot\.com$/i.test(manualOrigin)) {
+        result = { origins: [manualOrigin.replace(/\/$/, '')], canonicalHost: host };
+      }
+    } catch (_) {}
+  }
+
   if (!result) return null;
 
+  // KV에 저장 (다음 요청부터 즉시 사용)
   try {
     await env.SLUG_KV.put(kvOrigin(host),    JSON.stringify(result.origins));
     await env.SLUG_KV.put(kvCanonical(host), result.canonicalHost);
@@ -227,11 +265,13 @@ async function ghsTcpRequest(host) {
     const reader = socket.readable.getReader();
     const chunks = [];
     let total    = 0;
+    // 타임아웃: 최대 3초
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
     while (total < 4096) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
+      const chunk = await Promise.race([reader.read(), timeout]);
+      if (!chunk || chunk.done) break;
+      chunks.push(chunk.value);
+      total += chunk.value.byteLength;
     }
     reader.releaseLock();
 
@@ -243,6 +283,51 @@ async function ghsTcpRequest(host) {
   } finally {
     try { if (socket) await socket.close(); } catch (_) {}
   }
+}
+
+// HTTP fetch 폴백 — ghs.google.com으로 fetch 요청 (redirect: 'manual' 로 301 Location 추출)
+// TCP Socket이 작동하지 않는 환경(로컬 dev, 일부 Workers plan)에서 사용
+async function detectViaHttpFetch(host) {
+  const candidates = [host];
+  if (host.startsWith('www.')) candidates.push(host.slice(4));
+  else candidates.push('www.' + host);
+
+  for (const h of candidates) {
+    // 방법 A: 실제 도메인으로 직접 fetch (redirect:manual → Location 헤더 확인)
+    try {
+      const resp = await fetch(`http://${h}/`, {
+        method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' },
+        redirect: 'manual',
+      });
+      // 301/302 Location이 blogspot이면 성공
+      const loc = resp.headers.get('location') || '';
+      const origin = blogspotFromUrl(loc);
+      if (origin) return { origins: [origin], canonicalHost: h };
+
+      // 응답 본문에서 blogspot 주소 추출 시도
+      if (resp.ok || resp.status === 200) {
+        const text = await resp.text().catch(() => '');
+        const extracted = extractBlogspotFromContent(text);
+        if (extracted) return { origins: [extracted], canonicalHost: h };
+      }
+    } catch (_) {}
+
+    // 방법 B: https로 시도
+    try {
+      const resp = await fetch(`https://${h}/`, {
+        method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' },
+        redirect: 'follow',
+      });
+      if (resp.ok) {
+        const text = await resp.text().catch(() => '');
+        const extracted = extractBlogspotFromContent(text);
+        if (extracted) return { origins: [extracted], canonicalHost: h };
+      }
+    } catch (_) {}
+  }
+  return null;
 }
 
 function concatUint8(arrays) {
@@ -484,29 +569,67 @@ async function sanitize(resp, url, origin, canonicalHost) {
 }
 
 // ─────────────────────────────────────────────
-// 안내 페이지 (탐지 실패 시 200 OK — 에러 노출 없음)
+// 안내 페이지 (탐지 실패 시 — 503으로 변경하여 캐시 방지)
 // ─────────────────────────────────────────────
-function notice(lines = []) {
+function notice(lines = [], retryAfter = 10) {
   const comment = lines.length
     ? '\n<!--\n' + lines.join('\n').replace(/-->/g, '--&gt;') + '\n-->'
     : '';
-  return new Response(`<!DOCTYPE html><html lang="ko"><head>
-<meta charset="utf-8"><meta name="robots" content="noindex">
+  // 5초 후 자동 새로고침 + retry 버튼 포함
+  const html = `<!DOCTYPE html><html lang="ko"><head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex,nofollow">
+<meta http-equiv="refresh" content="${retryAfter}">
 <title>사이트 준비 중</title>
-<style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;
-min-height:100vh;margin:0;background:#fafafa}
-.b{text-align:center;padding:2rem}h1{font-size:1.2rem}p{color:#666}</style>
-</head><body><div class="b"><h1>사이트를 준비하고 있습니다</h1>
-<p>잠시 후 다시 시도해 주세요.</p></div>${comment}</body></html>`,
-    { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' } });
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  display:flex;align-items:center;justify-content:center;
+  min-height:100vh;margin:0;background:#f5f5f5}
+.card{text-align:center;padding:2.5rem 2rem;background:#fff;
+  border-radius:12px;box-shadow:0 2px 16px rgba(0,0,0,.08);max-width:400px;width:90%}
+.spinner{width:36px;height:36px;border:3px solid #e0e0e0;
+  border-top-color:#4285f4;border-radius:50%;animation:spin 0.9s linear infinite;margin:0 auto 1.2rem}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{font-size:1.1rem;color:#202124;margin:0 0 .5rem}
+p{color:#5f6368;font-size:.92rem;margin:0 0 1.2rem;line-height:1.5}
+button{background:#4285f4;color:#fff;border:none;padding:.55rem 1.4rem;
+  border-radius:6px;font-size:.9rem;cursor:pointer;transition:background .2s}
+button:hover{background:#3367d6}
+.note{font-size:.78rem;color:#aaa;margin-top:.8rem}
+</style>
+</head><body>
+<div class="card">
+  <div class="spinner"></div>
+  <h1>사이트를 준비하고 있습니다</h1>
+  <p>Origin 서버에 연결하는 중입니다.<br>잠시 후 자동으로 새로고침됩니다.</p>
+  <button onclick="location.reload()">지금 다시 시도</button>
+  <div class="note">${retryAfter}초 후 자동 새로고침</div>
+</div>
+${comment}
+</body></html>`;
+
+  return new Response(html, {
+    // 503 사용: CDN/브라우저가 캐시하지 않으며, Retry-After로 재시도 안내
+    status: 503,
+    headers: {
+      'content-type':   'text/html; charset=utf-8',
+      'cache-control':  'no-store, no-cache, must-revalidate',
+      'retry-after':    String(retryAfter),
+      'x-robots-tag':   'noindex,nofollow',
+    },
+  });
 }
 
 // ─────────────────────────────────────────────
 // 라우트 / HTML 판별
 // ─────────────────────────────────────────────
 function isPassthrough(path, url) {
-  if (path.startsWith('/feeds/'))  return true;
-  if (url.searchParams.has('alt')) return true;
+  if (path.startsWith('/feeds/'))       return true;
+  if (path === '/sitemap.xml')          return true;
+  if (path === '/robots.txt')           return true;
+  if (path.startsWith('/favicon'))      return true;
+  if (url.searchParams.has('alt'))      return true;
   if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|xml|txt|json)$/i.test(path)) return true;
   return false;
 }
