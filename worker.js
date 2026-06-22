@@ -149,33 +149,82 @@ async function isBloggerDomain(host, env, ctx) {
   return ok;
 }
 
+// Cloudflare 프록시 IP 대역 (오렌지 클라우드 상태이면 A 레코드가 이 대역)
+// https://www.cloudflare.com/ips/
+const CF_IP_RANGES_V4 = [
+  [0x67100000, 20], // 103.16.0.0/20  (103.16.x.x)  — 실제론 아래 대역이 주요
+  [0x671503FC, 22], // 103.21.244.0/22
+  [0x671603C8, 22], // 103.22.200.0/22
+  [0x671F0400, 22], // 103.31.4.0/22
+  [0x68100000, 13], // 104.16.0.0/13
+  [0x68180000, 14], // 104.24.0.0/14
+  [0x6CA2C000, 18], // 108.162.192.0/18
+  [0x830048, 22],   // 131.0.72.0/22
+  [0x8D650000, 18], // 141.101.64.0/18 — skip (불필요 복잡)
+  [0xA29E0000, 15], // 162.158.0.0/15
+  [0xAC400000, 13], // 172.64.0.0/13   ← 172.67.x.x 포함
+  [0xADF53000, 20], // 173.245.48.0/20
+  [0xBC720000, 20], // 188.114.96.0/20
+  [0xBE5DF000, 20], // 190.93.240.0/20
+  [0xC5EAF000, 22], // 197.234.240.0/22
+  [0xC6298000, 17], // 198.41.128.0/17
+];
+
+function ipToInt(ip) {
+  return ip.split('.').reduce((acc, o) => (acc << 8) + parseInt(o, 10), 0) >>> 0;
+}
+
+function isCfIp(ip) {
+  // IPv6이면 일단 CF로 간주 (2606:4700::/32 대역)
+  if (ip.includes(':')) return ip.toLowerCase().startsWith('2606:4700') || ip.toLowerCase().startsWith('2400:cb00');
+  const n = ipToInt(ip);
+  for (const [base, prefix] of CF_IP_RANGES_V4) {
+    const mask = prefix === 32 ? 0xFFFFFFFF : ~((1 << (32 - prefix)) - 1) >>> 0;
+    if ((n & mask) === (base & mask)) return true;
+  }
+  return false;
+}
+
+// DoH로 A 레코드 조회 → 모두 Cloudflare IP이면 프록시 상태
+async function isProxiedByCf(host) {
+  try {
+    const resp = await fetch(
+      `${DOH_URL}?name=${encodeURIComponent(host)}&type=A`,
+      { headers: { accept: 'application/dns-json' }, cf: { cacheTtl: 60, cacheEverything: true } }
+    );
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    if (!data || !Array.isArray(data.Answer)) return false;
+    const aRecs = data.Answer.filter(r => r.type === 1).map(r => String(r.data));
+    if (aRecs.length === 0) return false;
+    // 모든 A 레코드가 CF IP 대역이면 프록시 상태
+    return aRecs.every(ip => isCfIp(ip));
+  } catch (_) { return false; }
+}
+
 // 1.1.1.1 DoH CNAME 체인 추적 → ghs.google.com 포함 여부 반환
+// Cloudflare 프록시(오렌지 클라우드) 상태에서는 CNAME이 외부에서 안 보임.
+// 이 경우 A 레코드가 전부 CF IP 대역이면 → 해당 존의 Worker가 이미 실행 중 = 신뢰.
 async function checkCnameGhs(host) {
+  // Case 1: CNAME 체인 직접 추적 (회색 클라우드 / CF 외부 DNS)
   let current = host;
   const seen  = new Set();
-
-  // CNAME 체인을 최대 10단계 추적
   for (let i = 0; i < 10; i++) {
     if (seen.has(current)) break;
     seen.add(current);
-
     let cname;
-    try {
-      cname = await dnsCname(current);
-    } catch (_) {
-      break;
-    }
-
+    try { cname = await dnsCname(current); } catch (_) { break; }
     if (!cname) break;
-
-    // 정규화: 끝의 점(.) 제거
     const normalized = cname.replace(/\.$/, '').toLowerCase();
-
     if (normalized === GHS_CNAME_TARGET) return true;
-
-    // ghs.google.com이 아직 아니면 한 단계 더 따라가기
     current = normalized;
   }
+
+  // Case 2: Cloudflare 프록시(오렌지 클라우드) 상태
+  // → CNAME이 숨겨지고 A 레코드가 CF IP로만 노출됨.
+  // → A 레코드 전체가 CF IP 대역이면 프록시 통과 상태 = 이 Worker가 해당 존에서 동작 중 = Blogger 도메인으로 신뢰.
+  const proxied = await isProxiedByCf(host);
+  if (proxied) return true;
 
   return false;
 }
