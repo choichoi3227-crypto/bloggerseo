@@ -4,9 +4,11 @@
 name = "blogspot-seo-worker"
 main = "worker.js"
 compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
 
 # ─── KV 네임스페이스 ───────────────────────────────────────
+# 아래 id 값은 본인의 Cloudflare 계정 KV ID로 교체하세요.
+# wrangler kv:namespace create SLUG_KV
+# wrangler kv:namespace create CACHE_RESERVE_KV
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "dee1ee21fe4c44559bce049b53cf4d0a"
@@ -15,25 +17,17 @@ id      = "dee1ee21fe4c44559bce049b53cf4d0a"
 binding = "CACHE_RESERVE_KV"
 id      = "7153daa4c5874bc581670f75adf66a22"
 
-# ─── 필수 Secret 설정 ──────────────────────────────────────
-# Cloudflare 대시보드 → Workers & Pages → 해당 워커 → Settings
-# → Variables and Secrets 에서 아래 3개를 Secret으로 추가:
+# ─── Secret 설정 (필수 1개) ────────────────────────────────
+# Cloudflare 대시보드 → Workers & Pages → 해당 워커
+# → Settings → Variables and Secrets 에서 아래를 Secret으로 추가:
 #
-#   CF_ACCOUNT_ID   Cloudflare 계정 ID
-#                   (대시보드 우측 사이드바 또는 계정 홈 URL에서 확인)
+#   BLOGGER_API_KEY   Google Cloud Console에서 발급한 Blogger API 키
+#                     (APIs & Services → Credentials → API key)
+#                     Blogger API v3 활성화 필요
 #
-#   CF_API_TOKEN    API 토큰 (최소 권한: Zone.Worker Routes.Read)
-#                   대시보드 → My Profile → API Tokens → Create Token
-#
-#   CF_ZONE_ID      블로그 도메인이 속한 Zone ID
-#                   대시보드 → 해당 도메인 → Overview 우측 사이드바
-#
-# 사용자가 직접 blogspot 주소를 입력할 필요 없음.
-# Route를 추가하면 scheduled 트리거가 자동으로 탐지해서 저장함.
+# ※ 이것만 설정하면 blogspot origin이 자동으로 탐지됩니다.
 
 # ─── 스케줄드 트리거 ────────────────────────────────────────
-# Route 추가 직후 빠른 반영을 위해 매 시간 실행
-# (탐지 완료 후엔 KV 캐시가 있으므로 실제 탐지는 새 도메인에만 발생)
 [triggers]
 crons = ["0 * * * *"]
 
