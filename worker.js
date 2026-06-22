@@ -1,31 +1,85 @@
 /**
  * Blogspot SEO & Performance Optimization Worker
- * ------------------------------------------------
- * 설정 불필요 — Blogspot 원본 주소 자동 감지
+ * ─────────────────────────────────────────────────
+ * 설정 제로 — Route 추가만 하면 끝
  *
- * 동작 원리:
- *   1) KV(SLUG_KV)에 캐시된 origin(blogspot.com 백엔드) 사용 (가장 빠름)
- *   2) 없으면 커스텀 도메인 응답/ghs.google.com에서 실제 blogspot.com을 추출
- *      (도메인명 추측은 절대 하지 않음 — 항상 응답 안의 실제 참조만 사용)
- *   3) 추출된 origin을 KV에 영구 저장 (이후 요청은 1번 경로)
+ * ┌─ 자동 Origin 탐지 ──────────────────────────────────────────────┐
+ * │  Route 추가 → 첫 요청 시 ghs.google.com 방식으로 탐지           │
+ * │  (HTTP + Host헤더 → Blogger 301 Location → blogspot 주소 추출)  │
+ * │  탐지 결과를 KV에 영구 저장 → 이후 모든 요청은 KV 즉시 조회     │
+ * │  CF API / secret / 수동 입력 완전 불필요                         │
+ * └─────────────────────────────────────────────────────────────────┘
  *
- * 중요 — 사용자에게는 항상 커스텀 도메인만 노출됨:
- *   - 워커는 사용자의 "개인(커스텀) 도메인"에서 요청을 받는다.
- *   - blogspot.com은 콘텐츠를 가져오기 위한 내부 백엔드 주소일 뿐,
- *     절대 브라우저 주소창에 노출되면 안 된다.
- *   - 원본(Blogger)에 요청할 때 Host 헤더를 커스텀 도메인으로 유지해야
- *     Blogger가 "정식 도메인"으로 리다이렉트시키지 않는다.
- *   - 혹시 원본이 3xx를 주더라도 sanitizeOriginResponse가 Location을
- *     커스텀 도메인 기준으로 재작성해 blogspot.com이 노출되지 않게 한다.
+ * ┌─ 자체 로드 밸런싱 (CF 유료 기능 불사용) ───────────────────────┐
+ * │  알고리즘 (요청마다 자동 선택):                                  │
+ * │    1. Round Robin        — 순서대로 균등 분배                    │
+ * │    2. Weighted RR        — 도메인별 가중치 비례 분배             │
+ * │    3. Least RTT          — 최근 응답속도 가장 빠른 origin        │
+ * │    4. Least Connections  — 현재 연결 수 가장 적은 origin         │
+ * │    5. IP Hash            — 동일 사용자 → 동일 origin (세션 유지) │
+ * │    6. Least Bandwidth    — 처리 바이트 가장 적은 origin          │
+ * │    7. PoP Geo Routing    — cf-ray 공항코드로 가장 가까운 origin  │
+ * │  단일 블로그면 LB 없이 직통 (오버헤드 제로)                     │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * KV 키 구조:
+ *   origin:{host}          → "https://xxxx.blogspot.com"
+ *   canonical:host:{host}  → Blogger 정식 커스텀 호스트
+ *   lb:rtt:{origin}        → 최근 RTT ms (JSON)
+ *   lb:conn:{origin}       → 현재 active 연결 수 (숫자 문자열)
+ *   lb:bw:{origin}         → 누적 처리 바이트 (숫자 문자열)
+ *   lb:rr:{host}           → 라운드로빈 카운터
+ *   slug:*, canonical:*    → SEO slug 관련
  */
 
-const CACHE_TTL     = 30 * 60;
-const SLUG_CHECK_MS = 6 * 30 * 24 * 3600 * 1000;
+// ─────────────────────────────────────────────
+// 상수
+// ─────────────────────────────────────────────
+const CACHE_TTL       = 30 * 60;          // 30분
+const SLUG_CHECK_MS   = 6 * 30 * 24 * 3600 * 1000;
+const LB_RTT_DECAY    = 0.25;             // EWMA 가중치 (새 샘플 반영 비율)
+const LB_RTT_TTL      = 60;              // RTT 측정 캐시 60초
+const LB_ALGO_DEFAULT = 'least_rtt';     // 기본 알고리즘
 
-// 다중 도메인 지원: 커스텀 도메인별로 별도 KV 키 사용
-// 예) "__blogspot_origin__:blog1.example.com"
-function originKvKey(hostname) {
-  return '__blogspot_origin__:' + hostname;
+// ─────────────────────────────────────────────
+// KV 키 헬퍼
+// ─────────────────────────────────────────────
+const kvOrigin    = h => 'origin:'         + h;
+const kvCanonical = h => 'canonical:host:' + h;
+const kvRtt       = o => 'lb:rtt:'         + o;
+const kvConn      = o => 'lb:conn:'        + o;
+const kvBw        = o => 'lb:bw:'          + o;
+const kvRr        = h => 'lb:rr:'          + h;
+
+// ─────────────────────────────────────────────
+// CF PoP 공항코드 → 대륙/지역 매핑
+// (cf-ray: "xxxx-ICN" 에서 "ICN" 추출)
+// ─────────────────────────────────────────────
+const POP_REGION = {
+  // 아시아태평양
+  ICN:'APAC', NRT:'APAC', KIX:'APAC', TPE:'APAC', HKG:'APAC',
+  SIN:'APAC', KUL:'APAC', BKK:'APAC', SGN:'APAC', MNL:'APAC',
+  CGK:'APAC', DEL:'APAC', BOM:'APAC', MAA:'APAC', HYD:'APAC',
+  SYD:'APAC', MEL:'APAC', AKL:'APAC', PER:'APAC', BNE:'APAC',
+  PVG:'APAC', PEK:'APAC', CAN:'APAC', CTU:'APAC',
+  // 북미
+  LAX:'NA', SJC:'NA', SEA:'NA', PDX:'NA', DEN:'NA', DFW:'NA',
+  ORD:'NA', ATL:'NA', MIA:'NA', IAD:'NA', EWR:'NA', JFK:'NA',
+  BOS:'NA', YYZ:'NA', YVR:'NA', YUL:'NA', SFO:'NA',
+  // 유럽
+  LHR:'EU', AMS:'EU', CDG:'EU', FRA:'EU', MUC:'EU', ZRH:'EU',
+  MAD:'EU', BCN:'EU', FCO:'EU', MXP:'EU', ARN:'EU', CPH:'EU',
+  HEL:'EU', WAW:'EU', PRG:'EU', VIE:'EU', BRU:'EU', DUB:'EU',
+  // 남미
+  GRU:'SA', BOG:'SA', LIM:'SA', SCL:'SA', EZE:'SA',
+  // 중동/아프리카
+  DXB:'MEA', AUH:'MEA', DOH:'MEA', NBO:'MEA', JNB:'MEA', CAI:'MEA',
+};
+
+function popRegion(cfRay) {
+  if (!cfRay) return null;
+  const m = cfRay.match(/-([A-Z]{3})$/);
+  return m ? (POP_REGION[m[1]] || null) : null;
 }
 
 // ─────────────────────────────────────────────
@@ -33,13 +87,10 @@ function originKvKey(hostname) {
 // ─────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
-    // 최상위 안전망: 아래 handleFetch 안에서 예상하지 못한 예외가 발생해도
-    // 절대 워커가 5xx 크래시 응답으로 새지 않도록 한다. 어떤 에러든
-    // 최종적으로는 200 안내 페이지로 흡수되어, 사용자는 "에러"를 보지 않는다.
     try {
       return await handleFetch(request, env, ctx);
     } catch (e) {
-      return buildSetupNoticeResponse(['처리 중 예외: ' + (e && e.message ? e.message : String(e))]);
+      return notice(['처리 중 예외: ' + String(e && e.message || e)]);
     }
   },
 
@@ -49,584 +100,411 @@ export default {
 };
 
 async function handleFetch(request, env, ctx) {
-    const url  = new URL(request.url);
-    const path = url.pathname;
+  const url  = new URL(request.url);
+  const path = url.pathname;
 
-    // ── 프로브 가드 (무한 루프 절대 방지) ────
-    // resolveOrigin의 detectFromSelf가 "이 커스텀 도메인 자신"에게 직접
-    // fetch를 보내 Blogger의 진짜 응답을 엿보려고 시도한다. 만약 그 도메인이
-    // 같은 zone에서 이 워커로 라우팅되어 있다면, 그 fetch는 워커 자신의
-    // fetch() 핸들러로 다시 들어온다. 이 경우 resolveOrigin → fetch →
-    // resolveOrigin → fetch → ... 무한 재귀가 발생할 수 있으므로,
-    // detectFromSelf는 요청에 X-Origin-Probe 헤더를 반드시 심어 보내고,
-    // 여기서 그 헤더를 발견하면 즉시 502를 돌려주어 재귀를 1회 안에 끊는다.
-    // (이 502는 detectFromSelf 입장에서 "자기 호출이었다"는 명확한 신호이며,
-    //  반대로 이 헤더 없이 정상 HTML이 오면 "Blogger가 직접 응답했다"는 뜻이다.)
-    if (request.headers.get('x-origin-probe') === '1') {
-      return new Response('probe-loop-detected', { status: 502 });
-    }
+  // ── Origin 조회 ──────────────────────────
+  const resolved = await resolveOrigin(url.hostname, env);
+  if (!resolved) return notice(['Origin 탐지 실패 — 잠시 후 재시도하거나 Route 설정을 확인하세요.']);
 
-    // ── 원본 자동 감지 ───────────────────────
-    const resolved          = await resolveOrigin(request, url, env);
-    const origin            = resolved.origin;
-    const canonicalCustomHost = resolved.canonicalCustomHost;
-    if (!origin) {
-      return buildSetupNoticeResponse(resolved.debug || []);
-    }
+  const { origins, canonicalHost } = resolved;
 
-    // ── 1. 정적 자산 / Feed → 원본 직통 ─────
-    if (isPassthrough(path, url)) {
-      try {
-        const resp = await proxyToOrigin(request, url, origin, canonicalCustomHost);
-        const sanitized = await sanitizeOriginResponse(resp, url, origin, canonicalCustomHost);
-        if (sanitized.status >= 500) {
-          return buildSetupNoticeResponse(['원본 응답 5xx (passthrough): ' + sanitized.status]);
-        }
-        return sanitized;
-      } catch (e) {
-        return buildSetupNoticeResponse(['원본 fetch 예외 (passthrough): ' + e.message]);
-      }
-    }
+  // ── 로드 밸런서로 origin 선택 ────────────
+  const origin = await lbSelect(origins, url.hostname, request, env);
 
-    // ── 2. 슬러그 canonical 리다이렉트 ──────
-    const slugRedirect = await checkSlugRedirect(path, url, env);
-    if (slugRedirect) return slugRedirect;
-
-    // ── 3. Cache Reserve 조회 ───────────────
-    const cacheKey = buildCacheKey(url);
-    const cached   = await getCacheReserve(cacheKey, env);
-    if (cached) {
-      return new Response(cached.body, {
-        status:  200,
-        headers: buildCachedHeaders(cached.headers),
-      });
-    }
-
-    // ── 4. Blogspot 원본 직접 Fetch ─────────
-    let originResp;
+  // ── 1. 정적 자산 / Feed 직통 ─────────────
+  if (isPassthrough(path, url)) {
     try {
-      const rawOriginResp = await proxyToOrigin(request, url, origin, canonicalCustomHost);
-      originResp = await sanitizeOriginResponse(rawOriginResp, url, origin, canonicalCustomHost);
+      const resp = await proxyFetch(request, url, origin, canonicalHost);
+      const san  = await sanitize(resp, url, origin, canonicalHost);
+      return san.status >= 500 ? notice(['origin 5xx (passthrough): ' + san.status]) : san;
     } catch (e) {
-      // 원본(Blogger) 네트워크 장애 등 — 사용자에게 502 대신 안내 페이지
-      return buildSetupNoticeResponse(['원본 fetch 예외: ' + e.message]);
-    }
-
-    if (originResp.status >= 500) {
-      // 원본 서버 자체의 5xx 장애 — 그대로 노출하지 않고 안내 페이지로 대체
-      return buildSetupNoticeResponse(['원본 응답 5xx: ' + originResp.status]);
-    }
-    if (!isHtml(originResp) || !originResp.ok) return originResp;
-
-    // ── 5. HTML 파이프라인 ──────────────────
-    const html = await originResp.text();
-    let result, pageCtx;
-    try {
-      pageCtx = extractPageContext(html, url);
-      result  = transformHtml(html, pageCtx, url);
-    } catch (e) {
-      // SEO/성능 변환 중 예기치 못한 예외가 나도 사이트가 죽으면 안 된다.
-      // 변환 없이 원본 HTML을 그대로 서빙해 방문자는 정상적으로 페이지를 본다.
-      return new Response(html, {
-        status: 200,
-        headers: { 'content-type': 'text/html; charset=utf-8' },
-      });
-    }
-
-    // ── 6. 비동기 후처리 ────────────────────
-    const respHeaders = buildResponseHeaders();
-    try { ctx.waitUntil(updateSlugKV(pageCtx, url, env)); } catch (_) {}
-    try { ctx.waitUntil(setCacheReserve(cacheKey, result, respHeaders, env)); } catch (_) {}
-
-    return new Response(result, { status: 200, headers: respHeaders });
-}
-
-// ─────────────────────────────────────────────
-// 원본 자동 감지 실패 시 안내 페이지 (항상 200)
-// ─────────────────────────────────────────────
-// 자동 감지가 실패해도 사용자/검색엔진에게 502 Bad Gateway 같은 에러를
-// 절대 노출하지 않는다. 항상 200 OK인 일반 HTML 페이지를 반환하고,
-// 디버그 정보는 HTML 주석으로만 남겨 운영자가 "페이지 소스 보기"로
-// 확인할 수 있게 한다(일반 방문자에게는 보이지 않음).
-function buildSetupNoticeResponse(debugLines) {
-  const debugComment = debugLines.length
-    ? '\n<!--\n[설정 안내]\n' + debugLines.join('\n').replace(/-->/g, '--&gt;') + '\n-->'
-    : '';
-  const html = `<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>사이트 준비 중</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         display:flex; align-items:center; justify-content:center; min-height:100vh;
-         margin:0; background:#fafafa; color:#222; }
-  .box { text-align:center; padding:2rem; }
-  h1 { font-size:1.25rem; font-weight:600; margin-bottom:.5rem; }
-  p { color:#666; font-size:.95rem; }
-</style>
-</head>
-<body>
-  <div class="box">
-    <h1>사이트를 준비하고 있습니다</h1>
-    <p>잠시 후 다시 시도해 주세요.</p>
-  </div>
-${debugComment}
-</body>
-</html>`;
-  return new Response(html, {
-    status: 200,
-    headers: {
-      'content-type':   'text/html; charset=utf-8',
-      // 검색엔진/캐시에 이 임시 페이지가 정식 콘텐츠로 굳어지지 않도록
-      // 캐시하지 않는다 — origin이 곧 잡히면 바로 정상 콘텐츠로 전환되어야 함.
-      'cache-control':   'no-store',
-      'x-robots-tag':    'noindex',
-    },
-  });
-}
-
-// ─────────────────────────────────────────────
-// Blogspot 원본 자동 감지
-// ─────────────────────────────────────────────
-// 반환값: { origin, canonicalCustomHost, debug }
-//   origin              — "https://xxxx.blogspot.com"
-//   canonicalCustomHost — Blogger에 등록된 정식 커스텀 호스트
-//                         (예: "www.jiwunin.co.kr", "blog.example.com")
-//                         설정/감지 안 되면 요청 호스트 그대로
-async function resolveOrigin(request, url, env) {
-  const debug      = [];
-  const customHost = url.hostname;
-  const kvKey      = originKvKey(customHost);
-  const kvHostKey  = originKvKey(customHost) + ':host';
-
-  // 0) BLOGSPOT_ORIGIN 환경 변수 / secret 확인
-  //
-  //  형식 A — 단일 blogspot 주소:
-  //    "xxxx.blogspot.com"
-  //
-  //  형식 B — 다중 도메인, 단순 매핑:
-  //    {"jiwunin.co.kr":"aaa.blogspot.com"}
-  //
-  //  형식 C — 다중 도메인, 정식 커스텀 호스트 명시 (권장):
-  //    {"jiwunin.co.kr":{"blogspot":"aaa.blogspot.com","host":"www.jiwunin.co.kr"}}
-  //    host = Blogger 설정에 등록된 정식 커스텀 도메인 (루트도메인 리다이렉트 방지)
-  const configured = (env.BLOGSPOT_ORIGIN || '').trim();
-  if (configured) {
-    if (configured.startsWith('{')) {
-      try {
-        const map   = JSON.parse(configured);
-        const entry = map[customHost];
-        if (entry) {
-          // 형식 C: {blogspot, host}
-          if (typeof entry === 'object' && entry.blogspot) {
-            const normalized    = normalizeBlogspotOrigin(entry.blogspot);
-            const canonicalHost = (entry.host || customHost).replace(/^https?:\/\//, '').split('/')[0];
-            if (normalized) {
-              try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
-              try { await env.SLUG_KV.put(kvHostKey, canonicalHost); } catch (_) {}
-              return { origin: normalized, canonicalCustomHost: canonicalHost, debug };
-            }
-            debug.push(`JSON 형식C: blogspot 값 오류: "${entry.blogspot}"`);
-          }
-          // 형식 B: 단순 문자열
-          if (typeof entry === 'string') {
-            const normalized = normalizeBlogspotOrigin(entry);
-            if (normalized) {
-              try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
-              return { origin: normalized, canonicalCustomHost: customHost, debug };
-            }
-            debug.push(`JSON 형식B: 값 오류: "${entry}"`);
-          }
-        } else {
-          debug.push(`BLOGSPOT_ORIGIN JSON: "${customHost}" 키 없음 — 자동 감지 시도`);
-        }
-      } catch (e) {
-        debug.push('BLOGSPOT_ORIGIN JSON 파싱 실패: ' + e.message);
-      }
-    } else {
-      // 형식 A: 단일 문자열
-      const normalized = normalizeBlogspotOrigin(configured);
-      if (normalized) {
-        try { await env.SLUG_KV.put(kvKey, normalized); } catch (_) {}
-        return { origin: normalized, canonicalCustomHost: customHost, debug };
-      }
-      debug.push('BLOGSPOT_ORIGIN 값 오류: "' + configured + '"');
+      return notice(['passthrough fetch 예외: ' + e.message]);
     }
   }
 
-  // 1) KV 캐시 확인 — 도메인별 키 사용
-  try {
-    const cached     = await env.SLUG_KV.get(kvKey);
-    const cachedHost = await env.SLUG_KV.get(kvHostKey);
-    if (cached) return { origin: cached, canonicalCustomHost: cachedHost || customHost, debug };
-  } catch (e) { debug.push('KV get 실패: ' + e.message); }
+  // ── 2. 슬러그 canonical 리다이렉트 ───────
+  const slugRedir = await checkSlugRedirect(path, url, env);
+  if (slugRedir) return slugRedir;
 
-  // 2) 커스텀 도메인 자신에게 직접 요청
-  try {
-    const r = await detectFromSelf(customHost);
-    if (r.origin) {
-      await env.SLUG_KV.put(kvKey, r.origin);
-      return { origin: r.origin, canonicalCustomHost: customHost, debug };
-    }
-    debug.push('Self: ' + r.reason);
-  } catch (e) { debug.push('Self 예외: ' + e.message); }
-
-  // 3) Blogger 공식 API (byurl)
-  try {
-    const r = await detectFromBloggerApi(customHost);
-    if (r.origin) {
-      await env.SLUG_KV.put(kvKey, r.origin);
-      return { origin: r.origin, canonicalCustomHost: customHost, debug };
-    }
-    debug.push('BloggerAPI: ' + r.reason);
-  } catch (e) { debug.push('BloggerAPI 예외: ' + e.message); }
-
-  // 4) ghs.google.com
-  try {
-    const r = await detectFromGhs(customHost);
-    if (r.origin) {
-      await env.SLUG_KV.put(kvKey, r.origin);
-      return { origin: r.origin, canonicalCustomHost: customHost, debug };
-    }
-    debug.push('GHS: ' + r.reason);
-  } catch (e) { debug.push('GHS 예외: ' + e.message); }
-
-  debug.push('해결: BLOGSPOT_ORIGIN secret 설정 방법은 wrangler.toml 주석 참고.');
-  return { origin: null, canonicalCustomHost: customHost, debug };
-}
-
-// customHost로 직접 요청해서, 응답 안에서 실제 blogspot.com 참조를 찾는다.
-// X-Origin-Probe 헤더를 반드시 동반하여, 이 요청이 같은 워커로 되돌아올 경우
-// 위쪽 가드가 즉시 502(probe-loop-detected)를 주고 무한 재귀를 끊는다.
-//
-// redirect:'manual'을 사용한다 — 'follow'를 쓰면 fetch가 내부적으로
-// 리다이렉트를 자동으로 계속 따라가다가 무한/과도한 리다이렉트 체인에
-// 걸려 "Too many redirects" 예외로 죽어버릴 수 있다(예: 워커 앞단의
-// www/https 강제 리다이렉트 규칙과 얽히는 경우). manual로 받아서
-// 단계마다 직접 검사하면 최대 5단계로 안전하게 제한할 수 있다.
-async function detectFromSelf(customHost) {
-  const targetUrls = [
-    'https://' + customHost + '/',
-    'https://' + customHost + '/sitemap.xml',
-    'https://' + customHost + '/feeds/posts/default',
-    'https://' + customHost + '/feeds/posts/default?alt=rss',
-    'https://' + customHost + '/feeds/posts/default?alt=json&max-results=1',
-    'https://' + customHost + '/atom.xml',
-    'https://' + customHost + '/rss.xml',
-  ];
-
-  const reasons = [];
-
-  for (const startUrl of targetUrls) {
-    try {
-      const r = await followManually(startUrl);
-      if (r.origin) return r;
-      reasons.push(r.reason);
-    } catch (e) {
-      reasons.push('fetch 예외(' + startUrl + '): ' + e.message);
-    }
+  // ── 3. KV Cache Reserve ───────────────────
+  const cacheKey = buildCacheKey(url);
+  const cached   = await getCacheReserve(cacheKey, env);
+  if (cached) {
+    return new Response(cached.body, { status: 200, headers: buildCachedHeaders(cached.headers) });
   }
-  return { origin: null, reason: reasons.join(' | ') };
+
+  // ── 4. Origin Fetch (RTT 측정 포함) ──────
+  let originResp;
+  const t0 = Date.now();
+  try {
+    const raw  = await proxyFetch(request, url, origin, canonicalHost);
+    originResp = await sanitize(raw, url, origin, canonicalHost);
+  } catch (e) {
+    await lbRecordFailure(origin, env);
+    return notice(['origin fetch 예외: ' + e.message]);
+  }
+  const rtt = Date.now() - t0;
+  // RTT / 연결 수 비동기 업데이트 (응답 지연 없음)
+  ctx.waitUntil(lbRecordRtt(origin, rtt, env));
+
+  if (originResp.status >= 500) return notice(['origin 5xx: ' + originResp.status]);
+  if (!isHtml(originResp) || !originResp.ok) return originResp;
+
+  // ── 5. HTML 파이프라인 ────────────────────
+  const html = await originResp.text();
+  let result, pageCtx;
+  try {
+    pageCtx = extractPageContext(html, url);
+    result  = transformHtml(html, pageCtx, url);
+  } catch (_) {
+    return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+  }
+
+  // ── 6. 비동기 후처리 ─────────────────────
+  const respHeaders = buildResponseHeaders();
+  ctx.waitUntil(updateSlugKV(pageCtx, url, env));
+  ctx.waitUntil(setCacheReserve(cacheKey, result, respHeaders, env));
+  ctx.waitUntil(lbRecordBandwidth(origin, result.length, env));
+
+  return new Response(result, { status: 200, headers: respHeaders });
 }
 
-// redirect:'manual'로 최대 5단계까지 직접 리다이렉트를 따라가며,
-// 각 단계에서 (1) 워커 자기 호출 여부 (2) blogspot.com 직행 여부
-// (3) 응답 본문 안의 blogspot.com 참조를 검사한다.
-async function followManually(startUrl) {
-  let currentUrl = startUrl;
-  const chain = [];
+// ─────────────────────────────────────────────
+// Origin 자동 탐지 & 캐시
+// ─────────────────────────────────────────────
+// CF 인프라 내에서 외부 API 없이 완전 자동으로 탐지.
+// ghs.google.com 은 Blogger 커스텀 도메인의 실제 CNAME 목적지이므로,
+// HTTP + Host 헤더로 요청하면 Blogger가 blogspot.com 주소로 301 반환.
+// 이 Location에서 실제 origin을 추출 → KV 영구 저장.
+async function resolveOrigin(host, env) {
+  // 1) KV 캐시 우선 (정상 경로 — 속도 제로)
+  try {
+    const raw = await env.SLUG_KV.get(kvOrigin(host));
+    if (raw) {
+      const origins       = JSON.parse(raw);
+      const canonicalHost = (await env.SLUG_KV.get(kvCanonical(host))) || host;
+      return { origins, canonicalHost };
+    }
+  } catch (_) {}
 
-  for (let i = 0; i < 5; i++) {
-    let resp;
-    try {
-      resp = await fetch(currentUrl, {
-        method:   'GET',
-        redirect: 'manual',
-        headers:  { 'user-agent': 'Mozilla/5.0', 'x-origin-probe': '1' },
+  // 2) 첫 요청 시 실시간 탐지
+  const result = await detectViaGhs(host);
+  if (!result) return null;
+
+  try {
+    await env.SLUG_KV.put(kvOrigin(host),    JSON.stringify(result.origins));
+    await env.SLUG_KV.put(kvCanonical(host), result.canonicalHost);
+  } catch (_) {}
+
+  return result;
+}
+
+// ghs.google.com 으로 HTTP 요청하여 origin 탐지
+// 반환: { origins: ["https://xxxx.blogspot.com"], canonicalHost: "www.xxx.com" }
+async function detectViaGhs(host) {
+  const ghsUrl = 'http://ghs.google.com/';
+
+  // 시도 1: HTTP manual — Location에서 직접 추출
+  try {
+    const resp = await fetch(ghsUrl, {
+      method: 'GET', redirect: 'manual',
+      headers: { host, 'user-agent': 'Mozilla/5.0' },
+    });
+    const loc = resp.headers.get('location') || '';
+
+    // Location이 같은 도메인 계열로의 리다이렉트이면 → 정식 호스트 확인 후 재시도
+    const canonical = sameRootHost(loc, host);
+    if (canonical && canonical !== host) {
+      const resp2 = await fetch(ghsUrl, {
+        method: 'GET', redirect: 'manual',
+        headers: { host: canonical, 'user-agent': 'Mozilla/5.0' },
       });
-    } catch (e) {
-      return { origin: null, reason: `[${chain.join(' -> ')}] fetch 예외: ${e.message}` };
+      const loc2   = resp2.headers.get('location') || '';
+      const origin = blogspotFromUrl(loc2);
+      if (origin) return { origins: [origin], canonicalHost: canonical };
     }
 
-    chain.push(`${currentUrl} -> ${resp.status} loc="${resp.headers.get('location') || ''}"`);
+    const origin = blogspotFromUrl(loc);
+    if (origin) return { origins: [origin], canonicalHost: host };
+  } catch (_) {}
 
-    // 워커 자기 호출 감지
-    if (resp.status === 502) {
-      const text = await resp.text().catch(() => '');
-      if (text === 'probe-loop-detected') {
-        return { origin: null, reason: `자기 자신(워커) 라우팅 감지 [${chain.join(' | ')}]` };
-      }
-    }
+  // 시도 2: HTTP follow — 최종 URL 또는 본문에서 추출
+  try {
+    const resp = await fetch(ghsUrl, {
+      method: 'GET', redirect: 'follow',
+      headers: { host, 'user-agent': 'Mozilla/5.0' },
+    });
+    try {
+      const fh = new URL(resp.url).hostname;
+      if (/\.blogspot\.com$/i.test(fh)) return { origins: ['https://' + fh], canonicalHost: host };
+    } catch (_) {}
+    const html   = await resp.text().catch(() => '');
+    const origin = extractBlogspotFromContent(html);
+    if (origin) return { origins: [origin], canonicalHost: host };
+  } catch (_) {}
 
-    // 3xx면 Location을 따라 다음 단계로
-    if (resp.status >= 300 && resp.status < 400) {
-      const loc = resp.headers.get('location') || '';
-      if (!loc) return { origin: null, reason: `[${chain.join(' | ')}] 3xx인데 Location 없음` };
-      try {
-        const nextUrl = new URL(loc, currentUrl).toString();
-        const nextHost = new URL(nextUrl).hostname;
-        if (/\.blogspot\.com$/i.test(nextHost)) {
-          return { origin: 'https://' + nextHost, reason: null };
-        }
-        // 자기 자신과 완전히 동일한 URL로의 리다이렉트는 Cloudflare 레벨의
-        // 설정 문제(예: Redirect Rule이 같은 호스트를 다시 가리킴)이지,
-        // Blogger 응답이 아니다. 더 따라가도 의미가 없으니 즉시 종료한다.
-        if (nextUrl === currentUrl) {
-          return { origin: null, reason: `[${chain.join(' | ')}] 자기참조 301 — Cloudflare Redirect Rule/Always-HTTPS 설정 충돌 의심 (Blogger 응답 아님)` };
-        }
-        currentUrl = nextUrl;
-        continue;
-      } catch (e) {
-        return { origin: null, reason: `[${chain.join(' | ')}] Location 파싱 실패: ${loc}` };
-      }
-    }
-
-    // 최종 응답(2xx/4xx 등) — 본문에서 blogspot.com 참조 탐색
-    const text = await resp.text().catch(() => '');
-    const origin = extractBlogspotOriginFromContent(text);
-    if (origin) return { origin, reason: null };
-
-    return { origin: null, reason: `[${chain.join(' | ')}] 본문에서 blogspot.com 참조 없음 (len=${text.length})` };
-  }
-
-  return { origin: null, reason: `리다이렉트 5단계 초과 — chain=[${chain.join(' | ')}]` };
+  return null;
 }
 
-// "xxxx.blogspot.com", "https://xxxx.blogspot.com", "https://xxxx.blogspot.com/" 등
-// 다양한 입력 형태를 'https://xxxx.blogspot.com' 형태로 정규화.
-function normalizeBlogspotOrigin(value) {
-  let v = value.trim();
-  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+// Location URL이 같은 루트 도메인이면 해당 호스트 반환, 아니면 null
+function sameRootHost(location, originalHost) {
+  if (!location) return null;
   try {
-    const host = new URL(v).hostname;
-    if (/^[a-zA-Z0-9-]+\.blogspot\.com$/i.test(host)) return 'https://' + host;
+    const lh = new URL(location).hostname;
+    // co.kr 같은 2단계 ccTLD를 감안해 뒤 3부분 비교
+    const root = h => h.split('.').slice(-3).join('.');
+    if (lh !== originalHost &&
+       (lh.endsWith('.' + originalHost) ||
+        originalHost.endsWith('.' + lh) ||
+        root(lh) === root(originalHost))) return lh;
   } catch (_) {}
   return null;
 }
 
-// Blogger 공식 API로 커스텀 도메인이 연결된 실제 blogspot.com 블로그를 조회.
-async function detectFromBloggerApi(customHost) {
-  const apiUrl = 'https://www.googleapis.com/blogger/v3/blogs/byurl?url='
-    + encodeURIComponent('https://' + customHost + '/');
-  try {
-    const resp = await fetch(apiUrl, { headers: { 'user-agent': 'Mozilla/5.0' } });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      return { origin: null, reason: `status=${resp.status} body=${body.slice(0, 200)}` };
-    }
-    const data = await resp.json();
-    const blogUrl = data && data.url;
-    if (!blogUrl) return { origin: null, reason: 'url 필드 없음: ' + JSON.stringify(data).slice(0, 200) };
-    const host = new URL(blogUrl).hostname;
-    if (/\.blogspot\.com$/i.test(host)) return { origin: 'https://' + host, reason: null };
-    return { origin: null, reason: 'blogspot.com 아님: ' + host };
-  } catch (e) {
-    return { origin: null, reason: 'fetch 예외: ' + e.message };
+function blogspotFromUrl(url) {
+  if (!url) return null;
+  const m = url.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
+  return m ? 'https://' + m[1] : null;
+}
+
+// ─────────────────────────────────────────────
+// 로드 밸런서
+// ─────────────────────────────────────────────
+// origins 배열이 1개면 즉시 반환 (오버헤드 제로)
+// 2개 이상이면 7가지 알고리즘을 상황에 맞게 선택
+
+async function lbSelect(origins, host, request, env) {
+  if (origins.length === 1) return origins[0];
+
+  const algo = env.LB_ALGO || LB_ALGO_DEFAULT;
+
+  switch (algo) {
+    case 'round_robin':         return lbRoundRobin(origins, host, env);
+    case 'weighted_rr':         return lbWeightedRR(origins, host, env);
+    case 'least_connections':   return lbLeastConn(origins, env);
+    case 'least_bandwidth':     return lbLeastBw(origins, env);
+    case 'ip_hash':             return lbIpHash(origins, request);
+    case 'geo':                 return lbGeo(origins, request, env);
+    case 'least_rtt':
+    default:                    return lbLeastRtt(origins, env);
   }
 }
 
-// ghs.google.com에 Host 헤더로 요청해서 실제 매핑된 blogspot 호스트를 찾는다.
-// 중요: HTTPS로 시도하면 SNI가 ghs.google.com인데 Host 헤더는 customHost라서
-// Cloudflare 엣지에서 SNI/Host 불일치로 TLS 핸드셰이크 자체가 거부되어
-// 525(SSL handshake failed)가 난다. HTTP(평문, 80번 포트)는 TLS 단계가 없어
-// 이 문제를 피할 수 있다 — Blogger 커스텀 도메인 CNAME 설정 자체가 원래
-// ghs.google.com으로의 평문 HTTP 요청을 전제로 하던 방식이라 호환된다.
-async function detectFromGhs(customHost) {
-  let lastReason = '';
-
-  // 1) HTTP, manual redirect: Location 헤더에서 추출 (TLS 문제 없음)
+// 1. 라운드 로빈 — KV 카운터로 순서 보장
+async function lbRoundRobin(origins, host, env) {
   try {
-    const resp = await fetch('http://ghs.google.com/', {
-      method:   'GET',
-      redirect: 'manual',
-      headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
-    });
-    const location = resp.headers.get('location') || '';
-    const m = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-    if (m) return { origin: 'https://' + m[1], reason: null };
-    lastReason = `http manual status=${resp.status} location="${location}"`;
-  } catch (e) {
-    lastReason = 'http manual fetch 예외: ' + e.message;
-  }
+    const key = kvRr(host);
+    const cur = parseInt(await env.SLUG_KV.get(key) || '0', 10);
+    const idx = cur % origins.length;
+    env.SLUG_KV.put(key, String(cur + 1)).catch(() => {});
+    return origins[idx];
+  } catch (_) { return origins[0]; }
+}
 
-  // 2) HTTP, follow redirect: 최종 HTML 본문에서 추출
+// 2. 가중 라운드 로빈 — env.LB_WEIGHTS JSON 예: {"https://a.blogspot.com":3,"https://b.blogspot.com":1}
+async function lbWeightedRR(origins, host, env) {
+  let weights = {};
+  try { weights = JSON.parse(env.LB_WEIGHTS || '{}'); } catch (_) {}
+
+  // 가중치 없으면 일반 RR
+  const pool = [];
+  for (const o of origins) pool.push(...Array(weights[o] || 1).fill(o));
+  if (!pool.length) return origins[0];
+
   try {
-    const resp = await fetch('http://ghs.google.com/', {
-      method:   'GET',
-      redirect: 'follow',
-      headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
-    });
+    const key = kvRr(host) + ':w';
+    const cur = parseInt(await env.SLUG_KV.get(key) || '0', 10);
+    const idx = cur % pool.length;
+    env.SLUG_KV.put(key, String(cur + 1)).catch(() => {});
+    return pool[idx];
+  } catch (_) { return origins[0]; }
+}
+
+// 3. 최소 RTT — EWMA 기반 (새 측정마다 LB_RTT_DECAY 비율로 갱신)
+async function lbLeastRtt(origins, env) {
+  const rtts = await Promise.all(origins.map(async o => {
     try {
-      const finalHost = new URL(resp.url).hostname;
-      if (/\.blogspot\.com$/i.test(finalHost)) return { origin: 'https://' + finalHost, reason: null };
-    } catch (_) {}
-    const html = await resp.text();
-    const origin = extractBlogspotOriginFromContent(html);
-    if (origin) return { origin, reason: null };
-    lastReason += ` | http follow status=${resp.status} finalUrl=${resp.url} bodyLen=${html.length}`;
-  } catch (e) {
-    lastReason += ' | http follow fetch 예외: ' + e.message;
-  }
+      const raw = await env.SLUG_KV.get(kvRtt(o), { type: 'json' });
+      return { o, rtt: raw && raw.rtt != null ? raw.rtt : Infinity };
+    } catch (_) { return { o, rtt: Infinity }; }
+  }));
+  rtts.sort((a, b) => a.rtt - b.rtt);
+  return rtts[0].o;
+}
 
-  // 3) HTTPS 백업 (환경에 따라 525로 막힐 수 있음 — 그래도 시도는 해본다)
+// 4. 최소 연결 수
+async function lbLeastConn(origins, env) {
+  const conns = await Promise.all(origins.map(async o => {
+    try {
+      const v = await env.SLUG_KV.get(kvConn(o));
+      return { o, c: parseInt(v || '0', 10) };
+    } catch (_) { return { o, c: 0 }; }
+  }));
+  conns.sort((a, b) => a.c - b.c);
+  return conns[0].o;
+}
+
+// 5. IP Hash — 같은 IP → 같은 origin (세션 고정)
+function lbIpHash(origins, request) {
+  const ip = request.headers.get('cf-connecting-ip') || '0';
+  let hash = 0;
+  for (let i = 0; i < ip.length; i++) hash = (hash * 31 + ip.charCodeAt(i)) >>> 0;
+  return origins[hash % origins.length];
+}
+
+// 6. 최소 대역폭 (누적 처리 바이트 기준)
+async function lbLeastBw(origins, env) {
+  const bws = await Promise.all(origins.map(async o => {
+    try {
+      const v = await env.SLUG_KV.get(kvBw(o));
+      return { o, b: parseInt(v || '0', 10) };
+    } catch (_) { return { o, b: 0 }; }
+  }));
+  bws.sort((a, b) => a.b - b.b);
+  return bws[0].o;
+}
+
+// 7. PoP 지역 라우팅 — cf-ray 공항코드로 사용자와 가장 가까운 데이터센터 기준
+// env.LB_GEO_MAP JSON 예: {"APAC":"https://a.blogspot.com","NA":"https://b.blogspot.com"}
+function lbGeo(origins, request, env) {
+  const ray    = request.headers.get('cf-ray') || '';
+  const region = popRegion(ray);
+  let geoMap   = {};
+  try { geoMap = JSON.parse(env.LB_GEO_MAP || '{}'); } catch (_) {}
+  if (region && geoMap[region] && origins.includes(geoMap[region])) {
+    return geoMap[region];
+  }
+  // 매핑 없으면 least_rtt 폴백
+  return lbLeastRtt(origins, env);
+}
+
+// RTT 측정 결과 EWMA로 KV 갱신 (비동기, 요청 지연 없음)
+async function lbRecordRtt(origin, rttMs, env) {
   try {
-    const resp = await fetch('https://ghs.google.com/', {
-      method:   'GET',
-      redirect: 'manual',
-      headers:  { host: customHost, 'user-agent': 'Mozilla/5.0' },
-    });
-    const location = resp.headers.get('location') || '';
-    const m = location.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-    if (m) return { origin: 'https://' + m[1], reason: null };
-    lastReason += ` | https manual status=${resp.status} location="${location}"`;
-  } catch (e) {
-    lastReason += ' | https manual fetch 예외: ' + e.message;
-  }
-
-  return { origin: null, reason: lastReason };
+    const prev = await env.SLUG_KV.get(kvRtt(origin), { type: 'json' });
+    const ewma = prev && prev.rtt != null
+      ? prev.rtt * (1 - LB_RTT_DECAY) + rttMs * LB_RTT_DECAY
+      : rttMs;
+    await env.SLUG_KV.put(kvRtt(origin), JSON.stringify({ rtt: ewma, ts: Date.now() }), { expirationTtl: LB_RTT_TTL });
+  } catch (_) {}
 }
 
-// HTML/XML/JSON 본문 안에서 신뢰할 수 있는 blogspot.com 참조를 추출.
-// canonical / feed 링크 / EditURI / og:url / sitemap <loc> / Atom <id>,<link>
-// / RSS <link> 등 Blogger가 자기 자신을 가리키는 자리에서만 추출하여
-// 무관한 외부 링크를 배제한다.
-function extractBlogspotOriginFromContent(content) {
-  const patterns = [
-    // HTML <head>
-    /<link[^>]+rel=["']canonical["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    /<link[^>]+rel=["']service\.post["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    /<link[^>]+rel=["']EditURI["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    /<meta[^>]+property=["']og:url["'][^>]+content=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
-    // sitemap.xml: <loc>https://xxxx.blogspot.com/...</loc>
-    /<loc>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/loc>/i,
-    // Atom feed: <id>...</id>, <link rel="alternate" href="...">
-    /<id>\s*(?:tag:blogger\.com,1999:blog-\d+\.[^,]+|https?:\/\/)?([a-zA-Z0-9-]+\.blogspot\.com)/i,
-    /<link[^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["'][^>]*\/?>/i,
-    // RSS: <link>https://xxxx.blogspot.com/...</link>
-    /<link>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/link>/i,
-    // JSON(byurl, feed alt=json 등)
-    /"(?:id|url)"\s*:\s*"https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"]*"/i,
-  ];
-  for (const re of patterns) {
-    const m = content.match(re);
-    if (m && m[1]) return 'https://' + m[1];
-  }
-  return null;
+// origin fetch 실패 시 RTT를 매우 높게 설정 (해당 origin 기피)
+async function lbRecordFailure(origin, env) {
+  try {
+    await env.SLUG_KV.put(kvRtt(origin), JSON.stringify({ rtt: 99999, ts: Date.now() }), { expirationTtl: LB_RTT_TTL });
+  } catch (_) {}
 }
 
+// 처리 바이트 누적 (주기적으로 가장 적게 쓴 origin을 선택하기 위함)
+async function lbRecordBandwidth(origin, bytes, env) {
+  try {
+    const prev = parseInt(await env.SLUG_KV.get(kvBw(origin)) || '0', 10);
+    // 오버플로우 방지: 1TB 초과 시 리셋
+    const next = (prev + bytes) > 1e12 ? bytes : prev + bytes;
+    await env.SLUG_KV.put(kvBw(origin), String(next), { expirationTtl: 86400 });
+  } catch (_) {}
+}
 
 // ─────────────────────────────────────────────
-// 원본으로 프록시
+// Origin 프록시
 // ─────────────────────────────────────────────
-// 중요: Host 헤더를 blogspot.com으로 바꾸면 안 된다.
-// Blogger(GHS)는 Host 헤더로 "이 요청이 어느 도메인으로 들어왔는지"를 판단해서,
-// 그 블로그의 정식(커스텀) 도메인과 다르면 자신의 정식 도메인으로 301/302
-// 리다이렉트를 내려준다. targetUrl을 *.blogspot.com으로 fetch하면서
-// Host까지 blogspot.com으로 덮어쓰면 Blogger 입장에서는 "blogspot.com 주소로
-// 직접 들어왔다"고 인식하고, 정식 도메인(커스텀 도메인)이 따로 있으니
-// 그쪽으로 리다이렉트 → 결과적으로 응답 본문/위치가 blogspot.com을 가리켜
-// 브라우저가 그쪽으로 이동해버린다.
-// 해결: Host 헤더는 원래 커스텀 도메인(request의 Host)을 그대로 유지한 채,
-// 실제 네트워크 연결만 blogspot.com(origin)으로 보낸다.
-// proxyToOrigin: Blogger 백엔드로 요청 전달
-// canonicalCustomHost = Blogger에 등록된 정식 커스텀 호스트
-//   (예: "www.jiwunin.co.kr", "blog.example.com")
-// 요청자가 어떤 도메인으로 왔든 Blogger에는 정식 호스트를 Host 헤더로 보낸다.
-// 그래야 Blogger가 "이 도메인 모름 → 정식 도메인으로 리다이렉트" 루프를 안 만든다.
-function proxyToOrigin(request, url, origin, canonicalCustomHost) {
-  // ?m=1 / ?m=0 파라미터 제거
-  const cleanedParams = new URLSearchParams(url.search);
-  cleanedParams.delete('m');
-  const cleanedSearch = cleanedParams.toString() ? '?' + cleanedParams.toString() : '';
+function proxyFetch(request, url, origin, canonicalHost) {
+  // ?m=1/?m=0 제거 (Blogger 모바일 리다이렉트 경고 방지)
+  const p = new URLSearchParams(url.search);
+  p.delete('m');
+  const qs        = p.toString() ? '?' + p.toString() : '';
+  const targetUrl = origin + url.pathname + qs;
 
-  const targetUrl   = origin + url.pathname + cleanedSearch;
-  const headers     = new Headers(request.headers);
-  // Blogger가 인식하는 정식 호스트 사용 (설정된 canonicalCustomHost 우선)
-  headers.set('host', canonicalCustomHost || url.hostname);
+  const headers = new Headers(request.headers);
+  // Blogger가 인식하는 정식 커스텀 호스트로 Host 헤더 설정
+  // → "이 도메인 모름" 리다이렉트 루프 방지
+  headers.set('host', canonicalHost);
   headers.delete('cf-connecting-ip');
   headers.delete('cf-ipcountry');
   headers.delete('cf-ray');
   headers.delete('cf-visitor');
 
   return fetch(targetUrl, {
-    method:   request.method,
+    method:  request.method,
     headers,
-    body:     ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
+    body:    ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
     redirect: 'manual',
   });
 }
 
 // ─────────────────────────────────────────────
-// 원본 응답 정리: 리다이렉트를 워커가 직접 따라가 최종 콘텐츠를 반환
+// 응답 정리 — 리다이렉트를 워커가 직접 추적
 // ─────────────────────────────────────────────
-// Blogger는 커스텀 도메인 요청에 대해 www 추가, https 강제, ?m= 제거 등
-// 다양한 이유로 3xx 리다이렉트를 내려준다. 이것을 브라우저에 그대로 넘기면
-// 브라우저 → 워커 → Blogger → 3xx → 브라우저 → 워커 → ... 무한 루프가 된다.
-// 워커가 직접 최대 5단계까지 리다이렉트를 추적해 최종 응답을 가져온다.
-// 단, 최종 목적지가 완전히 다른 외부 도메인(blogspot도 커스텀도 아닌 곳)이면
-// 그때만 브라우저에 리다이렉트를 넘긴다.
-async function sanitizeOriginResponse(resp, url, origin, canonicalCustomHost) {
-  const customHost = url.host;
-  const originHost = (() => { try { return new URL(origin).host; } catch(_) { return ''; } })();
-  const bloggerHost = canonicalCustomHost || customHost;
-
-  let current = resp;
+// Blogger가 3xx를 내리면 브라우저에 그대로 넘기지 않고 워커가 최대 5단계까지
+// 직접 따라가 최종 콘텐츠를 가져온다 (무한 루프 완전 차단).
+async function sanitize(resp, url, origin, canonicalHost) {
+  const originHost  = (() => { try { return new URL(origin).host; } catch(_) { return ''; } })();
+  const customHost  = url.host;
+  let current    = resp;
   let currentUrl = url.toString();
 
   for (let i = 0; i < 5; i++) {
-    const status = current.status;
-    if (status < 300 || status >= 400) break;
+    const st = current.status;
+    if (st < 300 || st >= 400) break;
 
-    const location = current.headers.get('location') || '';
-    if (!location) break;
+    const loc = current.headers.get('location') || '';
+    if (!loc) break;
 
     let nextUrl;
-    try { nextUrl = new URL(location, currentUrl).toString(); } catch(_) { break; }
-
+    try { nextUrl = new URL(loc, currentUrl).toString(); } catch(_) { break; }
     const nextHost = (() => { try { return new URL(nextUrl).host; } catch(_) { return ''; } })();
 
-    // 완전히 외부 도메인이면 브라우저에 리다이렉트 위임
-    if (nextHost !== customHost && nextHost !== originHost && nextHost !== bloggerHost) {
+    // 완전 외부 도메인 → 브라우저에 위임
+    if (nextHost !== customHost && nextHost !== originHost && nextHost !== canonicalHost) {
       const h = new Headers(current.headers);
       h.set('location', nextUrl);
-      return new Response(null, { status, headers: h });
+      return new Response(null, { status: st, headers: h });
     }
 
-    // 자기참조(무한루프) 방지
-    if (nextUrl === currentUrl) {
-      return buildSetupNoticeResponse(['자기참조 리다이렉트 감지: ' + nextUrl]);
-    }
+    // 자기참조 루프 방지
+    if (nextUrl === currentUrl) return notice(['자기참조 리다이렉트: ' + nextUrl]);
 
-    // 커스텀/blogspot 도메인 리다이렉트 → 워커가 직접 따라감, ?m= 제거
-    const nextUrlObj = new URL(nextUrl);
-    nextUrlObj.searchParams.delete('m');
-    const targetUrl = origin + nextUrlObj.pathname + (nextUrlObj.search || '');
+    // 워커가 직접 따라감
+    const nu = new URL(nextUrl);
+    nu.searchParams.delete('m');
+    const targetUrl = origin + nu.pathname + (nu.search || '');
 
     try {
-      const headers = new Headers();
-      // Blogger 정식 호스트로 요청 — 리다이렉트 루프 방지
-      headers.set('host', bloggerHost);
-      headers.set('user-agent', 'Mozilla/5.0');
-      headers.delete('cf-connecting-ip');
-      headers.delete('cf-ipcountry');
-      headers.delete('cf-ray');
-      headers.delete('cf-visitor');
-      current = await fetch(targetUrl, { method: 'GET', headers, redirect: 'manual' });
+      const h = new Headers();
+      h.set('host', canonicalHost);
+      h.set('user-agent', 'Mozilla/5.0');
+      current    = await fetch(targetUrl, { method: 'GET', headers: h, redirect: 'manual' });
       currentUrl = nextUrl;
     } catch(e) {
-      return buildSetupNoticeResponse(['리다이렉트 추적 중 fetch 예외: ' + e.message]);
+      return notice(['리다이렉트 추적 fetch 예외: ' + e.message]);
     }
   }
 
   return current;
 }
 
+// ─────────────────────────────────────────────
+// 안내 페이지 (탐지 실패 시 200 OK — 에러 노출 없음)
+// ─────────────────────────────────────────────
+function notice(lines = []) {
+  const comment = lines.length
+    ? '\n<!--\n' + lines.join('\n').replace(/-->/g, '--&gt;') + '\n-->'
+    : '';
+  return new Response(`<!DOCTYPE html><html lang="ko"><head>
+<meta charset="utf-8"><meta name="robots" content="noindex">
+<title>사이트 준비 중</title>
+<style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;
+min-height:100vh;margin:0;background:#fafafa}
+.b{text-align:center;padding:2rem}h1{font-size:1.2rem}p{color:#666}</style>
+</head><body><div class="b"><h1>사이트를 준비하고 있습니다</h1>
+<p>잠시 후 다시 시도해 주세요.</p></div>${comment}</body></html>`,
+    { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' } });
+}
 
 // ─────────────────────────────────────────────
-// 라우트 판별
+// 라우트 / HTML 판별
 // ─────────────────────────────────────────────
 function isPassthrough(path, url) {
   if (path.startsWith('/feeds/'))  return true;
@@ -663,61 +541,37 @@ function isPostPath(path) {
 // HTML 변환 파이프라인
 // ─────────────────────────────────────────────
 function transformHtml(html, ctx, url) {
-  let out = html;
-  out = stripMobileParam(out);
-  out = enforceHttps(out, url);
-  out = injectMetaDescription(out, ctx);
-  out = injectCanonical(out, ctx, url);
-  out = injectSchemaMarkup(out, ctx, url);
-  out = injectSeoTags(out, ctx, url);
-  out = injectPerformanceOptimizations(out);
-  return out;
+  let o = html;
+  o = stripMobileParam(o);
+  o = enforceHttps(o, url);
+  o = injectMetaDescription(o, ctx);
+  o = injectCanonical(o, ctx, url);
+  o = injectSchemaMarkup(o, ctx, url);
+  o = injectSeoTags(o, ctx, url);
+  o = injectPerformanceOptimizations(o);
+  return o;
 }
 
-// HTML 안의 ?m=1 / ?m=0 파라미터 제거:
-// Blogger는 내부적으로 모바일 전환용으로 ?m=1/?m=0 링크를 HTML 곳곳에 심는다.
-// 사용자가 이 링크를 클릭하면 워커를 통해 다시 요청이 오고, Blogger upstream에
-// ?m=1 이 그대로 전달되어 "리디렉션 경고" 페이지가 뜨게 된다.
-// href/src/action 속성 안의 ?m=숫자 를 모두 제거해 이 현상을 원천 차단한다.
 function stripMobileParam(html) {
-  // href="...?m=1"  → href="..."
-  // href="...?m=1&foo=bar" → href="...?foo=bar"
-  // href="...?foo=bar&m=1" → href="...?foo=bar"
   return html
-    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+&/gi, '$1?')   // ?m=X& (앞에 위치)
-    .replace(/((?:href|src|action)=["'][^"']*)&m=\d+/gi,  '$1')      // &m=X  (뒤에 위치)
-    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+/gi, '$1');     // ?m=X  (단독)
+    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+&/gi, '$1?')
+    .replace(/((?:href|src|action)=["'][^"']*)&m=\d+/gi,  '$1')
+    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+/gi, '$1');
 }
 
-// 혼합 콘텐츠(Mixed Content) 에러 방지: 이 페이지는 항상 HTTPS로 서빙되므로
-// 본문 안의 http:// 리소스(이미지/스크립트/스타일/링크)를 https://로 강제
-// 치환한다. 브라우저가 "이 사이트는 안전하지 않은 콘텐츠를 포함합니다" 같은
-// 경고/차단을 하지 않도록 한다. 외부 사이트로의 일반 텍스트 링크까지 전부
-// 바꾸면 의미가 달라질 수 있으므로, src=/href= 속성 안의 http:// 만 대상으로 한다.
-function enforceHttps(html, url) {
-  // 이 워커 자신의 origin(블로그스팟)이나 커스텀 도메인을 가리키는
-  // http:// 링크만 안전하게 https://로 치환한다.
+function enforceHttps(html) {
   return html.replace(/((?:src|href)=["'])http:\/\//gi, '$1https://');
 }
 
 // ─────────────────────────────────────────────
-// 페이지 컨텍스트 추출
+// 페이지 컨텍스트
 // ─────────────────────────────────────────────
 function extractPageContext(html, url) {
   const ctx = {
-    type:        detectPageType(url),
-    title:       '',
-    description: '',
-    imageUrl:    '',
-    author:      '',
-    publishDate: '',
-    updateDate:  '',
-    tags:        [],
-    postUrl:     url.toString(),
-    siteName:    extractSiteName(html),
-    logoUrl:     extractLogoUrl(html),
+    type: detectPageType(url), title: '', description: '', imageUrl: '',
+    author: '', publishDate: '', updateDate: '', tags: [],
+    postUrl: url.toString(), siteName: extractSiteName(html), logoUrl: extractLogoUrl(html),
   };
-
   ctx.title       = extractMeta(html, 'og:title') || extractTagContent(html, /<title[^>]*>([^<]+)<\/title>/i) || '';
   const bodyText  = extractBodyText(html);
   ctx.description = extractMeta(html, 'description') || extractMeta(html, 'og:description') || buildMetaDescription(bodyText, ctx.title);
@@ -731,116 +585,75 @@ function extractPageContext(html, url) {
 
 function detectPageType(url) {
   const p = url.pathname;
-  if (p === '/' || p === '')                       return 'home';
-  if (/\/\d{4}\/\d{2}\/[^/]+\.html$/.test(p))     return 'post';
-  if (/^\/p\//.test(p))                            return 'page';
-  if (p.startsWith('/search/label/'))               return 'label';
-  if (p.startsWith('/search'))                      return 'search';
+  if (p === '/' || p === '')                   return 'home';
+  if (/\/\d{4}\/\d{2}\/[^/]+\.html$/.test(p)) return 'post';
+  if (/^\/p\//.test(p))                        return 'page';
+  if (p.startsWith('/search/label/'))           return 'label';
+  if (p.startsWith('/search'))                  return 'search';
   return 'other';
 }
 
 // ─────────────────────────────────────────────
-// 메타 설명 (RankMath 방식, 160자)
+// SEO 주입
 // ─────────────────────────────────────────────
 function injectMetaDescription(html, ctx) {
   if (!ctx.description) return html;
-  const desc = escapeAttr(ctx.description.slice(0, 160));
-  if (/<meta[^>]+name=["']description["'][^>]*>/i.test(html)) {
-    return html
-      .replace(/(<meta[^>]+name=["']description["'][^>]*content=["'])[^"']*(['"][^>]*>)/i, `$1${desc}$2`)
-      .replace(/(<meta[^>]+content=["'])[^"']*(['"][^>]+name=["']description["'][^>]*>)/i, `$1${desc}$2`);
-  }
-  return html.replace(/(<head[^>]*>)/i, `$1\n<meta name="description" content="${desc}">`);
+  const esc = escapeAttr(ctx.description);
+  let out = html;
+  if (/<meta[^>]+name=["']description["']/i.test(out))
+    out = out.replace(/(<meta[^>]+name=["']description["'][^>]+content=["'])[^"']*["']/i, `$1${esc}"`);
+  else
+    out = out.replace(/(<\/head>)/i, `<meta name="description" content="${esc}">\n$1`);
+  return out;
 }
 
-// ─────────────────────────────────────────────
-// Canonical
-// ─────────────────────────────────────────────
 function injectCanonical(html, ctx, url) {
-  if (/<link[^>]+rel=["']canonical["'][^>]*>/i.test(html)) return html;
-  return html.replace(/(<head[^>]*>)/i, `$1\n<link rel="canonical" href="${escapeAttr(url.origin + url.pathname)}">`);
+  if (/<link[^>]+rel=["']canonical["']/i.test(html)) return html;
+  const canon = escapeAttr(ctx.postUrl || url.toString());
+  return html.replace(/(<\/head>)/i, `<link rel="canonical" href="${canon}">\n$1`);
 }
 
-// ─────────────────────────────────────────────
-// SEO 태그
-// ─────────────────────────────────────────────
 function injectSeoTags(html, ctx, url) {
+  if (!ctx.title) return html;
   const tags = [];
-  if (!/<meta[^>]+name=["']robots["'][^>]*>/i.test(html))
-    tags.push('<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1">');
-  if (!/<meta[^>]+property=["']og:title["'][^>]*>/i.test(html) && ctx.title)
-    tags.push(`<meta property="og:title" content="${escapeAttr(ctx.title)}">`);
-  if (!/<meta[^>]+property=["']og:description["'][^>]*>/i.test(html) && ctx.description)
-    tags.push(`<meta property="og:description" content="${escapeAttr(ctx.description.slice(0, 200))}">`);
-  if (!/<meta[^>]+property=["']og:url["'][^>]*>/i.test(html))
-    tags.push(`<meta property="og:url" content="${escapeAttr(url.origin + url.pathname)}">`);
-  if (!/<meta[^>]+property=["']og:type["'][^>]*>/i.test(html))
-    tags.push(`<meta property="og:type" content="${ctx.type === 'post' ? 'article' : 'website'}">`);
-  if (!/<meta[^>]+property=["']og:site_name["'][^>]*>/i.test(html) && ctx.siteName)
-    tags.push(`<meta property="og:site_name" content="${escapeAttr(ctx.siteName)}">`);
-  if (!/<meta[^>]+property=["']og:image["'][^>]*>/i.test(html) && ctx.imageUrl) {
-    tags.push(`<meta property="og:image" content="${escapeAttr(ctx.imageUrl)}">`);
-    tags.push('<meta property="og:image:width" content="1200">');
-    tags.push('<meta property="og:image:height" content="630">');
-  }
-  if (!/<meta[^>]+name=["']twitter:card["'][^>]*>/i.test(html))
+  const push = (p, c) => { if (c) tags.push(`<meta property="${p}" content="${escapeAttr(c)}">`); };
+  if (!/<meta[^>]+property=["']og:title["']/i.test(html))    push('og:title',       ctx.title);
+  if (!/<meta[^>]+property=["']og:description["']/i.test(html)) push('og:description', ctx.description);
+  if (!/<meta[^>]+property=["']og:url["']/i.test(html))      push('og:url',         ctx.postUrl);
+  if (!/<meta[^>]+property=["']og:type["']/i.test(html))     push('og:type',        ctx.type === 'post' ? 'article' : 'website');
+  if (!/<meta[^>]+property=["']og:image["']/i.test(html) && ctx.imageUrl) push('og:image', ctx.imageUrl);
+  push('og:site_name', ctx.siteName);
+  if (!/<meta[^>]+name=["']twitter:card["']/i.test(html)) {
     tags.push(`<meta name="twitter:card" content="${ctx.imageUrl ? 'summary_large_image' : 'summary'}">`);
-  if (!/<meta[^>]+name=["']twitter:title["'][^>]*>/i.test(html) && ctx.title)
-    tags.push(`<meta name="twitter:title" content="${escapeAttr(ctx.title)}">`);
-  if (!/<meta[^>]+name=["']twitter:description["'][^>]*>/i.test(html) && ctx.description)
-    tags.push(`<meta name="twitter:description" content="${escapeAttr(ctx.description.slice(0, 200))}">`);
-  if (!/<meta[^>]+name=["']twitter:image["'][^>]*>/i.test(html) && ctx.imageUrl)
-    tags.push(`<meta name="twitter:image" content="${escapeAttr(ctx.imageUrl)}">`);
-  if (!tags.length) return html;
-  return html.replace('</head>', tags.join('\n') + '\n</head>');
-}
-
-// ─────────────────────────────────────────────
-// Schema 마크업 (RankMath 방식)
-// ─────────────────────────────────────────────
-function injectSchemaMarkup(html, ctx, url) {
-  if (html.includes('"BreadcrumbList"')) return html;
-  const schemas = [];
-  if (ctx.type === 'home') {
-    schemas.push(buildWebSiteSchema(ctx, url));
-    schemas.push(buildOrganizationSchema(ctx, url));
+    push('twitter:title',       ctx.title);
+    push('twitter:description', ctx.description);
+    if (ctx.imageUrl) push('twitter:image', ctx.imageUrl);
   }
-  schemas.push(buildBreadcrumbSchema(ctx, url));
-  if (ctx.type === 'post')                          schemas.push(buildArticleSchema(ctx, url));
-  if (ctx.type === 'page' || ctx.type === 'other')  schemas.push(buildWebPageSchema(ctx, url));
-  const scriptTag = schemas.map(s => `<script type="application/ld+json">${JSON.stringify(s)}</script>`).join('\n');
-  return html.replace('</head>', scriptTag + '\n</head>');
+  return tags.length ? html.replace(/(<\/head>)/i, tags.join('\n') + '\n$1') : html;
 }
 
-function buildWebSiteSchema(ctx, url) {
-  return {
-    '@context': 'https://schema.org', '@type': 'WebSite',
-    '@id': url.origin + '/#website', url: url.origin + '/', name: ctx.siteName || ctx.title,
-    potentialAction: { '@type': 'SearchAction', target: { '@type': 'EntryPoint', urlTemplate: url.origin + '/search?q={search_term_string}' }, 'query-input': 'required name=search_term_string' },
+function injectSchemaMarkup(html, ctx, url) {
+  if (html.includes('"@context":"https://schema.org"') || html.includes('"@context": "https://schema.org"')) return html;
+  const schemas = [buildWebsiteSchema(ctx, url)];
+  if (ctx.type === 'post') schemas.push(buildArticleSchema(ctx, url));
+  else schemas.push(buildWebPageSchema(ctx, url));
+  const ld = `<script type="application/ld+json">${JSON.stringify(schemas.length === 1 ? schemas[0] : schemas)}<\/script>`;
+  return html.replace(/(<\/head>)/i, ld + '\n$1');
+}
+
+function buildWebsiteSchema(ctx, url) {
+  return { '@context': 'https://schema.org', '@type': 'WebSite',
+    '@id': url.origin + '/#website', url: url.origin + '/',
+    name: ctx.siteName || ctx.title,
+    ...(ctx.logoUrl ? { publisher: { '@type': 'Organization', name: ctx.siteName, logo: { '@type': 'ImageObject', url: ctx.logoUrl } } } : {}),
   };
 }
 
-function buildOrganizationSchema(ctx, url) {
-  const s = { '@context': 'https://schema.org', '@type': 'Organization', '@id': url.origin + '/#organization', name: ctx.siteName || ctx.title, url: url.origin + '/' };
-  if (ctx.logoUrl) s.logo = { '@type': 'ImageObject', '@id': url.origin + '/#logo', url: ctx.logoUrl, contentUrl: ctx.logoUrl };
-  return s;
-}
-
-function buildBreadcrumbSchema(ctx, url) {
-  const segs  = url.pathname.replace(/^\/|\/$/g, '').split('/').filter(Boolean);
-  const items = [{ '@type': 'ListItem', position: 1, name: ctx.siteName || '홈', item: url.origin + '/' }];
-  let acc     = url.origin;
-  segs.forEach((seg, i) => { acc += '/' + seg; items.push({ '@type': 'ListItem', position: i + 2, name: decodeSegmentName(seg), item: acc }); });
-  return { '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: items };
-}
-
 function buildArticleSchema(ctx, url) {
-  const s = {
-    '@context': 'https://schema.org', '@type': ['Article', 'BlogPosting'],
-    '@id': ctx.postUrl + '#article', url: ctx.postUrl, headline: ctx.title, description: ctx.description,
-    isPartOf: { '@id': url.origin + '/#website' },
-    author: { '@type': 'Person', name: ctx.author || ctx.siteName || 'Author' },
-    publisher: { '@type': 'Organization', '@id': url.origin + '/#organization', name: ctx.siteName || '' },
+  const s = { '@context': 'https://schema.org', '@type': 'Article',
+    '@id': ctx.postUrl + '#article', mainEntityOfPage: ctx.postUrl + '#webpage',
+    headline: ctx.title, description: ctx.description,
+    author: { '@type': 'Person', name: ctx.author || ctx.siteName },
     inLanguage: 'ko-KR',
   };
   if (ctx.imageUrl)    { s.image = { '@type': 'ImageObject', url: ctx.imageUrl }; s.thumbnailUrl = ctx.imageUrl; }
@@ -851,41 +664,37 @@ function buildArticleSchema(ctx, url) {
 }
 
 function buildWebPageSchema(ctx, url) {
-  return {
-    '@context': 'https://schema.org', '@type': 'WebPage',
-    '@id': ctx.postUrl + '#webpage', url: ctx.postUrl, name: ctx.title, description: ctx.description,
+  return { '@context': 'https://schema.org', '@type': 'WebPage',
+    '@id': ctx.postUrl + '#webpage', url: ctx.postUrl,
+    name: ctx.title, description: ctx.description,
     isPartOf: { '@id': url.origin + '/#website' }, inLanguage: 'ko-KR',
     ...(ctx.publishDate ? { datePublished: ctx.publishDate } : {}),
     ...(ctx.updateDate  ? { dateModified:  ctx.updateDate  } : {}),
   };
 }
 
-// ─────────────────────────────────────────────
-// 성능 최적화
-// ─────────────────────────────────────────────
 function injectPerformanceOptimizations(html) {
   if (html.includes('rel="dns-prefetch"')) return html;
-  const perfTags = [
+  const tags = [
     '<link rel="dns-prefetch" href="//www.blogger.com">',
     '<link rel="dns-prefetch" href="//www.gstatic.com">',
     '<link rel="dns-prefetch" href="//fonts.googleapis.com">',
     '<link rel="dns-prefetch" href="//fonts.gstatic.com">',
-    '<link rel="dns-prefetch" href="//pagead2.googlesyndication.com">',
     '<link rel="preconnect" href="https://www.gstatic.com" crossorigin>',
     '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
   ].join('\n');
-  let out = html.replace(/(<head[^>]*>)/i, `$1\n${perfTags}`);
-  out = out.replace(/<img(?![^>]*loading=)/gi, '<img loading="lazy" decoding="async"');
-  out = out.replace(/(<script(?![^>]*(defer|async|type=["']application\/ld\+json["']|type=["']text\/template["']))[^>]*src=["'][^"']+["'][^>]*)>/gi, '$1 defer>');
-  return out;
+  let o = html.replace(/(<head[^>]*>)/i, `$1\n${tags}`);
+  o = o.replace(/<img(?![^>]*loading=)/gi, '<img loading="lazy" decoding="async"');
+  o = o.replace(/(<script(?![^>]*(defer|async|type=["']application\/ld\+json["']|type=["']text\/template["']))[^>]*src=["'][^"']+["'][^>]*)>/gi, '$1 defer>');
+  return o;
 }
 
 // ─────────────────────────────────────────────
 // Cache Reserve
 // ─────────────────────────────────────────────
 function buildCacheKey(url) {
-  const sorted = new URLSearchParams([...url.searchParams].sort());
-  return url.origin + url.pathname + (sorted.toString() ? '?' + sorted : '');
+  const s = new URLSearchParams([...url.searchParams].sort());
+  return url.origin + url.pathname + (s.toString() ? '?' + s : '');
 }
 
 async function getCacheReserve(key, env) {
@@ -898,8 +707,7 @@ async function getCacheReserve(key, env) {
       return null;
     }
     const body = await env.CACHE_RESERVE_KV.get('body:' + key);
-    if (!body) return null;
-    return { body, headers: meta.headers };
+    return body ? { body, headers: meta.headers } : null;
   } catch (_) { return null; }
 }
 
@@ -916,18 +724,18 @@ async function setCacheReserve(key, body, headers, env) {
 // ─────────────────────────────────────────────
 async function updateSlugKV(ctx, url, env) {
   if (!['post', 'page'].includes(ctx.type) || !ctx.title) return;
-  const path = url.pathname, generated = generateSlug(ctx.title);
+  const path = url.pathname, slug = generateSlug(ctx.title);
   try {
     const existing = await env.SLUG_KV.get('slug:' + path, { type: 'json' });
-    const now      = Date.now();
+    const now = Date.now();
     if (!existing) {
-      await env.SLUG_KV.put('slug:' + path, JSON.stringify({ title: ctx.title, slug: generated, path, createdAt: now, checkedAt: now }));
+      await env.SLUG_KV.put('slug:' + path, JSON.stringify({ title: ctx.title, slug, path, createdAt: now, checkedAt: now }));
     } else if (now - existing.checkedAt > SLUG_CHECK_MS) {
       const newSlug = generateSlug(ctx.title);
       if (newSlug !== existing.slug) {
-        const oldPath = path.replace(/[^/]+\.html$/, existing.slug + '.html');
-        const newPath = path.replace(/[^/]+\.html$/, newSlug + '.html');
-        if (oldPath !== newPath) await env.SLUG_KV.put('canonical:' + oldPath, newPath);
+        const op = path.replace(/[^/]+\.html$/, existing.slug + '.html');
+        const np = path.replace(/[^/]+\.html$/, newSlug + '.html');
+        if (op !== np) await env.SLUG_KV.put('canonical:' + op, np);
       }
       await env.SLUG_KV.put('slug:' + path, JSON.stringify({ ...existing, slug: newSlug, checkedAt: now }));
     }
@@ -944,9 +752,9 @@ async function runSlugAudit(env) {
         if (!data || now - data.checkedAt < SLUG_CHECK_MS) continue;
         const newSlug = generateSlug(data.title);
         if (newSlug !== data.slug) {
-          const oldPath = data.path.replace(/[^/]+\.html$/, data.slug + '.html');
-          const newPath = data.path.replace(/[^/]+\.html$/, newSlug + '.html');
-          if (oldPath !== newPath) await env.SLUG_KV.put('canonical:' + oldPath, newPath);
+          const op = data.path.replace(/[^/]+\.html$/, data.slug + '.html');
+          const np = data.path.replace(/[^/]+\.html$/, newSlug + '.html');
+          if (op !== np) await env.SLUG_KV.put('canonical:' + op, np);
         }
         await env.SLUG_KV.put(key.name, JSON.stringify({ ...data, slug: newSlug, checkedAt: now }));
       } catch (_) {}
@@ -955,18 +763,37 @@ async function runSlugAudit(env) {
 }
 
 // ─────────────────────────────────────────────
+// blogspot HTML/feed 본문에서 origin 추출 (보조)
+// ─────────────────────────────────────────────
+function extractBlogspotFromContent(content) {
+  const patterns = [
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    /<link[^>]+rel=["']EditURI["'][^>]+href=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    /<meta[^>]+property=["']og:url["'][^>]+content=["']https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"']*["']/i,
+    /<loc>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/loc>/i,
+    /<link>\s*https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^<]*<\/link>/i,
+    /"(?:id|url)"\s*:\s*"https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)[^"]*"/i,
+  ];
+  for (const re of patterns) {
+    const m = content.match(re);
+    if (m && m[1]) return 'https://' + m[1];
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────
 // 슬러그 생성 (다국어)
 // ─────────────────────────────────────────────
 function generateSlug(title) {
   if (!title) return 'untitled';
-  let slug = title.trim().toLowerCase()
-    .replace(/\s+/g, '-').replace(/[_]+/g, '-')
+  let s = title.trim().toLowerCase()
+    .replace(/\s+/g, '-').replace(/_+/g, '-')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
     .replace(/[^\p{L}\p{N}\-]/gu, '-')
     .replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
-  if (/[^\x00-\x7F]/.test(slug))
-    slug = encodeURIComponent(slug).replace(/%20/g, '-').replace(/%2F/gi, '-');
-  return slug || 'post';
+  if (/[^\x00-\x7F]/.test(s))
+    s = encodeURIComponent(s).replace(/%20/g, '-').replace(/%2F/gi, '-');
+  return s || 'post';
 }
 
 // ─────────────────────────────────────────────
@@ -985,7 +812,7 @@ function buildResponseHeaders() {
 
 function buildCachedHeaders(saved) {
   const h = new Headers(saved || {});
-  h.set('x-cache',      'HIT');
+  h.set('x-cache',       'HIT');
   h.set('cache-control', `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`);
   return h;
 }
@@ -998,8 +825,8 @@ function extractMeta(html, name) {
   return (
     html.match(new RegExp(`<meta[^>]+property=["']${r}["'][^>]+content=["']([^"']+)["']`, 'i')) ||
     html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${r}["']`, 'i')) ||
-    html.match(new RegExp(`<meta[^>]+name=["']${r}["'][^>]+content=["']([^"']+)["']`, 'i'))    ||
-    html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+name=["']${r}["']`, 'i'))    ||
+    html.match(new RegExp(`<meta[^>]+name=["']${r}["'][^>]+content=["']([^"']+)["']`,    'i')) ||
+    html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+name=["']${r}["']`,    'i')) ||
     []
   )[1] || '';
 }
@@ -1014,23 +841,16 @@ function extractBodyText(html) {
 }
 
 function buildMetaDescription(bodyText, title) {
-  let text = bodyText.replace(title, '').trim();
-  if (text.length > 160) {
-    text = text.slice(0, 160);
-    const last = text.lastIndexOf(' ');
-    if (last > 100) text = text.slice(0, last);
-    text += '…';
-  }
-  return text;
+  let t = bodyText.replace(title, '').trim();
+  if (t.length > 160) { t = t.slice(0, 160); const l = t.lastIndexOf(' '); if (l > 100) t = t.slice(0, l); t += '…'; }
+  return t;
 }
 
 function extractFirstImage(html)  { return (html.match(/<img[^>]+src=["']([^"']+)["']/i) || [])[1] || ''; }
 function extractSiteName(html)    { return extractMeta(html, 'og:site_name') || extractTagContent(html, /<title[^>]*>([^<|]+)/i) || ''; }
 function extractLogoUrl(html)     {
-  return (
-    html.match(/<img[^>]+id=["']Header1_headerimg["'][^>]+src=["']([^"']+)["']/i) ||
-    html.match(/<link[^>]+rel=["']icon["'][^>]+href=["']([^"']+)["']/i) || []
-  )[1] || '';
+  return (html.match(/<img[^>]+id=["']Header1_headerimg["'][^>]+src=["']([^"']+)["']/i) ||
+          html.match(/<link[^>]+rel=["']icon["'][^>]+href=["']([^"']+)["']/i) || [])[1] || '';
 }
 function extractLabels(html) {
   const labels = [], re = /class="label[^"]*"[^>]*>([^<]+)</gi; let m;
@@ -1038,6 +858,5 @@ function extractLabels(html) {
   return labels;
 }
 function extractJsonLdDate(html, key) { return (html.match(new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, 'i')) || [])[1] || ''; }
-function decodeSegmentName(seg) { try { return decodeURIComponent(seg.replace(/\.html$/, '').replace(/-/g, ' ')); } catch (_) { return seg; } }
-function escapeAttr(str) { return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function escapeAttr(str) { return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escapeRe(str)   { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
