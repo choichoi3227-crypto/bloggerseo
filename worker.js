@@ -103,25 +103,46 @@ async function handleFetch(request, env, ctx) {
   const url  = new URL(request.url);
   const path = url.pathname;
 
+  // ── 1. Feed / 정적 자산 직통 (origin 탐지보다 먼저) ──────────
+  // isPassthrough() 경로는 origin 없이도 blogspot.com 으로 직접 프록시.
+  // 단, origin이 KV에 없으면 feed 응답 본문에서 실시간으로 탐지해 저장.
+  if (isPassthrough(path, url)) {
+    const resolved = await resolveOrigin(url.hostname, env);
+    if (resolved) {
+      const origin = await lbSelect(resolved.origins, url.hostname, request, env);
+      try {
+        const resp = await proxyFetch(request, url, origin, resolved.canonicalHost);
+        const san  = await sanitize(resp, url, origin, resolved.canonicalHost);
+        // feed 응답에서 origin을 아직 모를 때를 대비해 백그라운드로 재확인
+        if (path.startsWith('/feeds/')) {
+          ctx.waitUntil(learnOriginFromFeed(san.clone(), url.hostname, env));
+        }
+        return san.status >= 500 ? notice(['origin 5xx (passthrough): ' + san.status]) : san;
+      } catch (e) {
+        return notice(['passthrough fetch 예외: ' + e.message]);
+      }
+    }
+    // origin 미탐지 상태에서 feed 요청 → blogspot.com 으로 직접 시도
+    if (path.startsWith('/feeds/')) {
+      const resp = await detectAndProxyFeed(request, url, env, ctx);
+      if (resp) return resp;
+    }
+    // 정적 자산인데 origin 없으면 404
+    return new Response('Not found', { status: 404 });
+  }
+
   // ── Origin 조회 ──────────────────────────
   const resolved = await resolveOrigin(url.hostname, env);
-  if (!resolved) return notice(['Origin 탐지 실패 — 잠시 후 재시도하거나 Route 설정을 확인하세요.']);
+  if (!resolved) {
+    // origin 모름 → 백그라운드에서 feed로 탐지 시작, 사용자에게 재시도 안내
+    ctx.waitUntil(detectOriginViaFeed(url.hostname, env));
+    return notice(['Origin 탐지 중 — 잠시 후 새로고침 해주세요.']);
+  }
 
   const { origins, canonicalHost } = resolved;
 
   // ── 로드 밸런서로 origin 선택 ────────────
   const origin = await lbSelect(origins, url.hostname, request, env);
-
-  // ── 1. 정적 자산 / Feed 직통 ─────────────
-  if (isPassthrough(path, url)) {
-    try {
-      const resp = await proxyFetch(request, url, origin, canonicalHost);
-      const san  = await sanitize(resp, url, origin, canonicalHost);
-      return san.status >= 500 ? notice(['origin 5xx (passthrough): ' + san.status]) : san;
-    } catch (e) {
-      return notice(['passthrough fetch 예외: ' + e.message]);
-    }
-  }
 
   // ── 2. 슬러그 canonical 리다이렉트 ───────
   const slugRedir = await checkSlugRedirect(path, url, env);
@@ -145,7 +166,6 @@ async function handleFetch(request, env, ctx) {
     return notice(['origin fetch 예외: ' + e.message]);
   }
   const rtt = Date.now() - t0;
-  // RTT / 연결 수 비동기 업데이트 (응답 지연 없음)
   ctx.waitUntil(lbRecordRtt(origin, rtt, env));
 
   if (originResp.status >= 500) return notice(['origin 5xx: ' + originResp.status]);
@@ -173,12 +193,16 @@ async function handleFetch(request, env, ctx) {
 // ─────────────────────────────────────────────
 // Origin 자동 탐지 & 캐시
 // ─────────────────────────────────────────────
-// Blogger API v3 blogs.getByUrl 사용.
-// 공개 블로그라면 API 키·secret·변수 설정 없이
-// 커스텀 도메인 URL을 넣으면 blogspot 주소를 반환한다.
-// (인증 불필요, Cloudflare Workers host 헤더 제한과 무관)
+// Blogger의 Atom feed (https://xxxx.blogspot.com/feeds/posts/default)는
+// 인증 없이 공개 접근 가능하고, 응답 XML 안에 blogspot URL이 반드시 포함된다.
+// 커스텀 도메인의 feed를 blogspot.com 주소 없이 직접 fetch할 수 없으므로,
+// 대신 blogspot.com 의 공개 feed를 커스텀 도메인 정보 없이는 접근 불가.
+//
+// 해결: 첫 요청 시 사용자에게 재시도 안내 페이지를 돌려주면서
+// 백그라운드(ctx.waitUntil)로 커스텀 도메인의 feed URL을 fetch →
+// 응답 본문(XML)에서 blogspot URL 추출 → KV 저장.
+// 두 번째 요청부터 KV 캐시로 즉시 반환.
 async function resolveOrigin(host, env) {
-  // 1) KV 캐시 우선
   try {
     const raw = await env.SLUG_KV.get(kvOrigin(host));
     if (raw) {
@@ -187,52 +211,75 @@ async function resolveOrigin(host, env) {
       return { origins, canonicalHost };
     }
   } catch (_) {}
-
-  // 2) 첫 요청 시 실시간 탐지
-  const result = await detectViaBloggerApi(host);
-  if (!result) return null;
-
-  try {
-    await env.SLUG_KV.put(kvOrigin(host),    JSON.stringify(result.origins));
-    await env.SLUG_KV.put(kvCanonical(host), result.canonicalHost);
-  } catch (_) {}
-
-  return result;
-}
-
-// Blogger API v3 blogs.getByUrl 로 blogspot origin 탐지
-// API 키 없이 공개 블로그 URL만으로 동작.
-// 반환: { origins: ["https://xxxx.blogspot.com"], canonicalHost: "www.xxx.com" } | null
-async function detectViaBloggerApi(host) {
-  // www 유무 양쪽 모두 시도
-  const candidates = [host];
-  if (host.startsWith('www.')) {
-    candidates.push(host.slice(4));
-  } else {
-    candidates.push('www.' + host);
-  }
-
-  for (const h of candidates) {
-    const apiUrl = `https://www.googleapis.com/blogger/v3/blogs/byurl?url=https://${h}/&fields=url`;
-    try {
-      const resp = await fetch(apiUrl, {
-        headers: { 'user-agent': 'BlogspotSEOWorker/1.0' },
-      });
-      if (!resp.ok) continue;
-      const data = await resp.json();
-      // data.url 은 "https://xxxx.blogspot.com/" 형태
-      const origin = blogspotFromUrl(data.url || '');
-      if (origin) return { origins: [origin], canonicalHost: h };
-    } catch (_) {}
-  }
-
   return null;
 }
 
-function blogspotFromUrl(url) {
-  if (!url) return null;
-  const m = url.match(/https?:\/\/([a-zA-Z0-9-]+\.blogspot\.com)/i);
-  return m ? 'https://' + m[1] : null;
+// 커스텀 도메인의 feed를 직접 fetch해서 blogspot origin 추출 → KV 저장
+// (백그라운드 실행용, ctx.waitUntil에서 호출)
+async function detectOriginViaFeed(host, env) {
+  // www 유무 양쪽 시도
+  const candidates = [host];
+  if (host.startsWith('www.')) candidates.push(host.slice(4));
+  else candidates.push('www.' + host);
+
+  for (const h of candidates) {
+    try {
+      const resp = await fetch(`https://${h}/feeds/posts/default?alt=rss&max-results=1`, {
+        redirect: 'follow',
+        headers: { 'user-agent': 'Mozilla/5.0' },
+      });
+      if (!resp.ok) continue;
+      const xml    = await resp.text();
+      const origin = extractBlogspotFromContent(xml);
+      if (origin) {
+        await env.SLUG_KV.put(kvOrigin(host),    JSON.stringify([origin]));
+        await env.SLUG_KV.put(kvCanonical(host), h);
+        return;
+      }
+    } catch (_) {}
+  }
+}
+
+// feed 응답 본문에서 origin을 학습해 KV 보완 (이미 origin 알고 있을 때 재확인용)
+async function learnOriginFromFeed(resp, host, env) {
+  try {
+    const xml    = await resp.text();
+    const origin = extractBlogspotFromContent(xml);
+    if (!origin) return;
+    const existing = await env.SLUG_KV.get(kvOrigin(host));
+    if (!existing) {
+      await env.SLUG_KV.put(kvOrigin(host),    JSON.stringify([origin]));
+      await env.SLUG_KV.put(kvCanonical(host), host);
+    }
+  } catch (_) {}
+}
+
+// origin 모르는 상태에서 feed 요청이 왔을 때:
+// blogspot 주소 탐지 후 직접 프록시하고 결과도 KV에 저장
+async function detectAndProxyFeed(request, url, env, ctx) {
+  const host = url.hostname;
+  const candidates = [host];
+  if (host.startsWith('www.')) candidates.push(host.slice(4));
+  else candidates.push('www.' + host);
+
+  for (const h of candidates) {
+    try {
+      const feedUrl = `https://${h}${url.pathname}${url.search}`;
+      const resp = await fetch(feedUrl, {
+        redirect: 'follow',
+        headers: { 'user-agent': 'Mozilla/5.0' },
+      });
+      if (!resp.ok) continue;
+      const xml    = await resp.text();
+      const origin = extractBlogspotFromContent(xml);
+      if (origin) {
+        ctx.waitUntil(env.SLUG_KV.put(kvOrigin(host),    JSON.stringify([origin])));
+        ctx.waitUntil(env.SLUG_KV.put(kvCanonical(host), h));
+        return new Response(xml, { status: 200, headers: { 'content-type': resp.headers.get('content-type') || 'application/xml' } });
+      }
+    } catch (_) {}
+  }
+  return null;
 }
 
 
