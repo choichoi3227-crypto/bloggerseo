@@ -6,7 +6,7 @@
 
 name = "blogspot-seo-worker"
 main = "worker.js"
-compatibility_date = "2024-09-23"
+compatibility_date = "2026-06-16"
 compatibility_flags = ["nodejs_compat"]
 
 # ─── KV 네임스페이스 ────────────────────────────────────────────────
@@ -38,6 +38,12 @@ invocation_logs = true
 enabled = false
 persist = true
 head_sampling_rate = 1
+
+
+
+[placement]
+mode = "smart"
+
 
 # ─── 동작 원리 ──────────────────────────────────────────────────────
 # 1. 요청 호스트의 CNAME이 ghs.google.com인지 1.1.1.1 DoH로 검증.
