@@ -246,25 +246,36 @@ async function dnsCname(host) {
 }
 
 // ─────────────────────────────────────────────
-// Blogger fetch: 커스텀 도메인으로 직접 요청
+// Blogger fetch: ghs.google.com으로 직접 요청
+//
+// 커스텀 도메인으로 fetch하면 Cloudflare Worker 자신을 다시 거쳐
+// 무한 리다이렉트 루프 발생 (Too many redirects).
+// → ghs.google.com에 Host: 커스텀도메인 헤더로 직접 요청.
+//
+// CF Workers의 fetch()는 서브리퀘스트에서 Host 헤더 override 가능.
+// ghs.google.com TCP 연결 + Host: 커스텀도메인 → Blogger 직접 응답.
+//
 // ?m=1 제거 (Blogger 모바일 파라미터)
 // ─────────────────────────────────────────────
 async function bloggerFetch(url, method, reqHeaders, body) {
   const params = new URLSearchParams(url.search);
   params.delete('m');
   const qs        = params.toString() ? '?' + params.toString() : '';
-  const targetUrl = url.origin + url.pathname + qs;
+
+  // ghs.google.com으로 직접 TCP 연결, Host는 커스텀 도메인 유지
+  const targetUrl = 'https://ghs.google.com' + url.pathname + qs;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
     const kl = k.toLowerCase();
-    if (kl === 'host')            continue;
     if (kl.startsWith('cf-'))     continue;
     if (kl === 'x-forwarded-for') continue;
     if (kl === 'x-real-ip')       continue;
     headers.set(k, v);
   }
-  // Googlebot UA로 설정 (Blogger가 크롤러에게 최적 응답 반환)
+  // Host를 커스텀 도메인으로 설정 → Blogger가 해당 블로그 콘텐츠 반환
+  headers.set('host', url.hostname);
+  // Googlebot UA (Blogger 최적 응답)
   headers.set('user-agent', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
 
   return fetch(targetUrl, {
