@@ -7,8 +7,6 @@ compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 # ─── KV 네임스페이스 ───────────────────────────────────────
-# 배포 전 `wrangler kv:namespace create SLUG_KV` 실행 후 id 입력
-# 배포 전 `wrangler kv:namespace create CACHE_RESERVE_KV` 실행 후 id 입력
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "dee1ee21fe4c44559bce049b53cf4d0a"
@@ -17,35 +15,24 @@ id      = "dee1ee21fe4c44559bce049b53cf4d0a"
 binding = "CACHE_RESERVE_KV"
 id      = "7153daa4c5874bc581670f75adf66a22"
 
-# ─── BLOGSPOT_ORIGIN 설정 방법 (택 1) ─────────────────────
+# ─── 필수 Secret 설정 ──────────────────────────────────────
+# Cloudflare 대시보드 → Workers & Pages → 해당 워커 → Settings
+# → Variables and Secrets 에서 아래 3개를 Secret으로 추가:
 #
-# 【방법 A】단일 도메인 — vars에 평문 설정 (간단, 노출 무방)
-#   [vars]
-#   BLOGSPOT_ORIGIN = "xxxx.blogspot.com"
+#   CF_ACCOUNT_ID   Cloudflare 계정 ID
+#                   (대시보드 우측 사이드바 또는 계정 홈 URL에서 확인)
 #
-# 【방법 B】단일 도메인 — secret으로 보안 설정 (권장)
-#   wrangler.toml에는 아무것도 추가하지 않고, 배포 후 아래 명령 실행:
-#   $ wrangler secret put BLOGSPOT_ORIGIN
-#   프롬프트에 "xxxx.blogspot.com" 입력 (따옴표 없이)
+#   CF_API_TOKEN    API 토큰 (최소 권한: Zone.Worker Routes.Read)
+#                   대시보드 → My Profile → API Tokens → Create Token
 #
-# 【방법 C】다중 도메인 — 커스텀 도메인별로 매핑 (JSON)
-#   vars 또는 secret 모두 가능.
-#   값 형식: JSON 객체  {"내도메인1.com":"aaa.blogspot.com","내도메인2.com":"bbb.blogspot.com"}
+#   CF_ZONE_ID      블로그 도메인이 속한 Zone ID
+#                   대시보드 → 해당 도메인 → Overview 우측 사이드바
 #
-#   · vars에 직접 쓸 경우 (공개 노출):
-#   [vars]
-#   BLOGSPOT_ORIGIN = '{"blog1.example.com":"aaa.blogspot.com","blog2.example.com":"bbb.blogspot.com"}'
-#
-#   · secret으로 설정할 경우 (권장):
-#   $ wrangler secret put BLOGSPOT_ORIGIN
-#   프롬프트에 JSON 문자열을 통째로 붙여넣기
-#
-# 【방법 D】설정 없음 — 자동 감지 (설정 생략 가능, 속도 약간 느림)
-#   BLOGSPOT_ORIGIN 를 아예 설정하지 않으면 워커가 자동으로 감지합니다.
-#   감지 결과는 KV에 캐시되므로 첫 요청 이후에는 즉시 반환됩니다.
-#
-# ──────────────────────────────────────────────────────────
+# 사용자가 직접 blogspot 주소를 입력할 필요 없음.
+# Route를 추가하면 scheduled 트리거가 자동으로 탐지해서 저장함.
 
-# ─── 스케줄드 트리거 (6개월마다 슬러그 감사) ───────────────
+# ─── 스케줄드 트리거 ────────────────────────────────────────
+# Route 추가 직후 빠른 반영을 위해 매 시간 실행
+# (탐지 완료 후엔 KV 캐시가 있으므로 실제 탐지는 새 도메인에만 발생)
 [triggers]
-crons = ["0 0 1 */6 *"]
+crons = ["0 * * * *"]
