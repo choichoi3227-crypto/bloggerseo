@@ -52,8 +52,12 @@ async function handleFetch(request, env, ctx) {
     return bloggerDebug(url, env);
   }
 
+  // ── 캐시 전체 purge: /__purge_all ────────────
+  if (path === '/__purge_all') {
+    return purgeAll(env);
+  }
+
   // ── CNAME 검증 (soft: 실패해도 차단 안 함, 로그만) ──
-  // blogspot.com 추적 없이 ghs.google.com resolveOverride만 사용
   ctx.waitUntil(warmCnameCache(host, env));
 
   // ── 1. 정적 자산 / Feed / Sitemap 직통 ──────
@@ -61,22 +65,56 @@ async function handleFetch(request, env, ctx) {
     return proxyPass(url, request, env);
   }
 
-  // ── 2. 슬러그 canonical 리다이렉트 ──────────
-  const slugRedir = await checkSlugRedirect(path, url, env);
-  if (slugRedir) return slugRedir;
+  // ── 2. 캐시 우회 판별 ────────────────────────
+  // - GET/HEAD 이외 메서드 (POST 등)
+  // - ?purge=1 파라미터
+  // - Cache-Control: no-cache 요청 헤더
+  // - Blogger 관리/동적 경로 (/b/, /ncr, ?blogedit 등)
+  const bypassCache = shouldBypassCache(request, url, path);
 
-  // ── 3. KV Cache Reserve ──────────────────────
-  const cacheKey = buildCacheKey(url);
+  // purge 모드: KV에서 해당 키 삭제 후 origin에서 새로 가져옴
+  if (bypassCache && url.searchParams.get('purge') === '1') {
+    const cacheKey = buildCacheKey(url);
+    await deleteCacheReserve(cacheKey, env);
+    // purge 파라미터 제거한 URL로 리다이렉트
+    const clean = new URL(url.toString());
+    clean.searchParams.delete('purge');
+    return Response.redirect(clean.toString(), 302);
+  }
+
+  // 캐시 우회: origin 직통
+  if (bypassCache) {
+    return proxyPass(url, request, env);
+  }
+
+  // ── 3. 슬러그 라우팅 ──────────────────────────
+  const slugRoute = await resolveSlugRoute(path, url, env);
+
+  if (slugRoute.type === 'redirect') {
+    // 원본 blogspot 경로 → 제목 슬러그 경로로 301
+    const dest = new URL(url.toString());
+    dest.pathname = slugRoute.titlePath;
+    return Response.redirect(dest.toString(), 301);
+  }
+
+  // alias 경로(제목 슬러그)로 들어온 요청:
+  // KV에서 찾은 원본 경로로 내부 fetch하되 응답 URL은 슬러그 그대로 유지
+  const fetchUrl = slugRoute.type === 'alias'
+    ? (() => { const u = new URL(url.toString()); u.pathname = slugRoute.originPath; return u; })()
+    : url;
+
+  // ── 4. KV Cache Reserve ──────────────────────
+  const cacheKey = buildCacheKey(url);  // 캐시 키는 슬러그 URL 기준
   const cached   = await getCacheReserve(cacheKey, env);
   if (cached) {
     return new Response(cached.body, { status: 200, headers: buildCachedHeaders(cached.headers) });
   }
 
-  // ── 4. Origin Fetch ──────────────────────────
+  // ── 5. Origin Fetch ──────────────────────────
   let originResp;
   const t0 = Date.now();
   try {
-    originResp = await bloggerFetch(url, 'GET', request.headers);
+    originResp = await bloggerFetch(fetchUrl, 'GET', request.headers);
   } catch (e) {
     return errResp(502, 'Fetch failed: ' + e.message);
   }
@@ -91,7 +129,7 @@ async function handleFetch(request, env, ctx) {
   if (originResp.status >= 500) return errResp(originResp.status, 'Origin error ' + originResp.status);
   if (!isHtml(originResp) || !originResp.ok) return stripInternalHeaders(originResp);
 
-  // ── 5. HTML 파이프라인 ────────────────────────
+  // ── 6. HTML 파이프라인 ────────────────────────
   const html = await originResp.text();
   let result, pageCtx;
   try {
@@ -101,13 +139,66 @@ async function handleFetch(request, env, ctx) {
     return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
   }
 
-  // ── 6. 비동기 후처리 ──────────────────────────
+  // ── 7. 비동기 후처리 ──────────────────────────
   const respHeaders = buildResponseHeaders();
   ctx.waitUntil(updateSlugKV(pageCtx, url, env));
   ctx.waitUntil(setCacheReserve(cacheKey, result, respHeaders, env));
   ctx.waitUntil(lbRecordBandwidth(host, result.length, env));
 
   return new Response(result, { status: 200, headers: respHeaders });
+}
+
+// ─────────────────────────────────────────────
+// 캐시 우회 판별
+// ─────────────────────────────────────────────
+function shouldBypassCache(request, url, path) {
+  // GET/HEAD 이외 메서드
+  if (!['GET', 'HEAD'].includes(request.method)) return true;
+  // purge 파라미터
+  if (url.searchParams.get('purge') === '1') return true;
+  // 브라우저 강력 새로고침 (Cache-Control: no-cache)
+  if (request.headers.get('cache-control') === 'no-cache') return true;
+  // Blogger 관리/동적 경로
+  if (path.startsWith('/b/'))          return true;  // Blogger 관리 패널
+  if (path.startsWith('/admin'))       return true;
+  if (path === '/ncr')                 return true;
+  // 동적 쿼리 파라미터
+  if (url.searchParams.has('blogedit'))  return true;
+  if (url.searchParams.has('postID'))    return true;
+  if (url.searchParams.has('action'))    return true;
+  if (url.searchParams.has('widgetType')) return true;
+  // 댓글/검색
+  if (path.startsWith('/search') && url.searchParams.has('q')) return true;
+  return false;
+}
+
+// ─────────────────────────────────────────────
+// 전체 캐시 purge
+// ─────────────────────────────────────────────
+async function purgeAll(env) {
+  if (!env.CACHE_RESERVE_KV) {
+    return new Response('CACHE_RESERVE_KV not bound', { status: 500 });
+  }
+  try {
+    let deleted = 0;
+    let cursor;
+    do {
+      const listed = await env.CACHE_RESERVE_KV.list({ prefix: 'meta:', cursor });
+      for (const key of listed.keys) {
+        const bodyKey = 'body:' + key.name.slice('meta:'.length);
+        await env.CACHE_RESERVE_KV.delete(key.name).catch(() => {});
+        await env.CACHE_RESERVE_KV.delete(bodyKey).catch(() => {});
+        deleted++;
+      }
+      cursor = listed.list_complete ? undefined : listed.cursor;
+    } while (cursor);
+    return new Response(JSON.stringify({ purged: deleted }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+    });
+  } catch (e) {
+    return errResp(500, 'Purge failed: ' + e.message);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -324,6 +415,14 @@ async function getCacheReserve(key, env) {
   } catch (_) { return null; }
 }
 
+async function deleteCacheReserve(key, env) {
+  if (!env.CACHE_RESERVE_KV) return;
+  try {
+    await env.CACHE_RESERVE_KV.delete('meta:' + key).catch(() => {});
+    await env.CACHE_RESERVE_KV.delete('body:' + key).catch(() => {});
+  } catch (_) {}
+}
+
 async function setCacheReserve(key, body, headers, env) {
   if (!env.CACHE_RESERVE_KV) return;
   try {
@@ -334,45 +433,86 @@ async function setCacheReserve(key, body, headers, env) {
 }
 
 // ─────────────────────────────────────────────
-// 슬러그 canonical 리다이렉트
+// 슬러그 라우팅
+//
+// KV 구조:
+//   origin:{originPath}  → { title, titleSlug, titlePath, createdAt, checkedAt }
+//     원본 blogspot 경로 → 제목 기반 슬러그 경로 매핑
+//
+//   alias:{titlePath}    → originPath
+//     제목 슬러그 경로 → 원본 경로 역방향 매핑
+//
+// 동작:
+//   원본 경로 요청  → 제목 슬러그 경로로 301 리다이렉트
+//   슬러그 경로 요청 → 원본 경로로 내부 fetch (URL은 슬러그로 유지)
 // ─────────────────────────────────────────────
-async function checkSlugRedirect(path, url, env) {
-  if (!isPostPath(path) || !env.SLUG_KV) return null;
-  try {
-    const canonical = await env.SLUG_KV.get('canonical:' + path);
-    if (canonical && canonical !== path) {
-      const dest = new URL(url.toString());
-      dest.pathname = canonical;
-      return Response.redirect(dest.toString(), 301);
-    }
-  } catch (_) {}
-  return null;
-}
 
 function isPostPath(path) {
   return /\/\d{4}\/\d{2}\/[^/]+\.html$/.test(path) || /^\/p\/[^/]+$/.test(path);
 }
 
-// ─────────────────────────────────────────────
-// 슬러그 KV
-// ─────────────────────────────────────────────
-async function updateSlugKV(ctx, url, env) {
-  if (!env.SLUG_KV) return;
-  if (!['post', 'page'].includes(ctx.type) || !ctx.title) return;
-  const path = url.pathname, slug = generateSlug(ctx.title);
+// 요청 경로의 슬러그 라우팅 타입 반환
+//   { type: 'redirect', titlePath }  → 원본 경로, 제목 슬러그로 301
+//   { type: 'alias',    originPath } → 슬러그 경로, 원본으로 내부 fetch
+//   { type: 'passthrough' }          → 처리 없이 통과
+async function resolveSlugRoute(path, url, env) {
+  if (!isPostPath(path) || !env.SLUG_KV) return { type: 'passthrough' };
+
+  // 1. alias 경로인지 먼저 확인 (제목 슬러그로 들어온 요청)
   try {
-    const existing = await env.SLUG_KV.get('slug:' + path, { type: 'json' });
+    const originPath = await env.SLUG_KV.get('alias:' + path);
+    if (originPath && originPath !== path) {
+      return { type: 'alias', originPath };
+    }
+  } catch (_) {}
+
+  // 2. 원본 경로에 대한 등록된 슬러그가 있는지 확인
+  try {
+    const rec = await env.SLUG_KV.get('origin:' + path, { type: 'json' });
+    if (rec && rec.titlePath && rec.titlePath !== path) {
+      return { type: 'redirect', titlePath: rec.titlePath };
+    }
+  } catch (_) {}
+
+  return { type: 'passthrough' };
+}
+
+// HTML fetch 후 슬러그 KV 등록/갱신
+async function updateSlugKV(pageCtx, url, env) {
+  if (!env.SLUG_KV) return;
+  if (!['post', 'page'].includes(pageCtx.type) || !pageCtx.title) return;
+
+  const originPath = url.pathname;
+  const titleSlug  = generateSlug(pageCtx.title);
+  const titlePath  = originPath.replace(/[^/]+\.html$/, titleSlug + '.html');
+
+  // blogspot이 이미 제목 기반 슬러그로 발급한 경우 처리 불필요
+  if (titlePath === originPath) return;
+
+  try {
+    const existing = await env.SLUG_KV.get('origin:' + originPath, { type: 'json' });
     const now = Date.now();
+
     if (!existing) {
-      await env.SLUG_KV.put('slug:' + path, JSON.stringify({ title: ctx.title, slug, path, createdAt: now, checkedAt: now }));
-    } else if (now - existing.checkedAt > SLUG_CHECK_MS) {
-      const newSlug = generateSlug(ctx.title);
-      if (newSlug !== existing.slug) {
-        const op = path.replace(/[^/]+\.html$/, existing.slug + '.html');
-        const np = path.replace(/[^/]+\.html$/, newSlug + '.html');
-        if (op !== np) await env.SLUG_KV.put('canonical:' + op, np);
+      // 최초 등록: origin + alias 모두 저장
+      await env.SLUG_KV.put('origin:' + originPath, JSON.stringify({
+        title: pageCtx.title, titleSlug, titlePath, createdAt: now, checkedAt: now,
+      }));
+      await env.SLUG_KV.put('alias:' + titlePath, originPath);
+    } else {
+      const newSlug      = generateSlug(pageCtx.title);
+      const newTitlePath = originPath.replace(/[^/]+\.html$/, newSlug + '.html');
+
+      if (newTitlePath !== existing.titlePath) {
+        // 제목 변경: 구 alias 삭제 → 신규 alias 등록
+        await env.SLUG_KV.delete('alias:' + existing.titlePath).catch(() => {});
+        await env.SLUG_KV.put('alias:' + newTitlePath, originPath);
+        await env.SLUG_KV.put('origin:' + originPath, JSON.stringify({
+          ...existing, title: pageCtx.title, titleSlug: newSlug, titlePath: newTitlePath, checkedAt: now,
+        }));
+      } else if (now - existing.checkedAt > SLUG_CHECK_MS) {
+        await env.SLUG_KV.put('origin:' + originPath, JSON.stringify({ ...existing, checkedAt: now }));
       }
-      await env.SLUG_KV.put('slug:' + path, JSON.stringify({ ...existing, slug: newSlug, checkedAt: now }));
     }
   } catch (_) {}
 }
@@ -380,19 +520,22 @@ async function updateSlugKV(ctx, url, env) {
 async function runSlugAudit(env) {
   if (!env.SLUG_KV) return;
   try {
-    const list = await env.SLUG_KV.list({ prefix: 'slug:' });
+    const list = await env.SLUG_KV.list({ prefix: 'origin:' });
     const now  = Date.now();
     for (const key of list.keys) {
       try {
         const data = await env.SLUG_KV.get(key.name, { type: 'json' });
         if (!data || now - data.checkedAt < SLUG_CHECK_MS) continue;
-        const newSlug = generateSlug(data.title);
-        if (newSlug !== data.slug) {
-          const op = data.path.replace(/[^/]+\.html$/, data.slug + '.html');
-          const np = data.path.replace(/[^/]+\.html$/, newSlug  + '.html');
-          if (op !== np) await env.SLUG_KV.put('canonical:' + op, np);
+        const newSlug      = generateSlug(data.title);
+        const originPath   = key.name.replace(/^origin:/, '');
+        const newTitlePath = originPath.replace(/[^/]+\.html$/, newSlug + '.html');
+        if (newTitlePath !== data.titlePath) {
+          await env.SLUG_KV.delete('alias:' + data.titlePath).catch(() => {});
+          await env.SLUG_KV.put('alias:' + newTitlePath, originPath);
+          await env.SLUG_KV.put(key.name, JSON.stringify({ ...data, titleSlug: newSlug, titlePath: newTitlePath, checkedAt: now }));
+        } else {
+          await env.SLUG_KV.put(key.name, JSON.stringify({ ...data, checkedAt: now }));
         }
-        await env.SLUG_KV.put(key.name, JSON.stringify({ ...data, slug: newSlug, checkedAt: now }));
       } catch (_) {}
     }
   } catch (_) {}
