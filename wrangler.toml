@@ -1,8 +1,10 @@
 # wrangler.toml
-# Blogspot SEO & Performance Optimization Worker
+# Blogspot SEO & Performance Optimization Worker (v3)
 # ─────────────────────────────────────────────────
-# 설정 제로 — Cloudflare 대시보드에서 Route만 추가하면 끝.
-# 환경변수/Secret 설정 불필요.
+# v3: Durable Objects 제거 → GitHub 레포 JSON 상태 저장으로 대체.
+#     WASM(AssemblyScript) 가속 + EC2/Linux급 인프라 기능 추가.
+# 설정 제로 기본 동작은 유지 — GITHUB_TOKEN 등 신규 secret이 없어도
+# 기존과 100% 동일하게 동작(해당 기능만 자동으로 no-op).
 
 name = "blogspot-seo-worker"
 main = "worker.js"
@@ -10,8 +12,9 @@ compatibility_date = "2026-06-16"
 compatibility_flags = ["nodejs_compat"]
 
 # ─── KV 네임스페이스 ────────────────────────────────────────────────
-# SLUG_KV     : CNAME 검증 캐시 + SEO 슬러그 + LB RTT 기록용
-# CACHE_RESERVE_KV : HTML 페이지 캐시용 (선택사항 — 없어도 동작)
+# SLUG_KV          : CNAME 검증 캐시 + SEO 슬러그 + LB RTT 기록
+#                    + [v3] 메트릭 집계 + 레이트리밋 카운터 (재사용, 신규 KV 불필요)
+# CACHE_RESERVE_KV : HTML 페이지 캐시용 (선택사항 — 없어도 동작, 현재 비활성)
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "dee1ee21fe4c44559bce049b53cf4d0a"
@@ -19,6 +22,28 @@ id      = "dee1ee21fe4c44559bce049b53cf4d0a"
 [[kv_namespaces]]
 binding = "CACHE_RESERVE_KV"
 id      = "7153daa4c5874bc581670f75adf66a22"
+
+# ─── [v3] GitHub 상태 저장소 (Durable Objects 대체) ────────────────
+# 아래 secret/var들이 없으면 githubTenantAcquire/Release/Status는 전부
+# no-op으로 통과하므로, 설정 전까지는 v2와 완전히 동일하게 동작함.
+#
+# 1) Personal Access Token 발급 (레포 contents 읽기/쓰기 권한,
+#    fine-grained PAT 권장: Contents: Read and write)
+# 2) secret 등록:
+#      npx wrangler secret put GITHUB_TOKEN
+#    (대화형 프롬프트에 토큰 값 입력 — 이 파일에는 토큰 값을 직접 적지 않음)
+# 3) (선택) state 서명용 키도 secret으로 등록 — 미설정 시 서명 단계 스킵:
+#      npx wrangler secret put STATE_SIGNING_KEY
+#
+# vars(평문, 토큰 아님)는 필요시 아래 [vars] 섹션에서 조정 가능.
+[vars]
+GITHUB_OWNER = "choichoi3227-crypto"
+GITHUB_REPO  = "bloggerseo"
+GITHUB_BRANCH = "main"
+TENANT_MAX_CONCURRENCY   = "24"
+TENANT_FAILURE_THRESHOLD = "5"
+TENANT_OPEN_COOLDOWN_MS  = "15000"
+RATE_LIMIT_PER_MIN       = "600"
 
 # ─── 스케줄드 트리거 (슬러그 canonical 감사, 매시간) ────────────────
 [triggers]
@@ -55,9 +80,23 @@ mode = "smart"
 #
 # 3. 검증 실패 시 502 Bad Gateway (사이트 준비 중 페이지 없음).
 #
+# 4. [v3] 도메인별 동시성/circuit-breaker 상태는 GitHub 레포
+#    (state/tenants/{host-hash}.json)에 실시간으로 커밋되어 관리됨.
+#    GITHUB_TOKEN 미설정 시 이 기능은 비활성(no-op)이며 나머지 동작은
+#    영향받지 않음.
+#
+# 5. [v3] 슬러그 생성/SHA-256/HMAC/캐시 해싱은 WASM(AssemblyScript)으로
+#    가속되며, WASM 인스턴스화/호출이 실패할 경우 동일한 결과를 내는
+#    JS 구현으로 즉시 자동 전환됨(서비스 영향 없음).
+#
 # ─── Cloudflare 라우트 설정 방법 ────────────────────────────────────
 # Workers & Pages → blogspot-seo-worker → Settings → Triggers
 # Custom Domains 또는 Routes에 커스텀 도메인 추가:
 #   예) blog.example.com/*
 #       www.example.com/*
 # ghs.google.com CNAME이 있는 서브도메인이면 자동으로 작동.
+#
+# ─── 신규 디버그/운영 엔드포인트 (v3) ───────────────────────────────
+#   GET /__blogger_debug  → CNAME/탐지/tenant(GitHub state)/wasm 백엔드 상태
+#   GET /__metrics?minutes=15 → 최근 N분 메트릭(요청수/에러율/레이턴시 분포)
+#   GET /__purge_all      → (구버전 호환) 잔존 KV HTML 캐시 정리
