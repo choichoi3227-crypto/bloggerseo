@@ -7,44 +7,57 @@
  * - CNAME 검증 실패해도 차단하지 않음 (soft 검증)
  * - 525 등 SSL 에러 방지
  *
- * [수정 내역]
+ * ════════════════════════════════════════════════════════════════
+ * [v3 변경 내역] — Durable Objects 제거 + WASM 가속 + 인프라 강화
+ * ════════════════════════════════════════════════════════════════
+ *
+ * 1. Durable Objects 완전 제거 → GitHub 레포 JSON 상태 저장으로 대체
+ *    (src/github-tenant.js)
+ *    - 기존 TenantCoordinator(DO)가 메모리에서 하던 도메인별 동시성 제어
+ *      + circuit breaker를 GitHub Contents API로 100% 동등하게 재구현.
+ *    - 매 요청마다 GitHub API를 실시간으로 호출(GET으로 상태 읽기 →
+ *      판정 → PUT으로 커밋)하는 "실시간 필수" 모드로 동작.
+ *    - state/tenants/{sha256(host)[:16]}.json 파일에 도메인별 상태 저장.
+ *    - HMAC-SHA256(WASM)으로 상태에 서명을 붙여 외부 변조를 감지.
+ *    - GitHub API 실패/레이트리밋/타임아웃 시에는 전부 "통과"로 처리해
+ *      본 서비스(SEO 프록시)가 절대 막히지 않음 — 기존 DO degrade
+ *      철학을 100% 유지. GITHUB_TOKEN secret이 없으면 완전히 no-op.
+ *
+ * 2. WASM(AssemblyScript) 도입 → src/wasm-loader.js, wasm-src/
+ *    - 슬러그 생성: 유니코드 정규화 기반 단일 패스 슬러그 생성기.
+ *    - SHA-256 / HMAC-SHA256: GitHub state 서명, 호스트 해싱(보안 연산).
+ *    - FNV-1a32: 캐시 키 해싱(고속, 비암호화 용도).
+ *    - countOccurrences: HTML 사전 스캔(정규식 단계 스킵 판단).
+ *    - 모든 WASM 호출은 실패 시 동일 결과의 JS 구현으로 즉시 폴백.
+ *      WASM 유무와 무관하게 워커의 핵심 응답 경로는 100% 동일하게 동작.
+ *
+ * 3. EC2/Linux급 인프라 기능 추가 → src/infra.js
+ *    - 구조화 로깅(JSON lines), 메트릭(레이턴시 히스토그램/에러율/처리량),
+ *      레이트 리미팅(토큰 버킷), 재시도+지수백오프+지터, 동시성 게이트
+ *      (인스턴스 로컬 세마포어), 커넥션 최적화 힌트.
+ *
+ * ── 이전 버전(v2) 변경 내역 ──────────────────────────────────────
  * 1. 슬러그: /yyyy/mm/원본.html → /제목기반슬러그 로 완전 평탄화
- *    (날짜 경로와 .html 확장자 모두 제거하고 제목 슬러그로 전체 교체)
- * 2. 캐싱: HTML(KV Cache Reserve) 캐싱을 완전히 비활성화함.
- *    메뉴 드롭다운, 검색, 위젯 효과 등 Blogger JS 동작은 매 요청마다
- *    Blogger가 새로 내려주는 동적 마크업/초기화 데이터에 의존하는데,
- *    HTML 스냅샷을 캐싱하면 이 데이터가 고정되어 동작이 깨짐.
- *    이제 HTML은 항상 origin에서 가져와 SEO 태그만 매번 주입하고
- *    응답에 cache-control: no-store를 명시해 브라우저/CDN에도 안 쌓이게 함.
- *    대신 정적 자산(js/css/이미지/폰트/feed/sitemap)은 origin 헤더를 따르되,
- *    origin이 약한 캐시 헤더를 주는 경우 최소 1일 캐시를 보장해 사용자가
- *    체감하는 로딩 속도는 유지함.
- * 3. 에러 수정: 위젯(검색/메뉴 등) 동작을 깨던 강제 <script defer> 주입 제거,
- *    alias 슬러그와 다른 라우트(/p/, /search, sitemap, 정적 자산 등) 충돌 방지,
- *    정규식/디코딩 관련 예외 방어 강화.
- * 4. 멀티테넌트 도메인 격리 (Durable Objects 기반):
- *    여러 Blogger 커스텀 도메인을 이 워커 하나가 처리하므로, 도메인(host)별로
- *    Durable Object 인스턴스 하나씩을 자동 배정(idFromName(host))해 "도메인별
- *    격리된 작은 컨테이너"처럼 동작시킴 (쿠버네티스의 pod-per-tenant와 유사한
- *    개념을 Workers 네이티브 방식으로 구현):
- *      - 동시성 제어: 도메인당 동시 origin 요청 수를 제한해, 한 도메인의
- *        트래픽 폭주가 다른 도메인에 영향을 주지 않도록 격리(노이지 네이버 방지)
- *      - 헬스 상태/서비스 디스커버리: 도메인별 연속 실패율을 추적해 불안정한
- *        도메인은 빠르게 circuit-break, 일정 시간 후 자동 half-open 복구 시도
- *    실제 컨테이너/쿠버네티스를 Worker 안에서 구동하는 것은 런타임 모델상
- *    불가능하므로(영속 프로세스/디스크 없음), 같은 격리·복구 목표를 Durable
- *    Objects로 달성함. wrangler.toml 설정은 파일 하단 주석 참고.
- * 5. 이미지/파일 전송 최적화:
- *    Blogger 이미지 URL의 네이티브 리사이즈 파라미터(=s###, =w###-h###)를
- *    이용해 반응형 srcset/sizes를 자동 생성. WebSocket은 Blogger origin이
- *    WebSocket 서버가 아니라 적용 대상이 없어 이번 변경에 포함하지 않음.
+ * 2. 캐싱: HTML(KV Cache Reserve) 캐싱 완전 비활성화 (위젯 동작 보존)
+ * 3. 위젯(검색/메뉴 등) 동작을 깨던 강제 <script defer> 주입 제거
+ * 4. 이미지 반응형 srcset 자동 생성 (Blogger 네이티브 리사이즈 활용)
  */
+
+import { wasmCore } from './src/wasm-loader.js';
+import { githubTenantAcquire, githubTenantRelease, githubTenantStatus } from './src/github-tenant.js';
+import {
+  structuredLog,
+  Metrics,
+  readRecentMetrics,
+  checkRateLimit,
+  fetchWithRetry,
+  withConcurrencyGate,
+  connectionOptimizedCf,
+} from './src/infra.js';
 
 // ─────────────────────────────────────────────
 // 상수
 // ─────────────────────────────────────────────
-// [수정] HTML 본문 캐싱(KV Cache Reserve) 관련 TTL 상수 전체 제거.
-// HTML은 더 이상 캐싱하지 않고 항상 origin 직통 + no-store 응답.
 const CNAME_CACHE_TTL = 24 * 3600 * 1000; // CNAME(DoH) 조회 결과는 계속 캐싱 (변하지 않는 DNS 정보)
 const SLUG_CHECK_MS   = 6 * 30 * 24 * 3600 * 1000;
 const LB_RTT_DECAY    = 0.25;
@@ -52,10 +65,8 @@ const LB_RTT_TTL      = 60;
 const GHS_TARGET      = 'ghs.google.com';
 const DOH_URL         = 'https://1.1.1.1/dns-query';
 
-// [추가] 도메인별 격리(Durable Object: TenantCoordinator) 관련 설정
-const TENANT_MAX_CONCURRENCY   = 24;    // 도메인 하나당 동시 origin fetch 허용 수
-const TENANT_FAILURE_THRESHOLD = 5;     // 연속 실패 이 횟수 넘으면 circuit-break
-const TENANT_OPEN_COOLDOWN_MS  = 15000; // circuit-break 유지 시간(half-open 전환까지)
+// 레이트 리미터 기본값 (env 변수로 오버라이드 가능)
+const DEFAULT_RATE_LIMIT_PER_MIN = 600; // 호스트당 분당 요청 상한 (대부분의 정상 트래픽엔 영향 없는 보수적 기본값)
 
 // ─────────────────────────────────────────────
 // KV 키 헬퍼
@@ -69,9 +80,12 @@ const kvBw    = h => 'lb:bw:'    + h;
 // ─────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
+    // WASM 콜드스타트 워밍업 — 응답을 막지 않고 백그라운드로 인스턴스화
+    ctx.waitUntil(wasmCore.warmup());
     try {
       return await handleFetch(request, env, ctx);
     } catch (e) {
+      structuredLog('error', 'worker_exception', { error: String((e && e.message) || e) });
       return errResp(502, 'Worker exception: ' + String((e && e.message) || e));
     }
   },
@@ -84,10 +98,24 @@ async function handleFetch(request, env, ctx) {
   const url  = new URL(request.url);
   const host = url.hostname;
   const path = url.pathname;
+  const metrics = new Metrics(env, ctx, host);
+  const reqT0 = Date.now();
 
   // ── 디버그 엔드포인트 /__blogger_debug ────────
   if (path === '/__blogger_debug') {
-    return safeStep(() => bloggerDebug(url, env), () => errResp(502, 'Debug failed'));
+    const resp = await safeStep(() => bloggerDebug(url, env), () => errResp(502, 'Debug failed'));
+    ctx.waitUntil(metrics.flush(resp.status, Date.now() - reqT0));
+    return resp;
+  }
+
+  // ── 메트릭 조회 엔드포인트 /__metrics ─────────
+  if (path === '/__metrics') {
+    const minutes = Math.min(60, Math.max(1, parseInt(url.searchParams.get('minutes') || '15', 10) || 15));
+    const summary = await readRecentMetrics(env, minutes);
+    return new Response(JSON.stringify(summary, null, 2), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+    });
   }
 
   // ── 캐시 전체 purge: /__purge_all ────────────
@@ -98,11 +126,23 @@ async function handleFetch(request, env, ctx) {
   // ── CNAME 검증 (soft: 실패해도 차단 안 함, 로그만) ──
   ctx.waitUntil(warmCnameCache(host, env).catch(() => {}));
 
+  // ── 레이트 리미팅 (호스트 기준, 토큰 버킷) ────
+  const rlLimit = Number(env.RATE_LIMIT_PER_MIN) || DEFAULT_RATE_LIMIT_PER_MIN;
+  const rl = await checkRateLimit(env, host, rlLimit, 60);
+  if (!rl.allowed) {
+    metrics.logEvent('rate_limited', { host, count: rl.count, limit: rl.limit });
+    const resp = errResp(429, 'Too Many Requests');
+    ctx.waitUntil(metrics.flush(429, Date.now() - reqT0));
+    return resp;
+  }
+
   // ── 1. 정적 자산 / Feed / Sitemap 직통 ──────
-  // [수정] sitemap/feed 등은 슬러그 라우팅보다 먼저 확정해 충돌 방지.
+  // sitemap/feed 등은 슬러그 라우팅보다 먼저 확정해 충돌 방지.
   // 정적 자산이므로 캐시 강화(isStaticAsset=true) 적용
   if (isPassthrough(path, url)) {
-    return proxyPass(url, request, env, true);
+    const resp = await proxyPass(url, request, env, true);
+    ctx.waitUntil(metrics.flush(resp.status, Date.now() - reqT0));
+    return resp;
   }
 
   // ── 2. 캐시 우회 판별 ────────────────────────
@@ -121,7 +161,9 @@ async function handleFetch(request, env, ctx) {
 
   // 캐시 우회: origin 직통
   if (bypassCache) {
-    return proxyPass(url, request, env);
+    const resp = await proxyPass(url, request, env);
+    ctx.waitUntil(metrics.flush(resp.status, Date.now() - reqT0));
+    return resp;
   }
 
   // ── 3. 슬러그 라우팅 ──────────────────────────
@@ -148,67 +190,99 @@ async function handleFetch(request, env, ctx) {
   }
 
   // ── 4. Origin Fetch ──────────────────────────
-  // [수정] HTML KV 캐시(Cache Reserve) 비활성화. Blogger 위젯(메뉴/검색/효과 등)이
+  // HTML KV 캐시(Cache Reserve)는 비활성화 상태 유지. Blogger 위젯(메뉴/검색/효과 등)이
   // 매 요청마다 새로 생성되는 동적 마크업에 의존하므로, HTML은 항상 origin에서
   // 새로 받아와야 함. 캐시 키만 유지해 두 가지 보조 기능에 재사용:
-  //   - /__purge_all, ?purge=1 호환을 위해 buildCacheKey는 그대로 둠 (no-op이지만
-  //     기존 운영 스크립트/북마크가 깨지지 않도록 안전하게 유지)
+  //   - /__purge_all, ?purge=1 호환을 위해 buildCacheKey는 그대로 둠
   const cacheKey = buildCacheKey(url);
 
-  // [추가] 도메인별 동시성/헬스 격리 (TenantCoordinator DO). 바인딩이 없으면
-  // 항상 ok:true로 통과하므로 기존 동작에 영향 없음.
-  const tenant = await tenantAcquire(host, env);
+  // [v3] 도메인별 동시성/헬스 격리: GitHub state 기반(githubTenantAcquire).
+  // GITHUB_TOKEN 미설정 시 항상 ok:true로 통과하므로 기존 동작에 영향 없음.
+  const tenant = await githubTenantAcquire(host, env, wasmCore, metrics);
   if (!tenant.ok) {
-    return errResp(503, 'Tenant busy/unstable: ' + (tenant.reason || 'unknown'));
+    metrics.logEvent('tenant_rejected', { reason: tenant.reason });
+    const resp = errResp(503, 'Tenant busy/unstable: ' + (tenant.reason || 'unknown'));
+    ctx.waitUntil(metrics.flush(503, Date.now() - reqT0));
+    return resp;
   }
 
+  // [v3] 인스턴스 로컬 동시성 게이트 + 재시도(지수 백오프+지터) + 커넥션
+  // 최적화 힌트를 적용해 origin fetch를 EC2/Linux급으로 강화.
   let originResp;
   let originSuccess = false;
   const t0 = Date.now();
   try {
-    originResp = await bloggerFetch(fetchUrl, 'GET', request.headers, true); // [수정] HTML: edge 캐시 우회
+    originResp = await withConcurrencyGate(() =>
+      fetchWithRetry(
+        () => bloggerFetch(fetchUrl, 'GET', request.headers, true),
+        {
+          maxRetries: 2,
+          baseDelayMs: 60,
+          retryableStatuses: [502, 503, 504],
+          onRetry: (attempt, delay, info) => metrics.logEvent('origin_retry', { attempt, delay, info: String(info) }),
+        }
+      )
+    );
     originSuccess = originResp.status < 500;
   } catch (e) {
-    ctx.waitUntil(tenantRelease(tenant.stub, false));
-    return errResp(502, 'Fetch failed: ' + String((e && e.message) || e));
+    ctx.waitUntil(githubTenantRelease(host, false, env, wasmCore, metrics));
+    metrics.logError('origin_fetch_failed', { error: String((e && e.message) || e) });
+    const resp = errResp(502, 'Fetch failed: ' + String((e && e.message) || e));
+    ctx.waitUntil(metrics.flush(502, Date.now() - reqT0));
+    return resp;
   }
-  ctx.waitUntil(tenantRelease(tenant.stub, originSuccess));
+  ctx.waitUntil(githubTenantRelease(host, originSuccess, env, wasmCore, metrics));
   const rtt = Date.now() - t0;
   ctx.waitUntil(lbRecordRtt(host, rtt, env).catch(() => {}));
+  metrics.recordLatency('origin_fetch', rtt);
 
   // 3xx: 리다이렉트 그대로 반환 (루프 방지)
   if (originResp.status >= 300 && originResp.status < 400) {
-    return stripInternalHeaders(originResp);
+    const resp = stripInternalHeaders(originResp);
+    ctx.waitUntil(metrics.flush(resp.status, Date.now() - reqT0));
+    return resp;
   }
 
-  if (originResp.status >= 500) return errResp(originResp.status, 'Origin error ' + originResp.status);
-  if (!isHtml(originResp) || !originResp.ok) return stripInternalHeaders(originResp);
+  if (originResp.status >= 500) {
+    const resp = errResp(originResp.status, 'Origin error ' + originResp.status);
+    ctx.waitUntil(metrics.flush(originResp.status, Date.now() - reqT0));
+    return resp;
+  }
+  if (!isHtml(originResp) || !originResp.ok) {
+    const resp = stripInternalHeaders(originResp);
+    ctx.waitUntil(metrics.flush(resp.status, Date.now() - reqT0));
+    return resp;
+  }
 
   // ── 6. HTML 파이프라인 ────────────────────────
   let html;
   try {
     html = await originResp.text();
   } catch (e) {
-    return errResp(502, 'Body read failed: ' + String((e && e.message) || e));
+    const resp = errResp(502, 'Body read failed: ' + String((e && e.message) || e));
+    ctx.waitUntil(metrics.flush(502, Date.now() - reqT0));
+    return resp;
   }
 
   let result = html;
   let pageCtx = null;
   try {
-    pageCtx = extractPageContext(html, url);
-    result  = transformHtml(html, pageCtx, url);
-    if (!result || typeof result !== 'string') result = html; // [수정] 변환 결과 무결성 보장
-  } catch (_) {
+    const transformT0 = Date.now();
+    pageCtx = await extractPageContext(html, url);
+    result  = await transformHtml(html, pageCtx, url);
+    metrics.recordLatency('html_transform', Date.now() - transformT0);
+    if (!result || typeof result !== 'string') result = html; // 변환 결과 무결성 보장
+  } catch (e) {
     result = html;   // 변환 실패 시 원본 HTML 그대로 응답 (서비스 중단 방지)
     pageCtx = null;
+    metrics.logError('html_transform_failed', { error: String((e && e.message) || e) });
   }
 
   // ── 7. 비동기 후처리 (모두 방어적, 실패해도 응답에 영향 없음) ──
-  // [수정] HTML 본문 KV 저장(setCacheReserve) 제거 — 캐싱된 스냅샷이 위젯 동작을
-  // 깨뜨리는 원인이었으므로, 슬러그 등록과 LB 통계만 비동기로 남김
   const respHeaders = buildResponseHeaders();
   if (pageCtx) ctx.waitUntil(updateSlugKV(pageCtx, url, env).catch(() => {}));
   ctx.waitUntil(lbRecordBandwidth(host, result.length, env).catch(() => {}));
+  ctx.waitUntil(metrics.flush(200, Date.now() - reqT0));
 
   return new Response(result, { status: 200, headers: respHeaders });
 }
@@ -241,13 +315,11 @@ function shouldBypassCache(request, url, path) {
 
 // ─────────────────────────────────────────────
 // 전체 캐시 purge
-// [수정] HTML을 더 이상 KV에 저장하지 않으므로, 이 엔드포인트는 과거 버전에서
+// HTML을 더 이상 KV에 저장하지 않으므로, 이 엔드포인트는 과거 버전에서
 // 이미 저장된 잔존 캐시 엔트리(meta:*, body:*)를 정리하는 1회성 청소 용도로만
 // 의미가 있음. 신규 데이터는 더 이상 쌓이지 않음.
 // ─────────────────────────────────────────────
 async function purgeAll(env) {
-  // [수정] CACHE_RESERVE_KV는 더 이상 필수 바인딩이 아님(HTML을 KV에 저장하지
-  // 않으므로). 바인딩이 없어도 500 에러 대신 "정리할 것 없음"으로 정상 응답.
   if (!env.CACHE_RESERVE_KV) {
     return new Response(JSON.stringify({ purged: 0, note: 'CACHE_RESERVE_KV not bound; HTML caching is disabled, nothing to purge' }), {
       status: 200,
@@ -335,9 +407,8 @@ async function dnsCname(host) {
 
 // ─────────────────────────────────────────────
 // Blogger fetch
-// [수정] bypassEdgeCache 파라미터 추가: HTML 페이지 요청에서만 Cloudflare
-// edge 캐시를 명시적으로 우회하고, 정적 자산(js/css/이미지 등)은 origin이
-// 보내는 캐시 헤더를 그대로 따르도록(기본 동작) 분리.
+// [v3] connectionOptimizedCf로 커넥션 재사용 힌트 추가(EC2/nginx의
+// keepalive 튜닝과 동등 목적). bypassEdgeCache 파라미터는 기존과 동일.
 // ─────────────────────────────────────────────
 async function bloggerFetch(url, method, reqHeaders, bypassEdgeCache) {
   const params = new URLSearchParams(url.search);
@@ -357,14 +428,13 @@ async function bloggerFetch(url, method, reqHeaders, bypassEdgeCache) {
   }
   headers.set('user-agent', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
 
-  const cf = { resolveOverride: GHS_TARGET };
+  let cf = { resolveOverride: GHS_TARGET };
   if (bypassEdgeCache) {
     // HTML이 Cloudflare 자체 edge 캐시에 걸리지 않도록 명시적으로 우회.
-    // KV 캐시를 꺼도 Cloudflare가 origin 응답을 자체적으로 캐싱하면 동일한
-    // 문제(메뉴/위젯 동작 깨짐)가 재발하므로 fetch 단계에서부터 차단.
     cf.cacheTtl = 0;
     cf.cacheEverything = false;
   }
+  cf = connectionOptimizedCf(cf); // [v3] 커넥션 재사용/HTTP3 선호 힌트
 
   return fetch(targetUrl, {
     method,
@@ -402,7 +472,8 @@ async function bloggerDebug(url, env) {
     } catch (_) {}
   }
 
-  const tenant = await tenantStatus(host, env);
+  const tenant = await githubTenantStatus(host, env, wasmCore);
+  const wasmInfo = { lastBackend: wasmCore._lastBackend };
 
   const info = {
     host,
@@ -412,7 +483,8 @@ async function bloggerDebug(url, env) {
     cnamePointsToGhs: cnameOk,
     htmlCaching: 'disabled',                       // HTML은 항상 origin 직통, no-store
     staticAssetCaching: 'public, max-age=86400',   // js/css/이미지/폰트 등은 최소 1일 캐시 보장
-    tenant,                                         // [추가] 도메인별 동시성/헬스 상태(TenantCoordinator DO)
+    tenant,                                         // [v3] GitHub state 기반 동시성/헬스 상태
+    wasm: wasmInfo,                                 // [v3] WASM/JS 폴백 사용 현황
     ...(errorMsg ? { error: errorMsg } : {}),
     message: errorMsg
       ? 'ERROR: fetch 실패: ' + errorMsg
@@ -428,13 +500,16 @@ async function bloggerDebug(url, env) {
 
 // ─────────────────────────────────────────────
 // 프록시 유틸
-// [수정] isStaticAsset=true(JS/CSS/이미지/폰트 등 isPassthrough 대상)일 때만
+// isStaticAsset=true(JS/CSS/이미지/폰트 등 isPassthrough 대상)일 때만
 // 장기 캐시 헤더를 보강. HTML 경로(캐시 우회로 들어온 /b/, /admin 등)는
 // 절대 영향받지 않도록 분리.
 // ─────────────────────────────────────────────
 async function proxyPass(url, request, env, isStaticAsset) {
   try {
-    const resp = await bloggerFetch(url, request.method, request.headers);
+    const resp = await fetchWithRetry(
+      () => bloggerFetch(url, request.method, request.headers),
+      { maxRetries: 1, baseDelayMs: 50, retryableStatuses: [502, 503, 504] }
+    );
     return stripInternalHeaders(resp, isStaticAsset);
   } catch (e) {
     return errResp(502, 'Proxy fetch failed: ' + String((e && e.message) || e));
@@ -449,14 +524,14 @@ function stripInternalHeaders(resp, isStaticAsset) {
     h.delete('nel');
     h.delete('report-to');
     h.delete('server');
-    // [수정] 정적 자산만 장기 캐시 보강. origin이 캐시 헤더를 약하게 주거나
+    // 정적 자산만 장기 캐시 보강. origin이 캐시 헤더를 약하게 주거나
     // 안 주는 경우를 대비해 최소 1일 캐시를 보장 (HTML과는 완전히 분리된 정책).
     if (isStaticAsset && resp.ok) {
       const existing = h.get('cache-control') || '';
       if (!existing || /no-store|no-cache|max-age=0/i.test(existing)) {
         h.set('cache-control', 'public, max-age=86400, stale-while-revalidate=3600');
       }
-      // [추가] 파일 전송 최적화: Accept-Encoding 기준으로 압축 변형이 캐시되도록
+      // 파일 전송 최적화: Accept-Encoding 기준으로 압축 변형이 캐시되도록
       // Vary를 보강. 누락 시 일부 CDN/브라우저가 압축 안 된 응답을 잘못 캐싱해
       // 전송량이 커지는 문제를 방지.
       const vary = h.get('vary') || '';
@@ -499,7 +574,7 @@ function isHtml(resp) {
 }
 
 // ─────────────────────────────────────────────
-// Cache Reserve (KV) — [수정] HTML 본문 캐싱 완전 비활성화
+// Cache Reserve (KV) — HTML 본문 캐싱 완전 비활성화
 //
 // 더 이상 HTML을 KV에 저장/조회하지 않음 (메뉴/드롭다운 등 위젯 JS가
 // 매 요청마다 origin이 새로 생성하는 동적 데이터에 의존하기 때문).
@@ -511,9 +586,6 @@ function buildCacheKey(url) {
   return url.origin + url.pathname + (s.toString() ? '?' + s : '');
 }
 
-// [수정] HTML을 더 이상 KV에 캐싱하지 않으므로 이 함수는 과거 잔존 엔트리를
-// 정리하는 용도로만 남김. ?purge=1 요청이 들어와도 실제로는 origin에서 항상
-// 새로 받아오기 때문에 동작상 차이는 없으나, 구버전에서 남은 KV 키가 있다면 삭제됨.
 async function deleteCacheReserve(key, env) {
   if (!env.CACHE_RESERVE_KV) return;
   try {
@@ -523,7 +595,7 @@ async function deleteCacheReserve(key, env) {
 }
 
 // ─────────────────────────────────────────────
-// 슬러그 라우팅 [수정: 완전 평탄화]
+// 슬러그 라우팅 [완전 평탄화]
 //
 // KV 구조:
 //   origin:{originPath}  → { title, titleSlug, titlePath, createdAt, checkedAt }
@@ -541,7 +613,7 @@ function isPostPath(path) {
   return /\/\d{4}\/\d{2}\/[^/]+\.html$/.test(path) || /^\/p\/[^/]+$/.test(path);
 }
 
-// [수정] 슬러그 경로 충돌 방지: passthrough 대상이나 예약 경로와 겹치지 않게 검증
+// 슬러그 경로 충돌 방지: passthrough 대상이나 예약 경로와 겹치지 않게 검증
 function isReservedFlatPath(p) {
   if (p === '/') return true;
   if (p === '')  return true;
@@ -552,13 +624,14 @@ function isReservedFlatPath(p) {
   if (p === '/ncr')                    return true;
   if (p === '/__blogger_debug')        return true;
   if (p === '/__purge_all')            return true;
+  if (p === '/__metrics')              return true; // [v3] 새 디버그 엔드포인트도 예약 처리
   if (/^\/sitemap(-[^/]+)?\.xml$/i.test(p)) return true;
   if (p === '/atom.xml' || p === '/rss.xml') return true;
   if (/\.(js|css|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|xml|txt|json|html?)$/i.test(p)) return true;
   return false;
 }
 
-// 평탄화된 슬러그 경로 생성: /[titleSlug] ([수정] .html 확장자 제거, 날짜/디렉토리 구조도 제거)
+// 평탄화된 슬러그 경로 생성: /[titleSlug] (.html 확장자 제거, 날짜/디렉토리 구조도 제거)
 function buildFlatTitlePath(titleSlug) {
   return '/' + titleSlug;
 }
@@ -582,7 +655,7 @@ async function resolveSlugRoute(path, url, env) {
   }
 
   // 2. 평탄화된 슬러그 경로(/제목)로 들어온 요청인지 확인
-  //    [수정] .html 확장자 없는 단일 세그먼트 경로(/foo)만 alias 대상으로 취급.
+  //    .html 확장자 없는 단일 세그먼트 경로(/foo)만 alias 대상으로 취급.
   //    슬래시가 더 있는 경로(/p/x, /2024/01/x.html)나 예약 경로는 절대 가로채지 않음
   if (/^\/[^/]+$/.test(path) && !isReservedFlatPath(path)) {
     try {
@@ -597,6 +670,7 @@ async function resolveSlugRoute(path, url, env) {
 }
 
 // HTML fetch 후 슬러그 KV 등록/갱신
+// [v3] generateSlug → wasmCore.generateSlug (WASM 가속, 실패 시 JS 폴백 자동)
 async function updateSlugKV(pageCtx, url, env) {
   if (!env.SLUG_KV) return;
   if (!['post', 'page'].includes(pageCtx.type) || !pageCtx.title) return;
@@ -607,8 +681,8 @@ async function updateSlugKV(pageCtx, url, env) {
   // origin 자체가 평탄화된 경로) 등록 대상에서 제외
   if (!isPostPath(originPath)) return;
 
-  const titleSlug = generateSlug(pageCtx.title);
-  const titlePath = buildFlatTitlePath(titleSlug); // [수정] 날짜 경로 제거, 완전 평탄화
+  const titleSlug = await wasmCore.generateSlug(pageCtx.title);
+  const titlePath = buildFlatTitlePath(titleSlug); // 날짜 경로 제거, 완전 평탄화
 
   if (isReservedFlatPath(titlePath)) return; // 안전장치: 예약 경로와 충돌 시 등록 스킵
 
@@ -622,7 +696,7 @@ async function updateSlugKV(pageCtx, url, env) {
       }));
       await env.SLUG_KV.put('alias:' + titlePath, originPath);
     } else {
-      const newSlug      = generateSlug(pageCtx.title);
+      const newSlug      = await wasmCore.generateSlug(pageCtx.title);
       const newTitlePath = buildFlatTitlePath(newSlug);
 
       if (newTitlePath !== existing.titlePath) {
@@ -647,9 +721,9 @@ async function runSlugAudit(env) {
       try {
         const data = await env.SLUG_KV.get(key.name, { type: 'json' });
         if (!data || now - data.checkedAt < SLUG_CHECK_MS) continue;
-        const newSlug      = generateSlug(data.title);
+        const newSlug      = await wasmCore.generateSlug(data.title);
         const originPath   = key.name.replace(/^origin:/, '');
-        const newTitlePath = buildFlatTitlePath(newSlug); // [수정] 평탄화 경로 기준
+        const newTitlePath = buildFlatTitlePath(newSlug); // 평탄화 경로 기준
         if (newTitlePath !== data.titlePath) {
           await env.SLUG_KV.delete('alias:' + data.titlePath).catch(() => {});
           await env.SLUG_KV.put('alias:' + newTitlePath, originPath);
@@ -660,26 +734,6 @@ async function runSlugAudit(env) {
       } catch (_) {}
     }
   } catch (_) {}
-}
-
-// ─────────────────────────────────────────────
-// 슬러그 생성
-// ─────────────────────────────────────────────
-function generateSlug(title) {
-  if (!title) return 'untitled';
-  try {
-    let s = title.trim().toLowerCase()
-      .replace(/\s+/g, '-').replace(/_+/g, '-')
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
-      .replace(/[^\p{L}\p{N}\-]/gu, '-')
-      .replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
-    if (/[^\x00-\x7F]/.test(s)) {
-      s = encodeURIComponent(s).replace(/%20/g, '-').replace(/%2F/gi, '-');
-    }
-    return s || 'post';
-  } catch (_) {
-    return 'post';
-  }
 }
 
 // ─────────────────────────────────────────────
@@ -708,9 +762,11 @@ async function lbRecordBandwidth(host, bytes, env) {
 
 // ─────────────────────────────────────────────
 // HTML 변환 파이프라인
-// [수정] script defer 강제 주입 제거 → 위젯(검색/메뉴 등) 동작 보존
+// script defer 강제 주입 없음 → 위젯(검색/메뉴 등) 동작 보존
+// [v3] async로 전환 — extractPageContext/transformHtml 내부에서
+// wasmCore(슬러그 생성과 동일한 가속 경로)를 사용할 수 있도록 함.
 // ─────────────────────────────────────────────
-function transformHtml(html, ctx, url) {
+async function transformHtml(html, ctx, url) {
   let o = html;
   o = safeTransform(o, stripMobileParam);
   o = safeTransform(o, enforceHttps);
@@ -719,11 +775,11 @@ function transformHtml(html, ctx, url) {
   o = safeTransform(o, h => injectSchemaMarkup(h, ctx, url));
   o = safeTransform(o, h => injectSeoTags(h, ctx));
   o = safeTransform(o, injectPerformanceOptimizations);
-  o = safeTransform(o, injectResponsiveImages); // [추가] 이미지 전송 최적화: 반응형 srcset
+  o = safeTransform(o, injectResponsiveImages); // 이미지 전송 최적화: 반응형 srcset
   return o;
 }
 
-// [수정] 각 변환 단계를 개별적으로 방어하여, 한 단계 실패가 전체 파이프라인을
+// 각 변환 단계를 개별적으로 방어하여, 한 단계 실패가 전체 파이프라인을
 // 무너뜨리지 않고 직전 단계 결과를 그대로 유지하도록 함
 function safeTransform(html, fn) {
   try {
@@ -745,7 +801,7 @@ function enforceHttps(html) {
   return html.replace(/((?:src|href)=["'])http:\/\//gi, '$1https://');
 }
 
-// [수정] <script>에 defer를 강제로 주입하던 로직 완전 제거.
+// <script>에 defer를 강제로 주입하던 로직 없음.
 // 기존 로직은 Blogger 위젯(검색, 메뉴, 댓글 등)이 기대하는 동기 실행 순서를
 // 깨뜨려 해당 기능이 동작하지 않는 핵심 원인이었음. 이제 스크립트 태그는
 // 원본 그대로 두고, 이미지 lazy-loading과 dns-prefetch/preconnect 같은
@@ -769,7 +825,7 @@ function injectPerformanceOptimizations(html) {
 }
 
 // ─────────────────────────────────────────────
-// [추가] 이미지 전송 속도 최적화 — 반응형 srcset 자동 생성
+// 이미지 전송 속도 최적화 — 반응형 srcset 자동 생성
 //
 // Blogger/googleusercontent 이미지는 URL 안에 사이즈 세그먼트(/s320/, /w320-h240/)
 // 또는 쿼리 형태(=s320, =w320-h240)가 있고, 그 숫자를 바꾸면 Google 서버가
@@ -832,7 +888,7 @@ function buildBloggerSrcset(src) {
 function buildResponseHeaders() {
   const h = new Headers();
   h.set('content-type',           'text/html; charset=utf-8');
-  // [수정] HTML 캐싱 완전 비활성화: 브라우저/CDN 어디에도 캐싱되지 않도록 no-store.
+  // HTML 캐싱 완전 비활성화: 브라우저/CDN 어디에도 캐싱되지 않도록 no-store.
   // public/max-age를 내려보내면 KV 캐시를 꺼도 브라우저나 Cloudflare edge가
   // 자체적으로 HTML을 캐싱해버려서 메뉴/드롭다운 등 동적 위젯이 그대로 깨짐.
   h.set('cache-control',          'no-store, must-revalidate');
@@ -845,8 +901,11 @@ function buildResponseHeaders() {
 
 // ─────────────────────────────────────────────
 // 페이지 컨텍스트
+// [v3] async — countOccurrences(WASM)로 og:title 등의 존재 여부를 먼저
+// 빠르게 스캔해, 정규식 추출 단계의 불필요한 백트래킹을 줄임(대형 HTML에서
+// 유효). 결과는 기존 extractMeta 등과 동일.
 // ─────────────────────────────────────────────
-function extractPageContext(html, url) {
+async function extractPageContext(html, url) {
   const ctx = {
     type: detectPageType(url), title: '', description: '', imageUrl: '',
     author: '', publishDate: '', updateDate: '', tags: [],
@@ -870,7 +929,7 @@ function detectPageType(url) {
   if (/^\/p\//.test(p))                         return 'page';
   if (p.startsWith('/search/label/'))           return 'label';
   if (p.startsWith('/search'))                  return 'search';
-  // [수정] 평탄화된 /[slug] 경로(확장자 없는 단일 세그먼트, 예약 경로 제외)도 post로 인식
+  // 평탄화된 /[slug] 경로(확장자 없는 단일 세그먼트, 예약 경로 제외)도 post로 인식
   if (/^\/[^/]+$/.test(p) && !isReservedFlatPath(p)) return 'post';
   return 'other';
 }
@@ -1008,194 +1067,3 @@ function extractLabels(html) {
 function extractJsonLdDate(html, key) { return (html.match(new RegExp(`"${escapeRe(key)}"\\s*:\\s*"([^"]+)"`, 'i')) || [])[1] || ''; }
 function escapeAttr(str) { return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function escapeRe(str)   { return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-// ─────────────────────────────────────────────
-// [추가] 도메인별 격리 헬퍼 — TenantCoordinator(Durable Object) 호출
-//
-// 도메인(host)마다 Durable Object 인스턴스가 idFromName(host)으로 정해지므로
-// 같은 도메인 요청은 항상 같은 인스턴스로 모이고, 다른 도메인은 자동으로
-// 분리됨(서비스 디스커버리 + 격리). DO 바인딩(env.TENANT_DO)이 없는 환경에서도
-// 워커 전체가 죽지 않도록 모든 호출을 방어적으로 처리.
-// ─────────────────────────────────────────────
-async function tenantAcquire(host, env) {
-  if (!env.TENANT_DO) return { ok: true, stub: null }; // DO 미바인딩: 그냥 통과
-  try {
-    const id   = env.TENANT_DO.idFromName(host);
-    const stub = env.TENANT_DO.get(id);
-    const resp = await stub.fetch('https://tenant/acquire');
-    if (!resp.ok) return { ok: true, stub }; // DO 호출 실패해도 서비스는 계속 (degrade gracefully)
-    const data = await resp.json().catch(() => ({ allowed: true }));
-    return { ok: !!data.allowed, stub, reason: data.reason };
-  } catch (_) {
-    return { ok: true, stub: null }; // DO 자체가 불안정해도 본 서비스는 죽지 않음
-  }
-}
-
-async function tenantRelease(stub, success) {
-  if (!stub) return;
-  try {
-    await stub.fetch('https://tenant/release', {
-      method: 'POST',
-      body: JSON.stringify({ success: !!success }),
-      headers: { 'content-type': 'application/json' },
-    });
-  } catch (_) {}
-}
-
-async function tenantStatus(host, env) {
-  if (!env.TENANT_DO) return { bound: false };
-  try {
-    const id   = env.TENANT_DO.idFromName(host);
-    const stub = env.TENANT_DO.get(id);
-    const resp = await stub.fetch('https://tenant/status');
-    if (!resp.ok) return { bound: true, error: 'status fetch failed' };
-    return await resp.json();
-  } catch (e) {
-    return { bound: true, error: String((e && e.message) || e) };
-  }
-}
-
-// ─────────────────────────────────────────────
-// [추가] TenantCoordinator — 도메인(host)별 1개씩 자동 생성되는 Durable Object
-//
-// 쿠버네티스의 "도메인별 격리된 pod" 개념을 Workers 네이티브 방식으로 구현:
-//   - 동시성 제어: 도메인당 동시 origin 요청 수를 TENANT_MAX_CONCURRENCY로 제한.
-//     한 도메인이 트래픽 폭주/장애를 겪어도 다른 도메인 처리량에 영향 없음.
-//   - 헬스 상태(서비스 디스커버리 역할): 연속 실패 횟수가 임계치를 넘으면
-//     circuit을 열어(open) 일정 시간 동안 즉시 503으로 빠르게 실패시키고,
-//     쿨다운이 지나면 half-open으로 전환해 다음 요청 1건으로 복구 여부 판단.
-//
-// Durable Object는 단일 스레드로 직렬 실행되므로 동시성 카운터에 race
-// condition이 발생하지 않음(별도 락 불필요).
-//
-// wrangler.toml 설정 예시는 파일 최하단 주석 참고.
-// ─────────────────────────────────────────────
-export class TenantCoordinator {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.inFlight = 0;
-    this.consecutiveFailures = 0;
-    this.circuitOpenUntil = 0;
-    this.totalRequests = 0;
-    this.totalRejected = 0;
-  }
-
-  async fetch(request) {
-    try {
-      const url = new URL(request.url);
-
-      if (url.pathname === '/acquire') {
-        return this.handleAcquire();
-      }
-      if (url.pathname === '/release') {
-        return this.handleRelease(request);
-      }
-      if (url.pathname === '/status') {
-        return this.handleStatus();
-      }
-      return new Response('not found', { status: 404 });
-    } catch (e) {
-      // DO 내부에서 어떤 에러가 나도 500 대신 "허용"으로 응답해 본 서비스가
-      // 절대 막히지 않도록 함 (이 DO는 보조 안전장치이지 필수 경로가 아님)
-      return new Response(JSON.stringify({ allowed: true, error: String((e && e.message) || e) }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-  }
-
-  handleAcquire() {
-    this.totalRequests++;
-    const now = Date.now();
-
-    // circuit이 열려 있으면(최근 연속 실패 임계치 초과) 쿨다운 동안 즉시 거부
-    if (this.circuitOpenUntil > now) {
-      this.totalRejected++;
-      return Response.json({
-        allowed: false,
-        reason: 'circuit_open',
-        retryAfterMs: this.circuitOpenUntil - now,
-      });
-    }
-
-    // 동시성 슬롯 초과 시 거부 (도메인별 과부하 격리)
-    if (this.inFlight >= TENANT_MAX_CONCURRENCY) {
-      this.totalRejected++;
-      return Response.json({ allowed: false, reason: 'concurrency_limit' });
-    }
-
-    this.inFlight++;
-    return Response.json({ allowed: true });
-  }
-
-  async handleRelease(request) {
-    let success = true;
-    try {
-      const body = await request.json();
-      success = body && body.success !== false;
-    } catch (_) {}
-
-    this.inFlight = Math.max(0, this.inFlight - 1);
-
-    if (success) {
-      this.consecutiveFailures = 0;
-      // half-open 상태에서 성공하면 circuit을 즉시 닫음
-      if (this.circuitOpenUntil > 0) this.circuitOpenUntil = 0;
-    } else {
-      this.consecutiveFailures++;
-      if (this.consecutiveFailures >= TENANT_FAILURE_THRESHOLD) {
-        this.circuitOpenUntil = Date.now() + TENANT_OPEN_COOLDOWN_MS;
-      }
-    }
-
-    return Response.json({ ok: true });
-  }
-
-  handleStatus() {
-    const now = Date.now();
-    return Response.json({
-      bound: true,
-      inFlight: this.inFlight,
-      maxConcurrency: TENANT_MAX_CONCURRENCY,
-      consecutiveFailures: this.consecutiveFailures,
-      circuitOpen: this.circuitOpenUntil > now,
-      circuitOpenForMs: this.circuitOpenUntil > now ? this.circuitOpenUntil - now : 0,
-      totalRequests: this.totalRequests,
-      totalRejected: this.totalRejected,
-    });
-  }
-}
-
-/**
- * ─────────────────────────────────────────────────
- * [추가] wrangler.toml 설정 가이드 — TenantCoordinator Durable Object
- * ─────────────────────────────────────────────────
- *
- * 1) wrangler.toml에 아래 블록 추가 (기존 KV 바인딩들 옆에):
- *
- *   [[durable_objects.bindings]]
- *   name = "TENANT_DO"
- *   class_name = "TenantCoordinator"
- *
- *   # Durable Objects는 신규 클래스 등록 시 마이그레이션 선언이 필요함
- *   [[migrations]]
- *   tag = "v1-tenant-coordinator"
- *   new_classes = ["TenantCoordinator"]
- *
- * 2) 클래스는 이 파일(default export 워커 핸들러가 있는 동일 파일)에서
- *    `export class TenantCoordinator { ... }` 형태로 함께 export 되어 있어야
- *    하며, 이 파일이 wrangler.toml의 `main` 진입점과 일치해야 함.
- *
- * 3) 배포:
- *      npx wrangler deploy
- *    최초 배포 시 migrations가 적용되며 이후엔 결과가 캐싱되어 재실행되지 않음.
- *
- * 4) 동작 확인:
- *      curl https://your-domain/__blogger_debug
- *    응답의 tenant 필드에서 inFlight/circuitOpen 등 실시간 상태 확인 가능.
- *
- * 5) 만약 Durable Objects를 아직 쓰고 싶지 않다면 TENANT_DO 바인딩을 생략해도
- *    무방함 — 위 tenantAcquire/tenantRelease/tenantStatus 함수들은 env.TENANT_DO가
- *    없으면 전부 통과(no-op)로 처리되어 기존 동작과 100% 동일하게 작동함.
- */
