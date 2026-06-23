@@ -1,0 +1,13 @@
+{
+  "name": "bloggerseo-wasm",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AssemblyScript 소스 → bloggerseo.wasm 빌드용 워크스페이스. 결과물(bloggerseo.wasm, wasm-blob.js)은 ../src/wasm-loader.js가 사용.",
+  "scripts": {
+    "build": "asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime && node build-blob.js"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.28.19"
+  }
+}
