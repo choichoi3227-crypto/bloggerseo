@@ -40,7 +40,9 @@
  * 1. 슬러그: /yyyy/mm/원본.html → /제목기반슬러그 로 완전 평탄화
  * 2. 캐싱: HTML(KV Cache Reserve) 캐싱 완전 비활성화 (위젯 동작 보존)
  * 3. 위젯(검색/메뉴 등) 동작을 깨던 강제 <script defer> 주입 제거
- * 4. 이미지 반응형 srcset 자동 생성 (Blogger 네이티브 리사이즈 활용)
+ * 4. 이미지/스크립트 태그 강제 속성 주입 없음 (반응형 srcset, lazy-loading
+ *    자동 주입을 모두 제거 — Blogger 테마 자체 lazy-load 스크립트와 충돌해
+ *    이미지가 전혀 표시되지 않는 문제가 발생해 v3에서 완전히 되돌림)
  */
 
 import { wasmCore } from './src/wasm-loader.js';
@@ -775,7 +777,6 @@ async function transformHtml(html, ctx, url) {
   o = safeTransform(o, h => injectSchemaMarkup(h, ctx, url));
   o = safeTransform(o, h => injectSeoTags(h, ctx));
   o = safeTransform(o, injectPerformanceOptimizations);
-  o = safeTransform(o, injectResponsiveImages); // 이미지 전송 최적화: 반응형 srcset
   return o;
 }
 
@@ -804,8 +805,14 @@ function enforceHttps(html) {
 // <script>에 defer를 강제로 주입하던 로직 없음.
 // 기존 로직은 Blogger 위젯(검색, 메뉴, 댓글 등)이 기대하는 동기 실행 순서를
 // 깨뜨려 해당 기능이 동작하지 않는 핵심 원인이었음. 이제 스크립트 태그는
-// 원본 그대로 두고, 이미지 lazy-loading과 dns-prefetch/preconnect 같은
-// 안전한 최적화만 적용.
+// 원본 그대로 두고, dns-prefetch/preconnect 같은 안전한 최적화만 적용.
+//
+// [중요] 이미지 lazy-loading(loading="lazy") 자동 주입은 제거함.
+// Blogger 테마가 자체 lazy-load 스크립트(IntersectionObserver 기반,
+// data-src → src 전환 등)를 갖고 있는 경우가 많아, 모든 <img>에 네이티브
+// loading="lazy"를 강제로 끼워넣으면 테마 스크립트와 충돌해 이미지가
+// 영구적으로 로드되지 않는(완전히 안 보이는) 문제가 발생할 수 있음.
+// 원인이 확실히 격리되기 전까지 이 최적화는 비활성화 상태로 유지.
 function injectPerformanceOptimizations(html) {
   let o = html;
   if (!o.includes('rel="dns-prefetch"')) {
@@ -819,67 +826,7 @@ function injectPerformanceOptimizations(html) {
     ].join('\n');
     o = o.replace(/(<head[^>]*>)/i, `$1\n${tags}`);
   }
-  // 이미지 lazy-loading은 스크립트 실행 순서와 무관하므로 안전하게 유지
-  o = o.replace(/<img(?![^>]*loading=)/gi, '<img loading="lazy" decoding="async"');
   return o;
-}
-
-// ─────────────────────────────────────────────
-// 이미지 전송 속도 최적화 — 반응형 srcset 자동 생성
-//
-// Blogger/googleusercontent 이미지는 URL 안에 사이즈 세그먼트(/s320/, /w320-h240/)
-// 또는 쿼리 형태(=s320, =w320-h240)가 있고, 그 숫자를 바꾸면 Google 서버가
-// 즉석에서 리사이즈된 이미지를 내려줌(별도 이미지 처리 서버 불필요).
-// 이미 srcset이 있거나 사이즈 패턴이 없는 이미지는 건드리지 않음(안전 우선).
-// ─────────────────────────────────────────────
-const RESPONSIVE_WIDTHS = [320, 480, 800, 1200, 1600];
-
-function injectResponsiveImages(html) {
-  return html.replace(/<img\b[^>]*>/gi, tag => {
-    try {
-      if (/\bsrcset=/i.test(tag)) return tag; // 이미 srcset 있으면 건드리지 않음
-      const m = tag.match(/\bsrc=["']([^"']+)["']/i);
-      if (!m) return tag;
-      const src = m[1];
-      const srcset = buildBloggerSrcset(src);
-      if (!srcset) return tag;
-      // sizes는 보편적인 반응형 본문 이미지 기준값. 테마별로 다를 수 있어
-      // 보수적인 기본값만 제공(실제 표시 크기를 넘는 다운로드는 방지하되,
-      // 작은 화면에서 과도하게 작은 이미지가 선택되지 않도록 함).
-      return tag
-        .replace(/<img\b/i, `<img srcset="${escapeAttr(srcset)}" sizes="(max-width: 800px) 100vw, 800px"`);
-    } catch (_) {
-      return tag;
-    }
-  });
-}
-
-// Blogger 이미지 URL의 사이즈 세그먼트를 RESPONSIVE_WIDTHS 각각으로 교체해
-// "url width" 쌍의 srcset 문자열을 생성. 패턴이 없으면 null 반환(원본 유지).
-//
-// [주의] =w320-h240처럼 너비+높이가 모두 고정된 패턴은 너비만 바꾸면 원본
-// 비율이 깨져버리므로(높이를 비례 계산할 정보가 없음) 의도적으로 제외하고
-// 원본 그대로 둠. 너비만 있거나(=w320) 정사각형 크롭(=s320, /s320/)처럼
-// 한 변만 지정하는 패턴만 안전하게 교체함.
-function buildBloggerSrcset(src) {
-  // 패턴 A: 경로형 .../s320/... 또는 .../s320-c/... (정사각형 기준 한 변)
-  const pathPattern = /\/s\d{2,4}(-c)?\//i;
-  // 패턴 B: 쿼리형 한 변만 지정 ...=s320 또는 ...=w320 (높이 고정값 없음)
-  const queryPattern = /=([sw])\d{2,4}(-c)?(?=$|[?&])/i;
-  // 너비+높이가 모두 고정된 패턴은 비율 깨짐 위험이 있어 제외
-  const fixedAspectPattern = /=[sw]\d{2,4}-h\d{2,4}/i;
-
-  if (fixedAspectPattern.test(src)) return null;
-
-  if (pathPattern.test(src)) {
-    const entries = RESPONSIVE_WIDTHS.map(w => `${src.replace(pathPattern, `/s${w}$1/`)} ${w}w`);
-    return entries.join(', ');
-  }
-  if (queryPattern.test(src)) {
-    const entries = RESPONSIVE_WIDTHS.map(w => `${src.replace(queryPattern, `=$1${w}$2`)} ${w}w`);
-    return entries.join(', ');
-  }
-  return null;
 }
 
 // ─────────────────────────────────────────────
