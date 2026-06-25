@@ -5,7 +5,7 @@
 #     스키마 강화(Article+Breadcrumb+FAQ+WebSite) + 20+ 신규 기능
 #     WASM 강화(고급 연산+안정성) + 로딩 극소화 + 에러 완전 차단
 
-name = "blogspot-seo-worker"
+name = "bloggerseo"
 main = "worker.js"
 compatibility_date = "2026-06-16"
 compatibility_flags = ["nodejs_compat"]
