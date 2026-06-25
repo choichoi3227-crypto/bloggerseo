@@ -1,10 +1,9 @@
 # wrangler.toml
-# Blogspot SEO & Performance Optimization Worker (v3)
+# Blogspot SEO & Performance Optimization Worker (v4)
 # ─────────────────────────────────────────────────
-# v3: Durable Objects 제거 → GitHub 레포 JSON 상태 저장으로 대체.
-#     WASM(AssemblyScript) 가속 + EC2/Linux급 인프라 기능 추가.
-# 설정 제로 기본 동작은 유지 — GITHUB_TOKEN 등 신규 secret이 없어도
-# 기존과 100% 동일하게 동작(해당 기능만 자동으로 no-op).
+# v4: SLUG_KV = 순수 슬러그 전용 / CNAME_KV = CNAME 검증 전용(영구 캐시)
+#     스키마 강화(Article+Breadcrumb+FAQ+WebSite) + 20+ 신규 기능
+#     WASM 강화(고급 연산+안정성) + 로딩 극소화 + 에러 완전 차단
 
 name = "blogspot-seo-worker"
 main = "worker.js"
@@ -12,30 +11,17 @@ compatibility_date = "2026-06-16"
 compatibility_flags = ["nodejs_compat"]
 
 # ─── KV 네임스페이스 ────────────────────────────────────────────────
-# SLUG_KV          : CNAME 검증 캐시 + SEO 슬러그 + LB RTT 기록
-#                    + [v3] 메트릭 집계 + 레이트리밋 카운터 (재사용, 신규 KV 불필요)
-# CACHE_RESERVE_KV : HTML 페이지 캐시용 (선택사항 — 없어도 동작, 현재 비활성)
+# SLUG_KV  : SEO 슬러그 매핑만 (origin:* / alias:* 키)
+# CNAME_KV : CNAME 검증 결과 영구 캐시 (한번 검증된 도메인은 재검증 없음)
+#            LB RTT / metrics / rate-limit 도 여기에 저장
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "4fe8b16587f04703abe9e913763f58f7"
 
 [[kv_namespaces]]
-binding = "CACHE_RESERVE_KV"
-id      = "7153daa4c5874bc581670f75adf66a22"
+binding = "CNAME_KV"
+id      = "e0bbd4c3c6244069bac237d6f23de845"
 
-# ─── [v3] GitHub 상태 저장소 (Durable Objects 대체) ────────────────
-# 아래 secret/var들이 없으면 githubTenantAcquire/Release/Status는 전부
-# no-op으로 통과하므로, 설정 전까지는 v2와 완전히 동일하게 동작함.
-#
-# 1) Personal Access Token 발급 (레포 contents 읽기/쓰기 권한,
-#    fine-grained PAT 권장: Contents: Read and write)
-# 2) secret 등록:
-#      npx wrangler secret put GITHUB_TOKEN
-#    (대화형 프롬프트에 토큰 값 입력 — 이 파일에는 토큰 값을 직접 적지 않음)
-# 3) (선택) state 서명용 키도 secret으로 등록 — 미설정 시 서명 단계 스킵:
-#      npx wrangler secret put STATE_SIGNING_KEY
-#
-# vars(평문, 토큰 아님)는 필요시 아래 [vars] 섹션에서 조정 가능.
 [vars]
 GITHUB_OWNER = "choichoi3227-crypto"
 GITHUB_REPO  = "bloggerseo"
@@ -64,39 +50,5 @@ enabled = false
 persist = true
 head_sampling_rate = 1
 
-
-
 [placement]
 mode = "smart"
-
-
-# ─── 동작 원리 ──────────────────────────────────────────────────────
-# 1. 요청 호스트의 CNAME이 ghs.google.com인지 1.1.1.1 DoH로 검증.
-#    검증 결과는 SLUG_KV에 24시간 캐시 → 이후 요청은 KV 즉시 조회.
-#
-# 2. 검증 통과 시 커스텀 도메인으로 직접 fetch (blogspot.com 불필요).
-#    /feeds/*, /sitemap*.xml, /atom.xml, /rss.xml → 그대로 프록시.
-#    HTML 페이지 → SEO 최적화(메타태그, schema.org, canonical) 후 반환.
-#
-# 3. 검증 실패 시 502 Bad Gateway (사이트 준비 중 페이지 없음).
-#
-# 4. [v3] 도메인별 동시성/circuit-breaker 상태는 GitHub 레포
-#    (state/tenants/{host-hash}.json)에 실시간으로 커밋되어 관리됨.
-#    GITHUB_TOKEN 미설정 시 이 기능은 비활성(no-op)이며 나머지 동작은
-#    영향받지 않음.
-#
-# 5. [v3] 슬러그 생성/SHA-256/HMAC/캐시 해싱은 WASM(AssemblyScript)으로
-#    가속되며, WASM 인스턴스화/호출이 실패할 경우 동일한 결과를 내는
-#    JS 구현으로 즉시 자동 전환됨(서비스 영향 없음).
-#
-# ─── Cloudflare 라우트 설정 방법 ────────────────────────────────────
-# Workers & Pages → blogspot-seo-worker → Settings → Triggers
-# Custom Domains 또는 Routes에 커스텀 도메인 추가:
-#   예) blog.example.com/*
-#       www.example.com/*
-# ghs.google.com CNAME이 있는 서브도메인이면 자동으로 작동.
-#
-# ─── 신규 디버그/운영 엔드포인트 (v3) ───────────────────────────────
-#   GET /__blogger_debug  → CNAME/탐지/tenant(GitHub state)/wasm 백엔드 상태
-#   GET /__metrics?minutes=15 → 최근 N분 메트릭(요청수/에러율/레이턴시 분포)
-#   GET /__purge_all      → (구버전 호환) 잔존 KV HTML 캐시 정리
