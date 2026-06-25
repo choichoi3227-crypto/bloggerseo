@@ -1,20 +1,22 @@
 // ═══════════════════════════════════════════════════════════════════
-// [WASM 로더] — bloggerseo.wasm (AssemblyScript) 안전 호출 계층
+// [WASM 로더 v4] — 고급 연산 + 안정성 강화
 //
-// 설계 원칙:
-//   1) WASM 인스턴스화는 워커 인스턴스(콜드/웜) 생명주기 동안 1회만 수행
-//      (모듈 스코프 캐싱) — 매 요청마다 재컴파일/재인스턴스화하지 않음.
-//   2) 모든 WASM 호출은 try/catch로 감싸고, 실패 시 동일한 결과를 내는
-//      JS 구현으로 즉시 폴백한다 — 워커의 핵심 응답 경로는 WASM 유무와
-//      무관하게 100% 동일하게 동작해야 한다("워커 전체 코드에 영향 없도록").
-//   3) JS와 호스트(워커) 사이의 데이터 교환은 고정 오프셋 raw 버퍼
-//      (rawGenerateSlug 등)만 사용 — AssemblyScript GC 문자열 객체의
-//      내부 구조에 의존하지 않아 빌드가 바뀌어도 안전.
+// v4 개선:
+//   - WASM 초기화 실패 시 영구 실패가 아닌 백오프 후 재시도
+//   - 버퍼 오버플로 완전 방어 (대형 HTML 입력 안전 처리)
+//   - TextEncoder/Decoder 인스턴스 재사용 (마이크로 최적화)
+//   - warmup() → 타임아웃 보호 추가 (5초 초과 시 조용히 실패)
+//   - 모든 exports 존재 여부 런타임 검증 → 누락 export = JS 폴백
 // ═══════════════════════════════════════════════════════════════════
 
 import { WASM_BASE64 } from '../wasm-src/wasm-blob.js';
 
 let _wasmInstancePromise = null;
+let _wasmFailedUntil = 0;         // 실패 후 재시도 금지 기간(ms)
+const WASM_RETRY_COOLDOWN = 30000; // 30초간 재시도 없음
+
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
 
 function base64ToBytes(b64) {
   const bin = atob(b64);
@@ -27,52 +29,60 @@ async function instantiateWasm() {
   const bytes = base64ToBytes(WASM_BASE64);
   const importObject = {
     env: {
-      // AssemblyScript 런타임이 어설션/언리치블 발생 시 호출.
-      // 워커를 죽이지 않고 예외로만 변환 → 호출부에서 catch해 JS 폴백.
       abort(msgPtr, filePtr, line, col) {
         throw new Error(`wasm-abort@${line}:${col}`);
       },
       trace() {},
-      seed() { return Date.now(); },
+      seed() { return Date.now() * Math.random(); },
     },
   };
   const { instance } = await WebAssembly.instantiate(bytes, importObject);
+
+  // 필수 exports 검증 — 누락 시 즉시 throw → JS 폴백 사용
+  const required = [
+    'memory', 'getInputPtr', 'getInput2Ptr', 'getOutputPtr',
+    'getBufSize', 'rawGenerateSlug', 'rawSha256',
+    'rawHmacSha256', 'rawFnv1a32', 'rawCountOccurrences',
+  ];
+  for (const exp of required) {
+    if (typeof instance.exports[exp] === 'undefined') {
+      throw new Error(`wasm missing export: ${exp}`);
+    }
+  }
   return instance;
 }
 
-// 모듈 스코프에서 1회만 초기화 (워커 인스턴스 재사용 시 캐시됨)
 function getWasmInstance() {
+  // 최근 실패 시 쿨다운 기간 동안 즉시 JS 폴백
+  if (_wasmFailedUntil > Date.now()) return Promise.reject(new Error('wasm cooldown'));
   if (!_wasmInstancePromise) {
     _wasmInstancePromise = instantiateWasm().catch(e => {
-      // 초기화 자체가 실패해도 다음 요청에서 재시도할 수 있도록 캐시를 비움
       _wasmInstancePromise = null;
+      _wasmFailedUntil = Date.now() + WASM_RETRY_COOLDOWN;
       throw e;
     });
   }
   return _wasmInstancePromise;
 }
 
-function mem8(instance) {
-  return new Uint8Array(instance.exports.memory.buffer);
-}
+function mem8(inst) { return new Uint8Array(inst.exports.memory.buffer); }
 
-function writeUtf8(instance, ptr, str) {
-  const encoded = new TextEncoder().encode(str);
-  if (encoded.length > instance.exports.getBufSize()) {
-    throw new Error('wasm input too large for buffer');
-  }
-  mem8(instance).set(encoded, ptr);
+function writeUtf8(inst, ptr, str) {
+  const encoded = _enc.encode(str);
+  const bufSize = inst.exports.getBufSize();
+  if (encoded.length > bufSize) throw new Error('wasm input too large');
+  mem8(inst).set(encoded, ptr);
   return encoded.length;
 }
 
-function writeBytes(instance, ptr, bytes) {
-  mem8(instance).set(bytes, ptr);
+function writeBytes(inst, ptr, bytes) {
+  const bufSize = inst.exports.getBufSize();
+  if (bytes.length > bufSize) throw new Error('wasm input too large');
+  mem8(inst).set(bytes, ptr);
   return bytes.length;
 }
 
-function readBytes(instance, ptr, len) {
-  return mem8(instance).slice(ptr, ptr + len);
-}
+function readBytes(inst, ptr, len) { return mem8(inst).slice(ptr, ptr + len); }
 
 function bytesToHex(bytes) {
   let out = '';
@@ -80,9 +90,7 @@ function bytesToHex(bytes) {
   return out;
 }
 
-// ─────────────────────────────────────────────
-// JS 폴백 구현 (WASM과 동일한 결과를 내야 함 — 정확성 검증 완료된 기존 로직)
-// ─────────────────────────────────────────────
+// ─── JS 폴백 구현 ──────────────────────────────────────────────────
 function generateSlugJsFallback(title) {
   if (!title) return 'untitled';
   try {
@@ -95,23 +103,20 @@ function generateSlugJsFallback(title) {
       s = encodeURIComponent(s).replace(/%20/g, '-').replace(/%2F/gi, '-');
     }
     return s || 'post';
-  } catch (_) {
-    return 'post';
-  }
+  } catch (_) { return 'post'; }
 }
 
 async function sha256HexJsFallback(input) {
-  const data = new TextEncoder().encode(input);
+  const data = _enc.encode(input);
   const digest = await crypto.subtle.digest('SHA-256', data);
   return bytesToHex(new Uint8Array(digest));
 }
 
 async function hmacSha256HexJsFallback(key, message) {
-  const enc = new TextEncoder();
   const cryptoKey = await crypto.subtle.importKey(
-    'raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    'raw', _enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
-  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(message));
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, _enc.encode(message));
   return bytesToHex(new Uint8Array(sig));
 }
 
@@ -120,15 +125,13 @@ function constantTimeEqualJsFallback(a, b) {
   const len = Math.max(a.length, b.length);
   let diff = 0;
   for (let i = 0; i < len; i++) {
-    const ca = i < a.length ? a.charCodeAt(i) : 0;
-    const cb = i < b.length ? b.charCodeAt(i) : 0;
-    diff |= ca ^ cb;
+    diff |= (i < a.length ? a.charCodeAt(i) : 0) ^ (i < b.length ? b.charCodeAt(i) : 0);
   }
   return diff === 0 && a.length === b.length;
 }
 
 function fnv1a32JsFallback(input) {
-  const bytes = new TextEncoder().encode(input);
+  const bytes = _enc.encode(input);
   let hash = 0x811c9dc5;
   for (let i = 0; i < bytes.length; i++) {
     hash ^= bytes[i];
@@ -149,22 +152,18 @@ function countOccurrencesJsFallback(haystack, needle) {
   return count;
 }
 
-// ─────────────────────────────────────────────
-// 공개 API — 워커 어디서나 이 객체만 사용. WASM/JS 여부는 내부에서 처리.
-// 모든 메서드는 async (WASM 인스턴스화가 비동기이므로 일관성 유지).
-// ─────────────────────────────────────────────
+// ─── 공개 API ──────────────────────────────────────────────────────
 export const wasmCore = {
-  // 어떤 백엔드(wasm|js)가 실제로 사용됐는지 마지막 호출 기준으로 노출(디버그용)
   _lastBackend: 'unknown',
 
   async generateSlug(title) {
     try {
-      const instance = await getWasmInstance();
-      const inPtr = Number(instance.exports.getInputPtr());
-      const outPtr = Number(instance.exports.getOutputPtr());
-      const n = writeUtf8(instance, inPtr, title);
-      const outLen = instance.exports.rawGenerateSlug(n);
-      const result = new TextDecoder().decode(readBytes(instance, outPtr, outLen));
+      const inst = await getWasmInstance();
+      const inPtr = Number(inst.exports.getInputPtr());
+      const outPtr = Number(inst.exports.getOutputPtr());
+      const n = writeUtf8(inst, inPtr, title);
+      const outLen = inst.exports.rawGenerateSlug(n);
+      const result = _dec.decode(readBytes(inst, outPtr, Number(outLen)));
       this._lastBackend = 'wasm';
       return result || 'post';
     } catch (_) {
@@ -175,14 +174,14 @@ export const wasmCore = {
 
   async sha256Hex(input) {
     try {
-      const instance = await getWasmInstance();
-      const inPtr = Number(instance.exports.getInputPtr());
-      const outPtr = Number(instance.exports.getOutputPtr());
-      const bytes = new TextEncoder().encode(input);
-      const n = writeBytes(instance, inPtr, bytes);
-      const outLen = instance.exports.rawSha256(n);
+      const inst = await getWasmInstance();
+      const inPtr = Number(inst.exports.getInputPtr());
+      const outPtr = Number(inst.exports.getOutputPtr());
+      const bytes = _enc.encode(input);
+      const n = writeBytes(inst, inPtr, bytes);
+      const outLen = inst.exports.rawSha256(n);
       this._lastBackend = 'wasm';
-      return bytesToHex(readBytes(instance, outPtr, outLen));
+      return bytesToHex(readBytes(inst, outPtr, Number(outLen)));
     } catch (_) {
       this._lastBackend = 'js';
       return sha256HexJsFallback(input);
@@ -191,41 +190,37 @@ export const wasmCore = {
 
   async sha256HexShort(input, len) {
     const full = await this.sha256Hex(input);
-    return full.slice(0, len);
+    return full.slice(0, len || 16);
   },
 
   async hmacSha256Hex(key, message) {
     try {
-      const instance = await getWasmInstance();
-      const inPtr = Number(instance.exports.getInputPtr());
-      const in2Ptr = Number(instance.exports.getInput2Ptr());
-      const outPtr = Number(instance.exports.getOutputPtr());
-      const keyBytes = new TextEncoder().encode(key);
-      const msgBytes = new TextEncoder().encode(message);
-      const kn = writeBytes(instance, inPtr, keyBytes);
-      const mn = writeBytes(instance, in2Ptr, msgBytes);
-      const outLen = instance.exports.rawHmacSha256(kn, mn);
+      const inst = await getWasmInstance();
+      const inPtr  = Number(inst.exports.getInputPtr());
+      const in2Ptr = Number(inst.exports.getInput2Ptr());
+      const outPtr = Number(inst.exports.getOutputPtr());
+      const keyBytes = _enc.encode(key);
+      const msgBytes = _enc.encode(message);
+      const kn = writeBytes(inst, inPtr,  keyBytes);
+      const mn = writeBytes(inst, in2Ptr, msgBytes);
+      const outLen = inst.exports.rawHmacSha256(kn, mn);
       this._lastBackend = 'wasm';
-      return bytesToHex(readBytes(instance, outPtr, outLen));
+      return bytesToHex(readBytes(inst, outPtr, Number(outLen)));
     } catch (_) {
       this._lastBackend = 'js';
       return hmacSha256HexJsFallback(key, message);
     }
   },
 
-  constantTimeEqual(a, b) {
-    // 순수 동기 비교 로직 — WASM 호출 비용(memory 접근)이 오히려 타이밍을
-    // 더 흔들 수 있어 이 함수만 JS로 직접 수행 (보안 목적상 변동 없음)
-    return constantTimeEqualJsFallback(a, b);
-  },
+  constantTimeEqual(a, b) { return constantTimeEqualJsFallback(a, b); },
 
   async fnv1a32Hex(input) {
     try {
-      const instance = await getWasmInstance();
-      const inPtr = Number(instance.exports.getInputPtr());
-      const bytes = new TextEncoder().encode(input);
-      const n = writeBytes(instance, inPtr, bytes);
-      const h = instance.exports.rawFnv1a32(n) >>> 0;
+      const inst = await getWasmInstance();
+      const inPtr = Number(inst.exports.getInputPtr());
+      const bytes = _enc.encode(input);
+      const n = writeBytes(inst, inPtr, bytes);
+      const h = inst.exports.rawFnv1a32(n) >>> 0;
       this._lastBackend = 'wasm';
       return h.toString(16).padStart(8, '0');
     } catch (_) {
@@ -236,21 +231,20 @@ export const wasmCore = {
 
   async countOccurrences(haystack, needle) {
     try {
-      const instance = await getWasmInstance();
-      const inPtr = Number(instance.exports.getInputPtr());
-      const in2Ptr = Number(instance.exports.getInput2Ptr());
-      const hBytes = new TextEncoder().encode(haystack);
-      const nBytes = new TextEncoder().encode(needle);
-      const bufSize = instance.exports.getBufSize();
+      const inst = await getWasmInstance();
+      const inPtr  = Number(inst.exports.getInputPtr());
+      const in2Ptr = Number(inst.exports.getInput2Ptr());
+      const bufSize = inst.exports.getBufSize();
+      const hBytes = _enc.encode(haystack);
+      const nBytes = _enc.encode(needle);
       if (hBytes.length > bufSize || nBytes.length > bufSize) {
-        // 버퍼보다 큰 입력은 WASM 경로를 건너뛰고 안전하게 JS로 처리
         this._lastBackend = 'js';
         return countOccurrencesJsFallback(haystack, needle);
       }
-      const hn = writeBytes(instance, inPtr, hBytes);
-      const nn = writeBytes(instance, in2Ptr, nBytes);
+      const hn = writeBytes(inst, inPtr,  hBytes);
+      const nn = writeBytes(inst, in2Ptr, nBytes);
       this._lastBackend = 'wasm';
-      return instance.exports.rawCountOccurrences(hn, nn);
+      return Number(inst.exports.rawCountOccurrences(hn, nn));
     } catch (_) {
       this._lastBackend = 'js';
       return countOccurrencesJsFallback(haystack, needle);
@@ -258,12 +252,13 @@ export const wasmCore = {
   },
 
   async warmup() {
-    // 콜드스타트 시 WASM을 미리 인스턴스화해 첫 요청 지연을 줄임 (waitUntil로 호출)
     try {
-      await getWasmInstance();
+      // 5초 타임아웃 보호
+      await Promise.race([
+        getWasmInstance(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('wasm warmup timeout')), 5000)),
+      ]);
       return true;
-    } catch (_) {
-      return false;
-    }
+    } catch (_) { return false; }
   },
 };
