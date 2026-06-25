@@ -17,7 +17,7 @@ compatibility_flags = ["nodejs_compat"]
 # CACHE_RESERVE_KV : HTML 페이지 캐시용 (선택사항 — 없어도 동작, 현재 비활성)
 [[kv_namespaces]]
 binding = "SLUG_KV"
-id      = "dee1ee21fe4c44559bce049b53cf4d0a"
+id      = "4fe8b16587f04703abe9e913763f58f7"
 
 [[kv_namespaces]]
 binding = "CACHE_RESERVE_KV"
