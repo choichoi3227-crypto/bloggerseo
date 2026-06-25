@@ -29,7 +29,6 @@
  *    - Permissions-Policy 헤더
  *    - ETag 생성 (FNV 기반)
  *    - 304 Not Modified 처리
- *    - 인라인 크리티컬 CSS 주입 (Above-the-fold 가속)
  *    - RSS/Atom 자동 발견 링크
  *    - rel="prev" / rel="next" 페이지네이션 지원
  *    - last-modified 헤더
@@ -49,7 +48,6 @@
  *    - warmup 타임아웃 보호
  *
  * 5. 로딩 극소화
- *    - 인라인 크리티컬 CSS
  *    - dns-prefetch + preconnect 강화
  *    - preload 힌트 (LCP, 폰트)
  *    - ETag + 304 Not Modified
@@ -807,7 +805,6 @@ async function transformHtml(html, ctx, url, env) {
   // ② 성능 최적화 (가장 먼저 — head에 주입)
   o = safeTransform(o, injectPerformanceHints);
   o = safeTransform(o, h => injectPreload(h, ctx));
-  o = safeTransform(o, injectCriticalCss);
 
   // ③ 메타 SEO
   o = safeTransform(o, h => injectMetaDescription(h, ctx));
@@ -876,19 +873,6 @@ function injectPreload(html, ctx) {
   }
   if (!preloads.length) return html;
   return html.replace(/(<\/head>)/i, preloads.join('\n') + '\n$1');
-}
-
-// 크리티컬 CSS 인라인 주입 (Above-the-fold 최소 스타일)
-function injectCriticalCss(html) {
-  if (html.includes('data-critical-css')) return html;
-  const css = `<style data-critical-css>
-*{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.6}
-img{max-width:100%;height:auto}
-a{color:inherit}
-.post-body img{display:block;margin:0 auto}
-</style>`;
-  return html.replace(/(<head[^>]*>)/i, `$1\n${css}`);
 }
 
 // ③ 메타 SEO
