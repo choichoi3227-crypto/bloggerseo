@@ -1,46 +1,26 @@
-# wrangler.toml
-# Blogspot SEO & Performance Optimization Worker (v4)
-# ─────────────────────────────────────────────────
-# v4: SLUG_KV = 순수 슬러그 전용 / CNAME_KV = CNAME 검증 전용(영구 캐시)
-#     스키마 강화(Article+Breadcrumb+FAQ+WebSite) + 20+ 신규 기능
-#     WASM 강화(고급 연산+안정성) + 로딩 극소화 + 에러 완전 차단
+# wrangler.toml — BloggerSEO Worker v5
+# ──────────────────────────────────────────────────────────────────
+# v5 변경:
+#   - CNAME_KV 제거 (인스턴스 메모리로 대체, KV 사용 0)
+#   - CACHE_RESERVE_KV 제거 (완전 제거)
+#   - SLUG_KV 단독 유지 (slug:origin:* / slug:alias:* 영속 저장)
+#   - GitHub API 관련 vars 전부 제거
+#   - 요청당 KV 최대 1회 읽기, 변경 없으면 쓰기 0회
 
 name = "bloggerseo"
 main = "worker.js"
 compatibility_date = "2026-06-16"
 compatibility_flags = ["nodejs_compat"]
 
-# ─── KV 네임스페이스 ────────────────────────────────────────────────
-# SLUG_KV  : SEO 슬러그 매핑만 (origin:* / alias:* 키)
-# CNAME_KV : CNAME 검증 결과 영구 캐시 (한번 검증된 도메인은 재검증 없음)
-#            LB RTT / metrics / rate-limit 도 여기에 저장
+# ─── KV: 슬러그 전용 (유일한 KV, 영속 NoSQL 스토리지) ─────────────
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "4fe8b16587f04703abe9e913763f58f7"
 
-[[kv_namespaces]]
-binding = "CNAME_KV"
-id      = "e0bbd4c3c6244069bac237d6f23de845"
-
-# CACHE_RESERVE_KV : "연산 결과" 전용 캐시 (HTML 본문/응답 바이트 절대 저장 금지)
-#   - pageCtx(제목/설명/og이미지/브레드크럼/스키마 데이터 등 파생 메타데이터)만 저장
-#   - 키 = origin raw HTML의 FNV 해시 → 동일 콘텐츠일 때만 히트
-#   - TTL 10분 — Blogger 원문 캐싱이 아니라 "동일 HTML 재파싱 비용" 절감용
-#   - 미스/오류 시 항상 직접 계산으로 폴백 (캐시는 선택적 가속 레이어일 뿐)
-[[kv_namespaces]]
-binding = "CACHE_RESERVE_KV"
-id      = "e68f949636934155a19febe344aa1082"
-
 [vars]
-GITHUB_OWNER = "choichoi3227-crypto"
-GITHUB_REPO  = "bloggerseo"
-GITHUB_BRANCH = "main"
-TENANT_MAX_CONCURRENCY   = "24"
-TENANT_FAILURE_THRESHOLD = "5"
-TENANT_OPEN_COOLDOWN_MS  = "15000"
-RATE_LIMIT_PER_MIN       = "600"
+RATE_LIMIT_PER_MIN = "600"
 
-# ─── 스케줄드 트리거 (슬러그 canonical 감사, 매시간) ────────────────
+# ─── 스케줄드 트리거 (슬러그 감사, 매시간) ──────────────────────────
 [triggers]
 crons = ["0 * * * *"]
 
