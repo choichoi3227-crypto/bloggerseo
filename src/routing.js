@@ -141,12 +141,23 @@ export function priorityRoute(request) {
 }
 
 // ── Load Balancer ─────────────────────────────────────────────────────
-const _workerId   = crypto.randomUUID().slice(0, 8);
-let   _inFlight   = 0;
+// 주의: crypto.randomUUID()는 global scope(모듈 최상단)에서 호출하면
+// Cloudflare Workers가 "Disallowed operation in global scope" 에러를 던진다.
+// 따라서 워커 ID는 요청 핸들러가 처음 실행될 때 lazy하게 생성한다.
+let  _workerId    = null;
+let  _inFlight    = 0;
 const MAX_INFLIGHT = 48;
 const LOAD_THRESH  = 0.80; // 80% 점유시 503
 
+function ensureWorkerId() {
+  if (_workerId === null) {
+    _workerId = crypto.randomUUID().slice(0, 8);
+  }
+  return _workerId;
+}
+
 export function lbAcquire() {
+  ensureWorkerId();
   if (_inFlight >= MAX_INFLIGHT) return false;
   _inFlight++;
   return true;
@@ -157,11 +168,11 @@ export function lbRelease() {
 export function lbLoad() {
   return _inFlight / MAX_INFLIGHT;
 }
-export function lbWorkerId() { return _workerId; }
+export function lbWorkerId() { return ensureWorkerId(); }
 
 // 워커 헬스를 Redis에 heartbeat (ctx.waitUntil으로 비동기 호출)
 export async function lbHeartbeat(env) {
-  await workerHeartbeat(env, _workerId, {
+  await workerHeartbeat(env, ensureWorkerId(), {
     inFlight : _inFlight,
     maxFlight: MAX_INFLIGHT,
     load     : lbLoad(),
