@@ -2,8 +2,8 @@
  * BloggerSEO v6 — 사이트맵 + RSS 생성기
  * ─────────────────────────────────────────────────────────────────────
  * Cron triggers:
- *   - */30 * * * * → RSS 생성
- *   - 0 * * * *    → 사이트맵 생성 + 슬러그 감사
+ *   - 매 30분 (cron: "asterisk/30 asterisk asterisk asterisk asterisk") → RSS 생성
+ *   - 매 정시 (cron: "0 asterisk asterisk asterisk asterisk")           → 사이트맵 생성 + 슬러그 감사
  *
  * 저장: Upstash Redis (saveSitemap / saveRss)
  * 제공: /sitemap.xml, /rss.xml, /atom.xml 엔드포인트
