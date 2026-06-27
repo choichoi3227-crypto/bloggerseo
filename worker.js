@@ -322,7 +322,19 @@ function isReservedFlatPath(p) {
   return false;
 }
 
-async function resolveSlugRoute(path, env) {
+// [v6.4 수정] URL.pathname은 한글 등 비ASCII 문자를 항상 퍼센트 인코딩된
+// 형태(%EC%A0%9C...)로 반환한다. 반면 슬러그 저장(upsertSlug)은 디코딩된
+// 한글 그대로("/제주도-여행-코스")를 키로 사용한다. 이 불일치 때문에
+// 슬러그가 KV/Redis에 정상 저장되어도 라우팅 조회에서 항상 찾지 못해
+// 404로 떨어지는 문제가 있었다. 조회 전에 반드시 디코딩해서 키를 맞춘다.
+function decodePathSafe(path) {
+  try { return decodeURIComponent(path); }
+  catch (_) { return path; } // 잘못된 인코딩이면 원본 그대로 (안전장치)
+}
+
+async function resolveSlugRoute(rawPath, env) {
+  const path = decodePathSafe(rawPath);
+
   if (isPostPath(path)) {
     const rec = await slugOriginGet(env, path);
     if (rec?.titlePath && rec.titlePath !== path) {
