@@ -1,31 +1,56 @@
-# wrangler.toml — BloggerSEO Worker v5
-# ──────────────────────────────────────────────────────────────────
-# v5 변경:
-#   - CNAME_KV 제거 (인스턴스 메모리로 대체, KV 사용 0)
-#   - CACHE_RESERVE_KV 제거 (완전 제거)
-#   - SLUG_KV 단독 유지 (slug:origin:* / slug:alias:* 영속 저장)
-#   - GitHub API 관련 vars 전부 제거
-#   - 요청당 KV 최대 1회 읽기, 변경 없으면 쓰기 0회
+# wrangler.toml — BloggerSEO Worker v6
+# ─────────────────────────────────────────────────────────────────────
+# v6 신규 기능:
+#   1. 자동 스키마 마크업 (Article/FAQ/Breadcrumb/Product)
+#   2. Argo Smart Routing (자체 구현)
+#   3. Regional Tiered Cache (자체 구현)
+#   4. 모바일·데스크탑 최적화
+#   5. Priority Routing (자체 구현)
+#   6. 구글·네이버·빙 상위노출 극대화
+#   7. 실시간 상태 저장 엔진 (KV·D1 없이 자체 NoSQL)
+#   8. Cache Reserve (4시간 만료, 자체 구현)
+#   9. 초고속 서버리스 NoSQL KV 스토리지 (외부 Upstash Redis 연동)
+#  10. Cron: 사이트맵(1시간) + RSS(30분)
+#  11. 자체 로드밸런싱
+#  12. 관리 패널 (Cloudflare + Worker 자동 연동)
 
 name = "bloggerseo"
 main = "worker.js"
 compatibility_date = "2026-06-16"
 compatibility_flags = ["nodejs_compat"]
 
-# ─── KV: 슬러그 전용 (유일한 KV, 영속 NoSQL 스토리지) ─────────────
+# ─── KV: 슬러그 전용 (유일한 KV, 영속 NoSQL 스토리지) ───────────────
 [[kv_namespaces]]
 binding = "SLUG_KV"
 id      = "4fe8b16587f04703abe9e913763f58f7"
 
+# ─── 환경 변수 ────────────────────────────────────────────────────────
 [vars]
-RATE_LIMIT_PER_MIN = "600"
+RATE_LIMIT_PER_MIN     = "600"
+CACHE_RESERVE_TTL_SEC  = "14400"      # 4시간 = 14400초
+MAX_WORKER_INSTANCES   = "50"         # 로드밸런싱: 최대 워커 인스턴스
+ARGO_REGIONS           = "KR,JP,US,EU"
+PRIORITY_ROUTING_TIERS = "3"
+PANEL_SECRET           = "change-me-in-dashboard"  # 관리 패널 인증 키
+NAVER_SITE_VERIFY      = ""           # 네이버 서치어드바이저 인증키
+BING_SITE_VERIFY       = ""           # 빙 웹마스터 인증키
+GOOGLE_SITE_VERIFY     = ""           # 구글 서치콘솔 인증키
+# Upstash Redis (자체 NoSQL 스토리지 — KV/D1 대체)
+UPSTASH_REDIS_URL      = ""           # https://xxx.upstash.io
+UPSTASH_REDIS_TOKEN    = ""           # 토큰 (환경 변수에 직접 입력)
+# Cloudflare API (관리 패널용)
+CF_API_TOKEN           = ""           # Cloudflare API 토큰
+CF_ZONE_ID             = ""           # Zone ID
+CF_ACCOUNT_ID          = ""           # Account ID
 
-# ─── 스케줄드 트리거 (슬러그 감사, 매시간) ──────────────────────────
+# ─── 스케줄드 트리거 ─────────────────────────────────────────────────
+# - 매 30분: RSS 생성
+# - 매 1시간: 사이트맵 생성 + 슬러그 감사 + 캐시 예약 만료 정리
 [triggers]
-crons = ["0 * * * *"]
+crons = ["*/30 * * * *", "0 * * * *"]
 
 [observability]
-enabled = false
+enabled = true
 head_sampling_rate = 1
 
 [observability.logs]
