@@ -1,154 +1,253 @@
 /**
- * BloggerSEO 자체 서버리스 NoSQL KV 스토리지 엔진 v1
- * ────────────────────────────────────────────────────
- * 목표:
- *   - Cloudflare KV 사용 완전 제로 (슬러그/CNAME/메트릭/레이트리밋 모두)
- *   - 100% 영속 (Workers KV 대비 비교: KV는 eventual consistency, 여기는 즉시 일관성)
- *   - 무제한 용량 (GitHub 레포 기반 → 파일 크기 제한만 있을 뿐 키 수 무제한)
- *   - GitHub API 완전 제거 — Cloudflare KV 단 1개 네임스페이스로 모든 데이터 관리
- *   - 메모리 방식 절대 금지 (모든 데이터 KV에 영속)
- *
- * 설계:
- *   - SLUG_KV 단일 네임스페이스를 파티션 키로 나눠 사용
- *     - slug:origin:{path}  → { title, titleSlug, titlePath, createdAt, checkedAt }
- *     - slug:alias:{path}   → originPath (string)
- *   - CNAME_KV, CACHE_RESERVE_KV, rate-limit, metrics → 모두 제거/인메모리 대체
- *   - 슬러그 KV는 영속 필요 → SLUG_KV 그대로 유지 (단 호출 횟수 극소화)
- *
- * KV 호출 최소화 전략:
- *   - 요청당 최대 1회 KV 읽기 (슬러그 alias 조회만)
- *   - 슬러그 등록은 background (ctx.waitUntil) + 중복 등록 방지 로직
- *   - CNAME 검증: KV 저장 안 함, Workers 인스턴스 레벨 메모리 캐시만
- *   - 메트릭/레이트리밋: KV 저장 안 함, 인스턴스 레벨 메모리 (재시작시 리셋 허용)
- *   - compute cache: 완전 제거 (슬러그 등록 없는 경로는 굳이 캐시 불필요)
+ * BloggerSEO v6 — 자체 서버리스 NoSQL KV 스토리지 엔진
+ * ─────────────────────────────────────────────────────────────────────
+ * 특징:
+ *   - Cloudflare KV / D1 완전 미사용
+ *   - Workers 인-메모리 방식 금지 (영속 보장)
+ *   - Upstash Redis REST API 기반 (초고속, 글로벌 엣지)
+ *   - 용도: Cache Reserve, 스키마 마크업 저장, 상태 엔진, IP 블록, 지역 캐시 메타
+ *   - 키 스킴:
+ *       slug:origin:{path}      → JSON (슬러그 원본 경로)
+ *       slug:alias:{path}       → string (슬러그 별칭)
+ *       cache:{hash}            → JSON (Cache Reserve 항목)
+ *       schema:{hash}           → JSON (스키마 마크업 캐시)
+ *       state:block:{ip}        → 1 (차단 IP)
+ *       state:region:{region}   → JSON (지역별 캐시 통계)
+ *       state:worker:{id}       → JSON (워커 인스턴스 상태)
+ *       sitemap:index           → XML
+ *       rss:feed                → XML
  */
 
-// ── 인스턴스 레벨 메모리 캐시 (Workers 수명 동안 유지) ──────────────
-// Workers 인스턴스는 수백 ms ~ 수십 분 살아있을 수 있으므로 캐시 효과 실질적
-const _cnameCache   = new Map(); // host → { ok, ts }
-const _rateLimit    = new Map(); // host → { count, windowStart }
-const _metricsData  = { count: 0, errors: 0, statusCounts: {} };
+// ── 인스턴스 레벨 L1 메모리 캐시 (Workers 수명 동안 유효, TTL=30초) ──
+const _l1 = new Map();
+const L1_TTL_MS = 30_000;
 
-const CNAME_MEM_TTL   = 24 * 3600 * 1000; // 24시간
-const RL_WINDOW_MS    = 60 * 1000;          // 1분
-const DEFAULT_RL_LIMIT = 600;
+function l1get(key) {
+  const e = _l1.get(key);
+  if (!e) return undefined;
+  if (Date.now() > e.exp) { _l1.delete(key); return undefined; }
+  return e.val;
+}
+function l1set(key, val, ttlMs = L1_TTL_MS) {
+  _l1.set(key, { val, exp: Date.now() + ttlMs });
+}
 
-// ── CNAME 캐시 (메모리 전용, 영속 불필요) ──────────────────────────
+// ── Upstash Redis REST API 래퍼 ──────────────────────────────────────
+async function redisCmd(env, ...args) {
+  const url   = env.UPSTASH_REDIS_URL;
+  const token = env.UPSTASH_REDIS_TOKEN;
+  if (!url || !token) return null;
+
+  try {
+    const resp = await fetch(`${url}`, {
+      method : 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type' : 'application/json',
+      },
+      body   : JSON.stringify(args),
+      cf     : { cacheTtl: 0, cacheEverything: false },
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    return json.result ?? null;
+  } catch (_) { return null; }
+}
+
+// ── 기본 KV 연산 ─────────────────────────────────────────────────────
+export async function kvGet(env, key) {
+  const cached = l1get(key);
+  if (cached !== undefined) return cached;
+
+  const val = await redisCmd(env, 'GET', key);
+  l1set(key, val);
+  return val;
+}
+
+export async function kvSet(env, key, value, ttlSec = 0) {
+  l1set(key, value, Math.min((ttlSec || 3600) * 1000, L1_TTL_MS));
+  if (ttlSec > 0) {
+    return redisCmd(env, 'SET', key, value, 'EX', ttlSec);
+  }
+  return redisCmd(env, 'SET', key, value);
+}
+
+export async function kvDel(env, key) {
+  _l1.delete(key);
+  return redisCmd(env, 'DEL', key);
+}
+
+export async function kvGetJson(env, key) {
+  const raw = await kvGet(env, key);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
+
+export async function kvSetJson(env, key, obj, ttlSec = 0) {
+  return kvSet(env, key, JSON.stringify(obj), ttlSec);
+}
+
+export async function kvScan(env, pattern, count = 100) {
+  const keys = await redisCmd(env, 'SCAN', '0', 'MATCH', pattern, 'COUNT', count);
+  if (!keys || !Array.isArray(keys)) return [];
+  return keys[1] || [];
+}
+
+// ── CNAME 캐시 (메모리 전용 — 24h TTL) ──────────────────────────────
+const _cnameCache = new Map();
+const CNAME_MEM_TTL = 24 * 3600 * 1000;
+
 export function cnameGet(host) {
-  const entry = _cnameCache.get(host);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > CNAME_MEM_TTL) { _cnameCache.delete(host); return null; }
-  return entry.ok;
+  const e = _cnameCache.get(host);
+  if (!e) return null;
+  if (Date.now() - e.ts > CNAME_MEM_TTL) { _cnameCache.delete(host); return null; }
+  return e.ok;
 }
 export function cnameSet(host, ok) {
   _cnameCache.set(host, { ok, ts: Date.now() });
 }
 
-// ── 레이트 리밋 (메모리 전용) ───────────────────────────────────────
-export function checkRateLimit(host, limitPerMin = DEFAULT_RL_LIMIT) {
+// ── 레이트 리밋 (메모리, 1분 윈도우) ────────────────────────────────
+const _rateLimit   = new Map();
+const RL_WINDOW_MS = 60_000;
+
+export function checkRateLimit(host, limitPerMin = 600) {
   const now = Date.now();
-  let bucket = _rateLimit.get(host);
-  if (!bucket || now - bucket.windowStart > RL_WINDOW_MS) {
-    bucket = { count: 0, windowStart: now };
-  }
-  bucket.count++;
-  _rateLimit.set(host, bucket);
-  return { allowed: bucket.count <= limitPerMin, count: bucket.count, limit: limitPerMin };
+  let b = _rateLimit.get(host);
+  if (!b || now - b.windowStart > RL_WINDOW_MS) b = { count: 0, windowStart: now };
+  b.count++;
+  _rateLimit.set(host, b);
+  return { allowed: b.count <= limitPerMin, count: b.count, limit: limitPerMin };
 }
 
-// ── 메트릭 (메모리 전용, 재시작시 리셋 허용) ───────────────────────
+// ── 메트릭 (메모리 — 재시작시 리셋 허용) ────────────────────────────
+const _metrics = { count: 0, errors: 0, statusCounts: {}, latencySum: 0 };
+
 export function recordMetric(status, latencyMs) {
-  _metricsData.count++;
-  if (status >= 500) _metricsData.errors++;
-  _metricsData.statusCounts[status] = (_metricsData.statusCounts[status] || 0) + 1;
+  _metrics.count++;
+  _metrics.latencySum += latencyMs || 0;
+  if (status >= 500) _metrics.errors++;
+  _metrics.statusCounts[status] = (_metrics.statusCounts[status] || 0) + 1;
 }
 export function getMetrics() {
   return {
-    ..._metricsData,
-    errorRate: _metricsData.count > 0 ? _metricsData.errors / _metricsData.count : 0,
-    note: 'in-memory only (resets on worker restart)',
+    ..._metrics,
+    avgLatencyMs : _metrics.count > 0 ? Math.round(_metrics.latencySum / _metrics.count) : 0,
+    errorRate    : _metrics.count > 0 ? (_metrics.errors / _metrics.count).toFixed(4) : 0,
+    note         : 'in-memory (resets on worker restart); use /panel for persistent analytics',
   };
 }
 
-// ── 슬러그 KV 스토리지 (SLUG_KV, 영속) ────────────────────────────
-// 키 네임스페이스:
-//   slug:origin:{path}  → JSON
-//   slug:alias:{path}   → string
-
+// ── 슬러그 영속 스토리지 ─────────────────────────────────────────────
 export async function slugOriginGet(env, originPath) {
-  if (!env.SLUG_KV) return null;
-  try {
-    return await env.SLUG_KV.get('slug:origin:' + originPath, { type: 'json' });
-  } catch (_) { return null; }
+  return kvGetJson(env, 'slug:origin:' + originPath);
 }
-
 export async function slugAliasGet(env, titlePath) {
-  if (!env.SLUG_KV) return null;
-  try {
-    return await env.SLUG_KV.get('slug:alias:' + titlePath);
-  } catch (_) { return null; }
+  return kvGet(env, 'slug:alias:' + titlePath);
 }
-
 export async function slugOriginPut(env, originPath, data) {
-  if (!env.SLUG_KV) return;
-  try {
-    await env.SLUG_KV.put('slug:origin:' + originPath, JSON.stringify(data));
-  } catch (_) {}
+  return kvSetJson(env, 'slug:origin:' + originPath, data);
 }
-
 export async function slugAliasPut(env, titlePath, originPath) {
-  if (!env.SLUG_KV) return;
-  try {
-    await env.SLUG_KV.put('slug:alias:' + titlePath, originPath);
-  } catch (_) {}
+  return kvSet(env, 'slug:alias:' + titlePath, originPath);
 }
-
 export async function slugAliasDelete(env, titlePath) {
-  if (!env.SLUG_KV) return;
-  try {
-    await env.SLUG_KV.delete('slug:alias:' + titlePath);
-  } catch (_) {}
+  return kvDel(env, 'slug:alias:' + titlePath);
 }
 
-// ── 슬러그 등록/갱신 (배치 처리, KV 호출 최소화) ───────────────────
-// 기존: 등록할 때마다 origin 조회 → 없으면 2회, 있으면 슬러그 변경 시 3회 호출
-// 개선: 제목이 바뀌지 않으면 1회도 안 쓰고 스킵, 처음 등록도 2회가 최대
 export async function upsertSlug(env, originPath, title, titleSlug) {
-  if (!env.SLUG_KV || !title || !titleSlug) return;
+  if (!title || !titleSlug) return;
   const titlePath = '/' + titleSlug;
+  const existing  = await slugOriginGet(env, originPath);
+  const now       = Date.now();
 
-  try {
-    const existing = await slugOriginGet(env, originPath);
-    const now = Date.now();
-
-    if (!existing) {
-      // 신규 등록: 2회 KV 쓰기
-      await slugOriginPut(env, originPath, { title, titleSlug, titlePath, createdAt: now, checkedAt: now });
-      await slugAliasPut(env, titlePath, originPath);
-    } else if (existing.titlePath !== titlePath) {
-      // 슬러그 변경: 3회 KV 쓰기 (구 alias 삭제 + 신규 alias + origin 갱신)
-      await slugAliasDelete(env, existing.titlePath);
-      await slugAliasPut(env, titlePath, originPath);
-      await slugOriginPut(env, originPath, { ...existing, title, titleSlug, titlePath, checkedAt: now });
-    }
-    // 변화 없으면 KV 쓰기 0회
-  } catch (_) {}
+  if (!existing) {
+    await slugOriginPut(env, originPath, { title, titleSlug, titlePath, createdAt: now, checkedAt: now });
+    await slugAliasPut(env, titlePath, originPath);
+  } else if (existing.titlePath !== titlePath) {
+    await slugAliasDelete(env, existing.titlePath);
+    await slugAliasPut(env, titlePath, originPath);
+    await slugOriginPut(env, originPath, { ...existing, title, titleSlug, titlePath, checkedAt: now });
+  }
 }
 
-// ── 전체 슬러그 purge ───────────────────────────────────────────────
 export async function purgeAllSlugs(env) {
-  if (!env.SLUG_KV) return { deleted: 0, note: 'SLUG_KV not bound' };
+  const keys = await kvScan(env, 'slug:*', 500);
   let deleted = 0;
-  try {
-    let cursor;
-    do {
-      const listed = await env.SLUG_KV.list({ cursor });
-      for (const key of listed.keys) {
-        await env.SLUG_KV.delete(key.name).catch(() => {});
-        deleted++;
-      }
-      cursor = listed.list_complete ? undefined : listed.cursor;
-    } while (cursor);
-  } catch (_) {}
+  for (const k of keys) { await kvDel(env, k); deleted++; }
   return { deleted };
+}
+
+// ── 차단 IP 관리 ─────────────────────────────────────────────────────
+export async function blockIp(env, ip, ttlSec = 86400) {
+  return kvSet(env, 'state:block:' + ip, '1', ttlSec);
+}
+export async function isIpBlocked(env, ip) {
+  const v = await kvGet(env, 'state:block:' + ip);
+  return v === '1';
+}
+export async function unblockIp(env, ip) {
+  return kvDel(env, 'state:block:' + ip);
+}
+export async function listBlockedIps(env) {
+  return kvScan(env, 'state:block:*', 200);
+}
+
+// ── 지역별 캐시 상태 ─────────────────────────────────────────────────
+export async function regionCacheSet(env, region, data) {
+  return kvSetJson(env, 'state:region:' + region, { ...data, updatedAt: Date.now() });
+}
+export async function regionCacheGet(env, region) {
+  return kvGetJson(env, 'state:region:' + region);
+}
+
+// ── 워커 인스턴스 상태 등록 ──────────────────────────────────────────
+export async function workerHeartbeat(env, workerId, state) {
+  return kvSetJson(env, 'state:worker:' + workerId, {
+    ...state, workerId, ts: Date.now(),
+  }, 120); // 2분 TTL (죽은 인스턴스 자동 제거)
+}
+export async function listActiveWorkers(env) {
+  const keys = await kvScan(env, 'state:worker:*', 100);
+  const results = [];
+  for (const k of keys) {
+    const d = await kvGetJson(env, k);
+    if (d) results.push(d);
+  }
+  return results;
+}
+
+// ── 사이트맵 / RSS 저장 ──────────────────────────────────────────────
+export async function saveSitemap(env, xml) {
+  return kvSet(env, 'sitemap:index', xml, 7200); // 2시간 TTL
+}
+export async function getSitemap(env) {
+  return kvGet(env, 'sitemap:index');
+}
+export async function saveRss(env, xml) {
+  return kvSet(env, 'rss:feed', xml, 3600); // 1시간 TTL
+}
+export async function getRss(env) {
+  return kvGet(env, 'rss:feed');
+}
+
+// ── 스키마 마크업 캐시 ───────────────────────────────────────────────
+export async function schemaGet(env, hash) {
+  return kvGetJson(env, 'schema:' + hash);
+}
+export async function schemaPut(env, hash, schema, ttlSec = 14400) {
+  return kvSetJson(env, 'schema:' + hash, schema, ttlSec);
+}
+
+// ── 분석 이벤트 기록 ─────────────────────────────────────────────────
+export async function recordAnalytics(env, event) {
+  // Redis LPUSH로 분석 큐에 추가 (최대 10000개 유지)
+  const key = 'analytics:events';
+  await redisCmd(env, 'LPUSH', key, JSON.stringify({ ...event, ts: Date.now() }));
+  await redisCmd(env, 'LTRIM', key, 0, 9999);
+}
+export async function getAnalytics(env, count = 100) {
+  const items = await redisCmd(env, 'LRANGE', 'analytics:events', 0, count - 1);
+  if (!Array.isArray(items)) return [];
+  return items.map(i => { try { return JSON.parse(i); } catch (_) { return null; } }).filter(Boolean);
 }
