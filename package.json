@@ -1,25 +1,18 @@
 {
   "name": "bloggerseo",
-  "version": "3.0.0",
-  "description": "Cloudflare Workers 기반 Blogger 커스텀 도메인 SEO 최적화 워커. v3: Durable Objects 제거(GitHub 상태 저장으로 대체) + WASM 가속 + EC2/Linux급 인프라 기능.",
+  "version": "6.0.0",
+  "description": "BloggerSEO Worker v6: Argo Smart Routing + Regional Tiered Cache + Priority Routing + Cache Reserve (4h) + 자동 스키마 마크업 + 관리 패널",
   "type": "module",
   "main": "worker.js",
   "scripts": {
-    "build:wasm": "cd wasm-src && npx asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime && node build-blob.js",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "build:wasm": "cd wasm-src && npx asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime && node build-blob.js",
+    "panel": "open http://localhost:8787/panel"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/choichoi3227-crypto/bloggerseo.git"
-  },
-  "keywords": [],
+  "keywords": ["cloudflare-workers","blogger","seo","schema-markup","cache","routing"],
   "author": "",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/choichoi3227-crypto/bloggerseo/issues"
-  },
-  "homepage": "https://github.com/choichoi3227-crypto/bloggerseo#readme",
   "devDependencies": {
     "wrangler": "^4.104.0"
   }
