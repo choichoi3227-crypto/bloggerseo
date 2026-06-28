@@ -1,21 +1,22 @@
 /**
- * BloggerSEO v6 — 자체 서버리스 NoSQL KV 스토리지 엔진
+ * BloggerSEO v7 — 자체 서버리스 NoSQL KV 스토리지 엔진
  * ─────────────────────────────────────────────────────────────────────
- * [v6.3] 4단계 폴백 구조로 재설계
+ * [v7.0] 5단계 폴백 구조로 재설계 — 100% 자체 제작 Redis(DO 기반)를 1순위로 승격
  *
  *   읽기 (순차 폴백, 먼저 찾은 값을 반환):
- *     1순위: SLUG_KV   — Cloudflare KV 바인딩 (메인, 영속·글로벌)
- *     2순위: Redis      — Upstash Redis REST API (서브, 영속·글로벌)
- *     3순위: L1 메모리  — 인스턴스 메모리, TTL 30초 (초고속, 비영속)
- *     4순위: L4 메모리  — 인스턴스 메모리, TTL 없음 (최후 안전망, 비영속)
+ *     1순위: DO Redis   — 자체 제작 서버리스 Redis (Durable Objects, 샤딩 64-way)
+ *     2순위: SLUG_KV    — Cloudflare KV 바인딩 (백업, 영속·글로벌)
+ *     3순위: Upstash    — 외부 Redis REST API (선택적 백업, 바인딩 있을 때만)
+ *     4순위: L1 메모리  — 인스턴스 메모리, TTL 30초 (초고속, 비영속)
+ *     5순위: L4 메모리  — 인스턴스 메모리, TTL 없음 (최후 안전망, 비영속)
  *
  *   쓰기 (동시 쓰기, 하나가 실패해도 나머지는 계속 진행):
- *     SLUG_KV + Redis + L1 + L4 네 곳 모두에 동시에 기록.
+ *     DO Redis + SLUG_KV + Upstash(있으면) + L1 + L4 모두에 동시 기록.
+ *     → 어느 한 계층이 죽어도 나머지로 즉시 폴백되는 다중 이중화 구조.
  *
- *   주의: L1/L4는 100% 자체 구현한 순수 메모리 NoSQL 엔진이지만,
+ *   주의: L1/L4는 100% 자체 구현한 순수 메모리 NoSQL 엔진이며,
  *   Workers 인스턴스가 재시작되면 사라지는 비영속 계층입니다.
- *   진짜 영속성은 SLUG_KV와 Redis가 살아있을 때만 보장됩니다.
- *   Durable Objects는 사용하지 않습니다 (요청에 따라 배제).
+ *   진짜 영속성은 DO Redis / SLUG_KV / Upstash 중 살아있는 계층이 보장합니다.
  *
  *   키 스킴:
  *       slug:origin:{path}      → JSON (슬러그 원본 경로)
@@ -28,6 +29,11 @@
  *       sitemap:index           → XML
  *       rss:feed                → XML
  */
+
+import {
+  doRedisAvailable, doRedisGet, doRedisSet, doRedisDel, doRedisScanAll,
+  doRedisLPush as doLPush, doRedisLRange as doLRange, doRedisLTrim as doLTrim,
+} from './redis-do.js';
 
 // ── 3순위: L1 메모리 캐시 (인스턴스 수명 동안 유효, TTL=30초) ────────
 const _l1 = new Map();
@@ -157,9 +163,19 @@ async function redisScan(env, pattern, count = 100) {
   return keys[1] || [];
 }
 
-// ── 통합 KV 연산: 1→2→3→4 순차 읽기 / 4곳 동시 쓰기 ──────────────────
+// ── 통합 KV 연산: 1(DO Redis)→2(KV)→3(Upstash)→4(L1)→5(L4) 순차 읽기 / 전체 동시 쓰기 ──
 export async function kvGet(env, key) {
-  // 1순위: SLUG_KV
+  // 1순위: 자체 제작 DO Redis
+  if (doRedisAvailable(env)) {
+    const fromDo = await doRedisGet(env, key);
+    if (fromDo !== null && fromDo !== undefined) {
+      l1set(key, fromDo);
+      l4set(key, fromDo);
+      return fromDo;
+    }
+  }
+
+  // 2순위: SLUG_KV
   const fromKv = await kvNativeGet(env, key);
   if (fromKv !== null && fromKv !== undefined) {
     l1set(key, fromKv);
@@ -167,7 +183,7 @@ export async function kvGet(env, key) {
     return fromKv;
   }
 
-  // 2순위: Redis
+  // 3순위: Upstash Redis (선택적 백업 — 바인딩 없으면 자동 스킵)
   const fromRedis = await redisGet(env, key);
   if (fromRedis !== null && fromRedis !== undefined) {
     l1set(key, fromRedis);
@@ -175,11 +191,11 @@ export async function kvGet(env, key) {
     return fromRedis;
   }
 
-  // 3순위: L1 메모리 (초고속, 30초 TTL)
+  // 4순위: L1 메모리 (초고속, 30초 TTL)
   const fromL1 = l1get(key);
   if (fromL1 !== undefined) return fromL1;
 
-  // 4순위: L4 메모리 (최후 안전망)
+  // 5순위: L4 메모리 (최후 안전망)
   const fromL4 = l4get(key);
   if (fromL4 !== undefined) return fromL4;
 
@@ -187,23 +203,27 @@ export async function kvGet(env, key) {
 }
 
 export async function kvSet(env, key, value, ttlSec = 0) {
-  // 4곳 모두 동시에 쓰기 — 일부 실패해도 나머지는 계속 진행
-  const results = await Promise.allSettled([
+  // 모든 영속 계층에 동시 쓰기 — 일부 실패해도 나머지는 계속 진행
+  const writes = [
+    doRedisAvailable(env) ? doRedisSet(env, key, value, ttlSec) : Promise.resolve(false),
     kvNativePut(env, key, value, ttlSec),
     redisSet(env, key, value, ttlSec),
-  ]);
+  ];
+  const results = await Promise.allSettled(writes);
   l1set(key, value, ttlSec > 0 ? Math.min(ttlSec * 1000, L1_TTL_MS) : L1_TTL_MS);
   l4set(key, value, ttlSec);
 
-  const kvOk    = results[0].status === 'fulfilled' && results[0].value === true;
-  const redisOk = results[1].status === 'fulfilled' && results[1].value !== null;
-  return kvOk || redisOk; // 영속 계층 중 하나라도 성공하면 true
+  const doOk    = results[0].status === 'fulfilled' && results[0].value === true;
+  const kvOk    = results[1].status === 'fulfilled' && results[1].value === true;
+  const redisOk = results[2].status === 'fulfilled' && results[2].value !== null && results[2].value !== false;
+  return doOk || kvOk || redisOk; // 영속 계층 중 하나라도 성공하면 true
 }
 
 export async function kvDel(env, key) {
   l1del(key);
   l4del(key);
   const results = await Promise.allSettled([
+    doRedisAvailable(env) ? doRedisDel(env, key) : Promise.resolve(false),
     kvNativeDelete(env, key),
     redisDel(env, key),
   ]);
@@ -220,20 +240,21 @@ export async function kvSetJson(env, key, obj, ttlSec = 0) {
   return kvSet(env, key, JSON.stringify(obj), ttlSec);
 }
 
-// 키 목록 스캔: SLUG_KV → Redis → L1 → L4 순으로 합쳐서 중복 제거
+// 키 목록 스캔: DO Redis → SLUG_KV → Upstash → L1 → L4 순으로 합쳐서 중복 제거
 export async function kvScan(env, pattern, count = 100) {
   // SLUG_KV.list()는 정확 일치 패턴이 아니라 prefix만 지원하므로,
   // 'slug:origin:*' 같은 패턴에서 '*' 앞부분을 prefix로 사용
   const prefix = pattern.replace(/\*+$/, '');
 
-  const [kvKeys, redisKeys] = await Promise.all([
+  const [doKeys, kvKeys, redisKeys] = await Promise.all([
+    doRedisAvailable(env) ? doRedisScanAll(env, prefix, count) : Promise.resolve([]),
     kvNativeList(env, prefix, count),
     redisScan(env, pattern, count),
   ]);
 
   const memKeys = [...l1scanPrefix(prefix), ...l4scanPrefix(prefix)];
 
-  const merged = new Set([...kvKeys, ...redisKeys, ...memKeys]);
+  const merged = new Set([...doKeys, ...kvKeys, ...redisKeys, ...memKeys]);
   return Array.from(merged).slice(0, count);
 }
 
@@ -384,13 +405,19 @@ export async function schemaPut(env, hash, schema, ttlSec = 14400) {
 }
 
 // ── 분석 이벤트 기록 ───────────────────────────────────────────────────
-// 리스트 연산(LPUSH/LTRIM)은 KV에 대응 개념이 없으므로 Redis 우선,
-// Redis가 없으면 L4 메모리에 배열로 보관하는 자체 구현 폴백을 사용.
+// 리스트 연산(LPUSH/LTRIM)은 KV에 대응 개념이 없으므로
+// 1순위 DO Redis → 2순위 Upstash → 3순위 L4 메모리 순으로 폴백.
 const ANALYTICS_KEY = 'analytics:events';
 const ANALYTICS_MAX = 10000;
 
 export async function recordAnalytics(env, event) {
   const entry = JSON.stringify({ ...event, ts: Date.now() });
+
+  if (doRedisAvailable(env)) {
+    await doLPush(env, ANALYTICS_KEY, entry);
+    await doLTrim(env, ANALYTICS_KEY, 0, ANALYTICS_MAX - 1);
+    return;
+  }
 
   if (hasRedis(env)) {
     await redisCmd(env, 'LPUSH', ANALYTICS_KEY, entry);
@@ -398,7 +425,7 @@ export async function recordAnalytics(env, event) {
     return;
   }
 
-  // Redis 없을 때 자체 메모리 리스트 폴백 (L4)
+  // 영속 Redis가 전혀 없을 때 자체 메모리 리스트 폴백 (L4)
   const list = l4get(ANALYTICS_KEY) || [];
   list.unshift(entry);
   if (list.length > ANALYTICS_MAX) list.length = ANALYTICS_MAX;
@@ -406,6 +433,13 @@ export async function recordAnalytics(env, event) {
 }
 
 export async function getAnalytics(env, count = 100) {
+  if (doRedisAvailable(env)) {
+    const items = await doLRange(env, ANALYTICS_KEY, 0, count - 1);
+    if (Array.isArray(items) && items.length) {
+      return items.map(i => { try { return JSON.parse(i); } catch (_) { return null; } }).filter(Boolean);
+    }
+  }
+
   if (hasRedis(env)) {
     const items = await redisCmd(env, 'LRANGE', ANALYTICS_KEY, 0, count - 1);
     if (Array.isArray(items)) {
@@ -416,3 +450,6 @@ export async function getAnalytics(env, count = 100) {
   const list = l4get(ANALYTICS_KEY) || [];
   return list.slice(0, count).map(i => { try { return JSON.parse(i); } catch (_) { return null; } }).filter(Boolean);
 }
+
+// ── 자체 제작 Redis(DO) 클러스터 관리 — 관리 패널 "Redis 관리" 탭에서 사용 ─────
+export { doRedisAvailable, doRedisClusterStats, doRedisFlushAll } from './redis-do.js';
