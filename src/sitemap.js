@@ -115,25 +115,34 @@ ${items}
 }
 
 // ── 사이트맵/RSS 엔드포인트 핸들러 ─────────────────────────────────
-export async function handleSitemapRequest(env, url) {
+export async function handleSitemapRequest(env, url, hostOverride) {
+  // 실제 개인도메인 우선 사용 (SITE_BASE_URL 환경변수 > 요청 host)
+  const base   = resolveBaseForRequest(env, url, hostOverride);
   const cached = await getSitemap(env);
   if (cached) {
+    // 캐시에 저장된 XML의 도메인이 현재 호스트와 다를 수 있으므로
+    // 저장된 그대로 반환 (Cron이 SITE_BASE_URL로 생성했다면 그게 맞는 값)
     return new Response(cached, {
       headers: {
         'content-type'  : 'application/xml; charset=utf-8',
         'cache-control' : 'public, max-age=3600, stale-while-revalidate=1800',
         'x-sitemap-src' : 'cache',
+        'x-sitemap-base': base,
       },
     });
   }
-  // 캐시 미스 → 즉시 생성
-  const { xml } = await generateSitemap(env, url.origin);
-  return new Response(xml || emptySitemap(url.origin), {
-    headers: { 'content-type': 'application/xml; charset=utf-8' },
+  // 캐시 미스 → 즉시 생성 (실제 도메인 사용)
+  const { xml } = await generateSitemap(env, base);
+  return new Response(xml || emptySitemap(base), {
+    headers: {
+      'content-type': 'application/xml; charset=utf-8',
+      'cache-control': 'public, max-age=3600, stale-while-revalidate=1800',
+    },
   });
 }
 
-export async function handleRssRequest(env, url) {
+export async function handleRssRequest(env, url, hostOverride) {
+  const base   = resolveBaseForRequest(env, url, hostOverride);
   const cached = await getRss(env);
   if (cached) {
     return new Response(cached, {
@@ -141,13 +150,39 @@ export async function handleRssRequest(env, url) {
         'content-type' : 'application/rss+xml; charset=utf-8',
         'cache-control': 'public, max-age=1800, stale-while-revalidate=900',
         'x-rss-src'    : 'cache',
+        'x-rss-base'   : base,
       },
     });
   }
-  const { xml } = await generateRss(env, url.origin);
-  return new Response(xml || emptyRss(url.origin), {
-    headers: { 'content-type': 'application/rss+xml; charset=utf-8' },
+  const { xml } = await generateRss(env, base);
+  return new Response(xml || emptyRss(base), {
+    headers: {
+      'content-type': 'application/rss+xml; charset=utf-8',
+      'cache-control': 'public, max-age=1800, stale-while-revalidate=900',
+    },
   });
+}
+
+// 실제 요청 host를 기반으로 baseUrl 결정
+// 우선순위: env.SITE_BASE_URL(명시) > 요청 host(자동) > url.origin
+function resolveBaseForRequest(env, url, hostOverride) {
+  // 환경변수 명시 설정 최우선
+  if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com' && env.SITE_BASE_URL !== '') {
+    return env.SITE_BASE_URL.replace(/\/$/, '');
+  }
+  if (env.SITE_HOST && env.SITE_HOST !== '') {
+    return 'https://' + env.SITE_HOST.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  }
+  // 요청 host 사용 (가장 정확 — 실제 개인도메인으로 들어온 요청이면 이게 맞음)
+  // blogspot.com이나 workers.dev 같은 내부 도메인은 제외
+  if (hostOverride && hostOverride !== 'localhost'
+      && !hostOverride.endsWith('.workers.dev')
+      && !hostOverride.endsWith('.blogspot.com')
+      && !hostOverride.endsWith('.cloudflareworkers.com')
+      && hostOverride.includes('.')) {
+    return 'https://' + hostOverride;
+  }
+  return url.origin;
 }
 
 function emptySitemap(base) {
