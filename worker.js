@@ -1907,19 +1907,12 @@ async function loadK8s() {
   const ctrs = status.containers?.containers || [];
   const tb = document.getElementById('k8s-ctr-table');
   tb.innerHTML = ctrs.length
-    ? ctrs.map(c => `<tr>
-        <td><code>${c.id?.slice(0,14)||'-'}</code></td>
-        <td>${c.image||'-'}</td>
-        <td><span class="badge ${c.state==='running'?'badge-green':c.state==='stopped'?'badge-yellow':'badge-red'}">${c.state||'-'}</span></td>
-        <td>${c.cpu?.usedMs?.toFixed(1)||0}ms</td>
-        <td>${c.requests?.count||0}</td>
-        <td><span class="badge ${c.health?.status==='healthy'?'badge-green':'badge-yellow'}">${c.health?.status||'unknown'}</span></td>
-      </tr>`).join('')
+    ? ctrs.map(c => \`<tr>\n        <td><code>\${c.id?.slice(0,14)||'-'}</code></td>\n        <td>\${c.image||'-'}</td>\n        <td><span class=\"badge \${c.state==='running'?'badge-green':c.state==='stopped'?'badge-yellow':'badge-red'}\">\${c.state||'-'}</span></td>\n        <td>\${c.cpu?.usedMs?.toFixed(1)||0}ms</td>\n        <td>\${c.requests?.count||0}</td>\n        <td><span class=\"badge \${c.health?.status==='healthy'?'badge-green':'badge-yellow'}\">\${c.health?.status||'unknown'}</span></td>\n      </tr>\`).join('')
     : '<tr><td colspan="6" style="color:#64748b;text-align:center">실행 중인 컨테이너 없음 — Reconcile 실행 후 새로고침</td></tr>';
 
   const evDiv = document.getElementById('k8s-events');
   evDiv.innerHTML = (events || []).slice(0, 30).map(e =>
-    `<div>[<span style="color:#60a5fa">${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style="color:#a78bfa">${e.type}</span> ${e.deployment||e.pod||e.namespace||''}</div>`
+    \`<div>[<span style="color:#60a5fa">\${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style="color:#a78bfa">\${e.type}</span> \${e.deployment||e.pod||e.namespace||''}</div>\`
   ).join('') || '<div style="color:#475569">이벤트 없음 — Worker 첫 요청 후 자동 생성됩니다</div>';
 }
 
