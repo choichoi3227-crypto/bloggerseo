@@ -26,7 +26,7 @@ import {
   doRedisAvailable, doRedisClusterStats, doRedisFlushAll,
 } from './src/store.js';
 import {
-  cacheReserveGet, cacheReservePut,
+  cacheReserveGet, cacheReservePut, cacheReserveGetStaleFallback,
   cacheReservePurge, cacheReserveStats,
   cacheReserveInvalidate, isCacheable,
 } from './src/cache-reserve.js';
@@ -153,16 +153,22 @@ async function handleFetch(request, env, ctx) {
     return resp;
   }
 
-  // ── Cache Reserve L2 조회 (봇·크롤러 제외) ──────────────────────
-  if (!isBot && isCacheable(request, null)) {
+  // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
+  // 쿠키 유무와 무관하게 캐시를 적용한다 (v7.1: 캐시 히트율 극대화).
+  if (isCacheable(request, null)) {
     const cached = await cacheReserveGet(env, request);
     if (cached) {
       ctx.waitUntil(regionalCacheRecord(env, argoCtx.region, true).catch(() => {}));
       recordMetric(200, Date.now() - t0);
-      ctx.waitUntil(recordAnalytics(env, {
-        type: 'cache_hit', path, region: argoCtx.region, label: pRoute.label,
-      }).catch(() => {}));
-      // SWR: 백그라운드 재검증
+      if (!isBot) {
+        ctx.waitUntil(recordAnalytics(env, {
+          type: 'cache_hit', path, region: argoCtx.region, label: pRoute.label, tier: cached.tier,
+        }).catch(() => {}));
+      }
+      // L2에서 히트했다면 L0(엣지 캐시)도 채워서, 같은 노드의 다음 요청은
+      // L2 호출 없이 즉시 응답되게 한다 (응답 지연 없이 백그라운드 처리).
+      if (cached.warmL0) ctx.waitUntil(cached.warmL0().catch(() => {}));
+      // SWR: 백그라운드 재검증 (만료 윈도우 진입 시)
       if (cached.isSwr) {
         ctx.waitUntil(backgroundRevalidate(request, env, url, argoCtx, pRoute).catch(() => {}));
       }
@@ -203,6 +209,15 @@ async function handleFetch(request, env, ctx) {
     originResp = await retryAsync(() => bloggerFetch(fetchUrl, request.headers, argoCtx));
   } catch (e) {
     lbRelease();
+    // ── 장애 격리: Origin(Blogger) 자체가 응답을 못 줄 때, 만료된 캐시라도
+    // 있으면 그걸 서빙해서 사이트를 살린다. 캐시도 없으면 502를 반환한다.
+    if (isCacheable(request, null)) {
+      const stale = await cacheReserveGetStaleFallback(env, request).catch(() => null);
+      if (stale) {
+        recordMetric(200, Date.now() - t0);
+        return stale;
+      }
+    }
     recordMetric(502, Date.now() - t0);
     return errResp(502, 'Fetch failed: ' + String(e?.message ?? e));
   }
@@ -215,6 +230,14 @@ async function handleFetch(request, env, ctx) {
     return stripInternalHeaders(originResp);
   }
   if (originResp.status >= 500) {
+    // ── 장애 격리: Origin이 5xx를 반환해도 stale 캐시가 있으면 그걸 서빙
+    if (isCacheable(request, null)) {
+      const stale = await cacheReserveGetStaleFallback(env, request).catch(() => null);
+      if (stale) {
+        recordMetric(200, Date.now() - t0);
+        return stale;
+      }
+    }
     recordMetric(originResp.status, Date.now() - t0);
     return errResp(originResp.status, 'Origin error ' + originResp.status);
   }
@@ -237,25 +260,27 @@ async function handleFetch(request, env, ctx) {
   } catch (_) { result = html; pageCtx = null; }
 
   // ── ETag / 304 ───────────────────────────────────────────────────
+  // 구글봇 등 크롤러도 ETag/If-None-Match 조건부 요청을 지원한다.
+  // (Google 공식: 크롤링 인프라가 ETag/Last-Modified 캐싱을 지원하며,
+  //  이를 활용하면 크롤링 효율이 올라간다 — SEO 랭킹 직접 요인은 아니지만
+  //  크롤 예산을 아껴주는 효과가 있어 손해는 없고 이득만 있다.)
   let etag = '';
-  const hasCookie = !!request.headers.get('cookie');
-  if (!hasCookie && !isBot) {
-    try {
-      etag = `"${fnv1a32Hex(result)}"`;
-      const ifNoneMatch = request.headers.get('if-none-match');
-      if (ifNoneMatch && ifNoneMatch === etag) {
-        recordMetric(304, Date.now() - t0);
-        return new Response(null, { status: 304, headers: { etag, 'cache-control': 'no-store' } });
-      }
-    } catch (_) { etag = ''; }
-  }
+  try {
+    etag = `"${fnv1a32Hex(result)}"`;
+    const ifNoneMatch = request.headers.get('if-none-match');
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      recordMetric(304, Date.now() - t0);
+      return new Response(null, { status: 304, headers: { etag, 'cache-control': 'no-store' } });
+    }
+  } catch (_) { etag = ''; }
 
   // ── 비동기 후처리 ───────────────────────────────────────────────
   if (pageCtx) {
     ctx.waitUntil(updateSlugKV(pageCtx, originPathForKV, env).catch(() => {}));
   }
 
-  // Cache Reserve 저장 (봇 제외, 성공 응답만)
+  // Cache Reserve 저장 (성공 응답만, 봇 트래픽으로 캐시를 오염시키지 않기
+  // 위해 쓰기는 사람 방문자 기준으로만 — 단, 읽기는 모두에게 적용됨)
   if (!isBot && pageCtx) {
     const respForCache = new Response(result, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
     ctx.waitUntil(
