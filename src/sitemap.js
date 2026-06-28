@@ -1,5 +1,5 @@
 /**
- * BloggerSEO v6 — 사이트맵 + RSS 생성기
+ * BloggerSEO v7 — 사이트맵 + RSS 생성기
  * ─────────────────────────────────────────────────────────────────────
  * Cron triggers:
  *   - 매 30분 (cron: "asterisk/30 asterisk asterisk asterisk asterisk") → RSS 생성
