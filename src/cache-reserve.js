@@ -37,10 +37,10 @@
 
 import { kvGet, kvSet, kvGetJson, kvSetJson, kvDel, kvScan } from './store.js';
 
-const RESERVE_TTL_SEC  = 43200;  // 12시간 (기존 4시간 → 연장, 원본 도달률 최소화)
-const SWR_WINDOW_SEC   = 21600;  // 6시간 (만료 전 stale 허용 윈도우)
+const RESERVE_TTL_SEC  = 1800;  // 12시간 (기존 4시간 → 연장, 원본 도달률 최소화)
+const SWR_WINDOW_SEC   = 1800;  // 6시간 (만료 전 stale 허용 윈도우)
 const MAX_BODY_BYTES    = 2_000_000; // 2MB까지 캐시 허용 (이미지 임베드 글 대응)
-const STALE_GRACE_SEC   = 259200; // 3일 — 완전 만료 후에도 origin 장애 시 이 기간까지는 stale 서빙
+const STALE_GRACE_SEC   = 3600; // 3일 — 완전 만료 후에도 origin 장애 시 이 기간까지는 stale 서빙
 
 // ── FNV-1a 32bit (캐시 키 해시) ──────────────────────────────────────
 function fnv1a32(str) {
