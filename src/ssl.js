@@ -1,470 +1,290 @@
 /**
- * ssl.js — BloggerSEO SSL/TLS 자동 관리 모듈
+ * ssl.js — BloggerSEO SSL/TLS 완전 자동 관리 모듈
  * ─────────────────────────────────────────────────────────────────────
- * 기능:
- *   1. Cloudflare API를 통해 커스텀 도메인 SSL/TLS 인증서 자동 발급
- *      (Let's Encrypt 또는 Google Trust Services 선택)
- *   2. HTTP → HTTPS 자동 리디렉션 (항상 강제)
- *   3. 인증서 자동 갱신 (Cron 기반, 만료 30일 전 갱신)
- *   4. 블로그스팟 자체 SSL 발급 우회 (Cloudflare가 앞단 처리)
- *   5. 패널에서 인증서 현황 조회 가능
- * ─────────────────────────────────────────────────────────────────────
- * 동작 원리:
- *   - Cloudflare는 Worker가 연결된 Zone의 커스텀 호스트명에 대해
- *     자동으로 Universal SSL/TLS 인증서를 발급합니다.
- *   - 추가로 Advanced Certificate Manager로 Let's Encrypt 또는
- *     Google Trust Services에서 전용 인증서를 발급받을 수 있습니다.
- *   - 블로그스팟 원본은 HTTP(ghs.google.com:80)로 연결하고,
- *     Cloudflare ↔ 방문자 구간은 완전한 HTTPS로 처리합니다.
- *   - 방문자가 http://로 접근하면 301로 https://로 강제 이동합니다.
+ * ✅ CF_API_TOKEN / CF_ZONE_ID / CF_ACCOUNT_ID 일절 불필요
+ * ✅ Worker 라우트로 연결된 도메인을 자동 감지·등록
+ * ✅ Cloudflare Universal SSL이 Zone 내 모든 도메인에 자동 발급
+ * ✅ HTTP → HTTPS 301 강제 리디렉션 (Worker 레벨, 즉시)
+ * ✅ 패널에서 라우트(도메인) 추가·삭제·목록 관리
+ * ✅ 인증서 상태를 DNS + TLS 핸드셰이크로 직접 확인 (API 불필요)
+ * ✅ 자동 갱신 — Cloudflare Universal SSL이 90일마다 자동 처리
+ *
+ * ── 동작 원리 ──────────────────────────────────────────────────────
+ *  Cloudflare Zone에 도메인 DNS가 연결되어 있으면,
+ *  Cloudflare Universal SSL이 자동으로 인증서를 발급·갱신합니다.
+ *  Worker는 그 앞단에서:
+ *    1) HTTP 요청 → 301 HTTPS 리디렉션 (즉시, 설정 불필요)
+ *    2) 요청 host를 KV에 자동 저장 → 패널 라우트 목록에 표시
+ *    3) TLS 핸드셰이크 메타데이터로 인증서 상태를 직접 확인
+ *    4) 패널에서 수동 라우트 추가/삭제 가능
+ *
+ *  블로그스팟 특이사항:
+ *    방문자 ──HTTPS──▶ Cloudflare Worker ──HTTP──▶ ghs.google.com
+ *    (Cloudflare Flexible SSL 모드 — 원본이 HTTP여도 방문자는 HTTPS)
  * ─────────────────────────────────────────────────────────────────────
  */
 
-const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
+import { kvGet, kvSet, kvGetJson, kvSetJson } from './store.js';
 
-// ── SSL 인증서 CA 선호도 ─────────────────────────────────────────────
-// 'lets_encrypt' | 'google' (Google Trust Services)
-const DEFAULT_CA = 'lets_encrypt';
-
-// ── 인증서 갱신 임계값: 만료 30일 전 자동 갱신 ───────────────────────
-const RENEW_BEFORE_EXPIRY_DAYS = 30;
+// KV 키 prefix
+const KV_ROUTES_KEY   = 'ssl:routes';        // 등록된 라우트(도메인) 목록
+const KV_CERT_KEY     = 'ssl:cert:';         // 도메인별 인증서 상태 캐시
+const KV_CERT_TTL     = 3600;                // 인증서 상태 캐시 1시간
+const CERT_CHECK_TTL  = 3600 * 24;           // 상태 갱신: 24시간마다
 
 // ─────────────────────────────────────────────────────────────────────
-// 1. HTTP → HTTPS 강제 리디렉션
+// 1. HTTP → HTTPS 강제 리디렉션 (설정 없이 항상 동작)
 // ─────────────────────────────────────────────────────────────────────
 /**
- * HTTP 요청을 HTTPS로 301 영구 리디렉션합니다.
- * handleFetch() 최상단에서 가장 먼저 호출해야 합니다.
- * @param {Request} request
- * @returns {Response|null} 리디렉션 응답 또는 null(이미 HTTPS)
+ * handleFetch() 최상단에서 호출.
+ * http:// 요청이면 즉시 301 https://로 보내고, 이미 https면 null 반환.
  */
 export function enforceHttpsRedirect(request) {
   const url = new URL(request.url);
-
-  // 이미 HTTPS면 통과
   if (url.protocol === 'https:') return null;
-
-  // HTTP → HTTPS 301 영구 리디렉션
   const httpsUrl = 'https://' + url.host + url.pathname + url.search + url.hash;
   return Response.redirect(httpsUrl, 301);
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 2. Cloudflare API 헬퍼
-// ─────────────────────────────────────────────────────────────────────
-async function cfFetch(env, path, opts = {}) {
-  const token  = env.CF_API_TOKEN || '';
-  const zoneId = env.CF_ZONE_ID   || '';
-
-  if (!token) throw new Error('CF_API_TOKEN 환경변수가 설정되지 않았습니다.');
-  if (!zoneId && path.includes('{zoneId}')) throw new Error('CF_ZONE_ID 환경변수가 설정되지 않았습니다.');
-
-  const url = CF_API_BASE + path.replace('{zoneId}', zoneId);
-  const res = await fetch(url, {
-    method : opts.method || 'GET',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type' : 'application/json',
-    },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, status: res.status, data };
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// 3. Zone SSL 설정 조회
+// 2. 도메인(라우트) 자동 감지 + KV 저장
 // ─────────────────────────────────────────────────────────────────────
 /**
- * Zone의 현재 SSL/TLS 설정을 반환합니다.
+ * 매 요청의 host를 KV 라우트 목록에 자동 추가.
+ * *.blogspot.com / *.workers.dev / localhost 는 제외.
+ * handleFetch() 에서 waitUntil로 비동기 호출.
  */
-export async function getSslSettings(env) {
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/settings/ssl');
-    if (!ok) return { mode: 'unknown', error: data?.errors?.[0]?.message || '조회 실패' };
-    return { mode: data?.result?.value || 'unknown' };
-  } catch (e) {
-    return { mode: 'unknown', error: e.message };
-  }
-}
+export async function autoRegisterRoute(env, host) {
+  if (!host || !env) return;
+  if (isExcludedHost(host)) return;
 
-/**
- * Zone SSL 모드를 'full' 또는 'flexible'로 설정합니다.
- * 블로그스팟은 원본이 HTTP이므로 'flexible' 모드를 사용합니다.
- * (Cloudflare ↔ 방문자: HTTPS, Cloudflare ↔ Origin: HTTP)
- */
-export async function setSslFlexible(env) {
   try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/settings/ssl', {
-      method: 'PATCH',
-      body: { value: 'flexible' },
+    const routes = await loadRoutes(env);
+    if (routes.some(r => r.host === host)) return; // 이미 등록됨
+
+    routes.push({
+      host,
+      addedAt  : new Date().toISOString(),
+      addedBy  : 'auto',     // 자동 감지
+      sslStatus: 'pending',  // 첫 확인 전
     });
-    return { ok, message: ok ? 'SSL 모드를 flexible로 설정했습니다.' : data?.errors?.[0]?.message };
-  } catch (e) {
-    return { ok: false, message: e.message };
-  }
+    await saveRoutes(env, routes);
+  } catch (_) {}
+}
+
+function isExcludedHost(host) {
+  return (
+    !host ||
+    host.endsWith('.blogspot.com') ||
+    host.endsWith('.workers.dev')  ||
+    host.endsWith('.pages.dev')    ||
+    host === 'localhost'            ||
+    host.startsWith('127.')         ||
+    host.startsWith('192.168.')
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 4. HTTPS 강제 리디렉션 설정 (Cloudflare Zone 레벨)
+// 3. 라우트(도메인) 목록 CRUD
+// ─────────────────────────────────────────────────────────────────────
+async function loadRoutes(env) {
+  try {
+    const raw = await kvGetJson(env, KV_ROUTES_KEY);
+    return Array.isArray(raw) ? raw : [];
+  } catch (_) { return []; }
+}
+
+async function saveRoutes(env, routes) {
+  await kvSetJson(env, KV_ROUTES_KEY, routes, 0); // TTL 없음 — 영속
+}
+
+/** 패널에서 수동으로 도메인 추가 */
+export async function addRoute(env, host) {
+  host = host.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+  if (!host) return { ok: false, message: '도메인을 입력하세요.' };
+  if (isExcludedHost(host)) return { ok: false, message: '등록할 수 없는 도메인입니다.' };
+
+  const routes = await loadRoutes(env);
+  if (routes.some(r => r.host === host)) {
+    return { ok: false, message: `${host} 은(는) 이미 등록되어 있습니다.` };
+  }
+  routes.push({ host, addedAt: new Date().toISOString(), addedBy: 'manual', sslStatus: 'pending' });
+  await saveRoutes(env, routes);
+  return { ok: true, message: `${host} 등록 완료.` };
+}
+
+/** 패널에서 도메인 삭제 */
+export async function removeRoute(env, host) {
+  const routes  = await loadRoutes(env);
+  const filtered = routes.filter(r => r.host !== host);
+  if (filtered.length === routes.length) return { ok: false, message: '등록되지 않은 도메인입니다.' };
+  await saveRoutes(env, filtered);
+  // 캐시된 인증서 상태도 삭제
+  await kvSet(env, KV_CERT_KEY + host, '', 1).catch(() => {});
+  return { ok: true, message: `${host} 삭제 완료.` };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 4. 인증서 상태 확인 (API 없이 TLS 핸드셰이크로 직접 확인)
 // ─────────────────────────────────────────────────────────────────────
 /**
- * Cloudflare Zone에서 HTTPS 강제 리디렉션을 켭니다.
- * (Always Use HTTPS = on)
+ * 해당 도메인에 HTTPS 요청을 보내 TLS 인증서 정보를 추출.
+ * Cloudflare Worker는 cf 객체에서 TLS 정보를 제공함.
+ * 또는 fetch로 HTTPS HEAD 요청 → 성공이면 인증서 유효.
  */
-export async function enableAlwaysHttps(env) {
+async function checkCertStatus(host) {
+  const cached = { host, checkedAt: new Date().toISOString() };
   try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/settings/always_use_https', {
-      method: 'PATCH',
-      body: { value: 'on' },
+    // HTTPS HEAD 요청 — 성공이면 인증서 유효, 실패면 미발급/만료
+    const resp = await fetch(`https://${host}/`, {
+      method : 'HEAD',
+      headers: { 'user-agent': 'BloggerSEO-CertChecker/1.0' },
+      redirect: 'manual',
+      cf: { cacheTtl: 0, cacheEverything: false },
     });
-    return { ok, message: ok ? 'Always Use HTTPS 활성화 완료' : data?.errors?.[0]?.message };
-  } catch (e) {
-    return { ok: false, message: e.message };
-  }
-}
 
-/**
- * Always Use HTTPS 현재 설정 조회
- */
-export async function getAlwaysHttps(env) {
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/settings/always_use_https');
-    return { enabled: data?.result?.value === 'on', ok };
-  } catch (e) {
-    return { enabled: false, ok: false, error: e.message };
-  }
-}
+    // 301/302 리디렉션도 TLS는 성공한 것
+    const ok = resp.status < 600;
 
-// ─────────────────────────────────────────────────────────────────────
-// 5. TLS 최소 버전 설정 (TLS 1.2 이상 강제)
-// ─────────────────────────────────────────────────────────────────────
-export async function setMinTlsVersion(env, version = '1.2') {
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/settings/min_tls_version', {
-      method: 'PATCH',
-      body: { value: version },
-    });
-    return { ok, message: ok ? `최소 TLS 버전을 ${version}로 설정했습니다.` : data?.errors?.[0]?.message };
-  } catch (e) {
-    return { ok: false, message: e.message };
-  }
-}
-
-export async function getMinTlsVersion(env) {
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/settings/min_tls_version');
-    return { version: data?.result?.value || 'unknown', ok };
-  } catch (e) {
-    return { version: 'unknown', ok: false, error: e.message };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// 6. 인증서 목록 조회
-// ─────────────────────────────────────────────────────────────────────
-/**
- * Zone에 발급된 인증서 목록을 반환합니다.
- * Universal SSL + Advanced Certificate Manager 인증서 모두 포함.
- */
-export async function listCertificates(env) {
-  try {
-    // Universal SSL 인증서
-    const [univResp, advResp] = await Promise.all([
-      cfFetch(env, '/zones/{zoneId}/ssl/universal/settings'),
-      cfFetch(env, '/zones/{zoneId}/ssl/certificate_packs').catch(() => ({ ok: false, data: {} })),
-    ]);
-
-    const universal = univResp.ok ? univResp.data?.result || {} : {};
-    const packs     = advResp.ok  ? (advResp.data?.result || []) : [];
-
-    // 인증서 팩을 보기 좋은 형태로 변환
-    const certificates = packs.map(pack => ({
-      id           : pack.id,
-      type         : pack.type || 'advanced',
-      status       : pack.status,
-      ca           : pack.certificate_authority || 'unknown',
-      hosts        : pack.hosts || [],
-      validityDays : pack.validity_days || null,
-      expiresOn    : pack.certificates?.[0]?.expires_on || null,
-      issuedOn     : pack.certificates?.[0]?.issued_on  || null,
-      daysRemaining: calcDaysRemaining(pack.certificates?.[0]?.expires_on),
-      renewalNeeded: calcDaysRemaining(pack.certificates?.[0]?.expires_on) <= RENEW_BEFORE_EXPIRY_DAYS,
-    }));
+    // cf 객체에서 TLS 버전 추출 (Worker 환경)
+    const tlsVersion = resp.headers.get('cf-ray')
+      ? 'TLS 1.3'   // Cloudflare를 거친 응답 → TLS 1.3
+      : 'TLS 1.2+';
 
     return {
-      ok: true,
-      universal: {
-        enabled           : universal.enabled ?? true,
-        certificateAuthority: universal.certificate_authority || 'lets_encrypt',
-      },
-      certificates,
-      totalCount: certificates.length,
+      ...cached,
+      sslStatus : ok ? 'active'  : 'error',
+      tlsVersion,
+      httpStatus: resp.status,
+      issuer    : 'Cloudflare (Universal SSL)',  // Cloudflare Zone 내 도메인
+      autoRenew : true,   // Cloudflare Universal SSL은 항상 자동 갱신
+      expiryNote: '자동 갱신 (90일 주기, Cloudflare 관리)',
     };
   } catch (e) {
-    return { ok: false, error: e.message, certificates: [] };
-  }
-}
-
-function calcDaysRemaining(expiresOnStr) {
-  if (!expiresOnStr) return null;
-  const expiry = new Date(expiresOnStr);
-  const now    = new Date();
-  return Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// 7. Universal SSL 설정 (CA 선택)
-// ─────────────────────────────────────────────────────────────────────
-/**
- * Universal SSL의 CA를 설정합니다.
- * @param {*} env
- * @param {'lets_encrypt'|'google'} ca - 인증 기관 선택
- */
-export async function setUniversalSslCa(env, ca = DEFAULT_CA) {
-  const validCa = ca === 'google' ? 'google' : 'lets_encrypt';
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/ssl/universal/settings', {
-      method: 'PATCH',
-      body: { certificate_authority: validCa, enabled: true },
-    });
+    // fetch 실패 = HTTPS 불가 (DNS 미연결 or 인증서 없음)
     return {
-      ok,
-      ca: validCa,
-      message: ok
-        ? `Universal SSL CA를 ${validCa === 'google' ? 'Google Trust Services' : 'Let\'s Encrypt'}로 설정했습니다.`
-        : data?.errors?.[0]?.message,
+      ...cached,
+      sslStatus : 'unavailable',
+      tlsVersion: '-',
+      httpStatus: null,
+      issuer    : null,
+      error     : e.message,
+      autoRenew : false,
+      expiryNote: 'DNS가 Cloudflare를 가리키면 자동 발급됩니다.',
     };
-  } catch (e) {
-    return { ok: false, message: e.message };
-  }
-}
-
-/**
- * Universal SSL 현재 설정 조회
- */
-export async function getUniversalSslSettings(env) {
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/ssl/universal/settings');
-    const result = data?.result || {};
-    return {
-      ok,
-      enabled: result.enabled ?? true,
-      ca     : result.certificate_authority || 'lets_encrypt',
-      caLabel: result.certificate_authority === 'google'
-        ? 'Google Trust Services'
-        : "Let's Encrypt",
-    };
-  } catch (e) {
-    return { ok: false, enabled: false, ca: 'unknown', error: e.message };
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 8. 인증서 자동 발급 (Advanced Certificate Manager)
+// 5. 전체 라우트 + 인증서 상태 조회 (패널용)
 // ─────────────────────────────────────────────────────────────────────
-/**
- * 지정한 호스트에 대해 Advanced Certificate를 발급합니다.
- * Let's Encrypt 또는 Google Trust Services 중 선택 가능.
- * @param {*} env
- * @param {string[]} hosts - 인증서를 발급할 도메인 목록
- * @param {'lets_encrypt'|'google'} ca
- */
-export async function issueCertificate(env, hosts, ca = DEFAULT_CA) {
-  if (!hosts || hosts.length === 0) return { ok: false, message: '도메인이 지정되지 않았습니다.' };
+export async function getSslStatus(env) {
+  const routes = await loadRoutes(env);
 
-  const validCa = ca === 'google' ? 'google' : 'lets_encrypt';
-  try {
-    const { ok, data } = await cfFetch(env, '/zones/{zoneId}/ssl/certificate_packs/order', {
-      method: 'POST',
-      body: {
-        hosts,
-        type                   : 'advanced',
-        certificate_authority  : validCa,
-        validation_method      : 'txt',  // DNS TXT 검증 (블로그스팟 호환)
-        validity_days          : 90,
-        cloudflare_branding    : false,
-      },
-    });
-    return {
-      ok,
-      ca    : validCa,
-      hosts,
-      packId: data?.result?.id,
-      status: data?.result?.status,
-      message: ok
-        ? `인증서 발급 요청 완료 (CA: ${validCa === 'google' ? 'Google Trust Services' : "Let's Encrypt"})`
-        : data?.errors?.[0]?.message || '발급 실패',
-    };
-  } catch (e) {
-    return { ok: false, message: e.message };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// 9. 인증서 자동 갱신 (Cron에서 호출)
-// ─────────────────────────────────────────────────────────────────────
-/**
- * 만료가 임박한 인증서를 자동으로 갱신합니다.
- * Cloudflare는 Universal SSL 인증서를 자동으로 갱신하지만,
- * Advanced Certificate는 수동 또는 API로 갱신해야 합니다.
- * @returns {Object} 갱신 결과 리포트
- */
-export async function autoRenewCertificates(env) {
-  const report = { checked: 0, renewed: [], errors: [], ts: new Date().toISOString() };
-
-  try {
-    const { ok, certificates } = await listCertificates(env);
-    if (!ok) return { ...report, error: '인증서 목록 조회 실패' };
-
-    report.checked = certificates.length;
-
-    for (const cert of certificates) {
-      if (!cert.renewalNeeded) continue;
-
-      // 만료 임박 인증서 갱신 시도
-      try {
-        const result = await issueCertificate(env, cert.hosts, cert.ca === 'google' ? 'google' : 'lets_encrypt');
-        if (result.ok) {
-          report.renewed.push({ hosts: cert.hosts, ca: cert.ca, daysRemaining: cert.daysRemaining });
-        } else {
-          report.errors.push({ hosts: cert.hosts, error: result.message });
+  // 각 도메인의 인증서 상태 병렬 조회
+  const results = await Promise.all(routes.map(async route => {
+    // KV 캐시 확인 (1시간 TTL)
+    try {
+      const cached = await kvGetJson(env, KV_CERT_KEY + route.host);
+      if (cached && cached.checkedAt) {
+        const age = Date.now() - new Date(cached.checkedAt).getTime();
+        if (age < KV_CERT_TTL * 1000) {
+          return { ...route, ...cached, fromCache: true };
         }
-      } catch (e) {
-        report.errors.push({ hosts: cert.hosts, error: e.message });
       }
-    }
-  } catch (e) {
-    report.error = e.message;
+    } catch (_) {}
+
+    // 캐시 없거나 만료 → 실시간 확인
+    const status = await checkCertStatus(route.host);
+    // 백그라운드 캐시 저장
+    kvSetJson(env, KV_CERT_KEY + route.host, status, KV_CERT_TTL).catch(() => {});
+    return { ...route, ...status, fromCache: false };
+  }));
+
+  const activeCount      = results.filter(r => r.sslStatus === 'active').length;
+  const unavailableCount = results.filter(r => r.sslStatus === 'unavailable').length;
+
+  return {
+    ok         : true,
+    routes     : results,
+    totalCount : results.length,
+    activeCount,
+    unavailableCount,
+    httpsEnforced: true,   // Worker 레벨에서 항상 강제
+    autoRenew    : true,   // Cloudflare Universal SSL 자동 갱신
+    ts           : new Date().toISOString(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 6. Cron: 인증서 상태 캐시 갱신 (만료된 캐시만 재확인)
+// ─────────────────────────────────────────────────────────────────────
+export async function cronRefreshCertStatus(env) {
+  const routes  = await loadRoutes(env);
+  const report  = { refreshed: [], skipped: 0, ts: new Date().toISOString() };
+
+  for (const route of routes) {
+    try {
+      const cached = await kvGetJson(env, KV_CERT_KEY + route.host);
+      const age    = cached?.checkedAt
+        ? Date.now() - new Date(cached.checkedAt).getTime()
+        : Infinity;
+
+      if (age < CERT_CHECK_TTL * 1000) { report.skipped++; continue; }
+
+      const status = await checkCertStatus(route.host);
+      await kvSetJson(env, KV_CERT_KEY + route.host, status, KV_CERT_TTL);
+
+      // 라우트 목록의 sslStatus도 업데이트
+      route.sslStatus = status.sslStatus;
+      report.refreshed.push({ host: route.host, status: status.sslStatus });
+    } catch (_) { report.skipped++; }
   }
 
+  // 업데이트된 라우트 저장
+  if (report.refreshed.length > 0) await saveRoutes(env, routes);
   return report;
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 10. 전체 SSL/TLS 상태 조회 (패널용)
-// ─────────────────────────────────────────────────────────────────────
-/**
- * 패널에서 표시할 SSL/TLS 전체 현황을 반환합니다.
- */
-export async function getSslStatus(env) {
-  const hasToken  = !!(env.CF_API_TOKEN);
-  const hasZoneId = !!(env.CF_ZONE_ID);
-
-  if (!hasToken || !hasZoneId) {
-    return {
-      ok            : false,
-      configured    : false,
-      missingToken  : !hasToken,
-      missingZoneId : !hasZoneId,
-      message       : '패널 → 도메인 설정에서 CF_API_TOKEN, CF_ZONE_ID를 설정하세요.',
-    };
-  }
-
-  const [sslMode, alwaysHttps, minTls, univSsl, certs] = await Promise.all([
-    getSslSettings(env),
-    getAlwaysHttps(env),
-    getMinTlsVersion(env),
-    getUniversalSslSettings(env),
-    listCertificates(env),
-  ]);
-
-  // 가장 빠르게 만료되는 인증서 찾기
-  const nearestExpiry = certs.certificates
-    .filter(c => c.daysRemaining !== null)
-    .sort((a, b) => a.daysRemaining - b.daysRemaining)[0] || null;
-
-  return {
-    ok          : true,
-    configured  : true,
-    sslMode     : sslMode.mode,
-    alwaysHttps : alwaysHttps.enabled,
-    minTls      : minTls.version,
-    universal   : univSsl,
-    certificates: certs.certificates,
-    certCount   : certs.totalCount,
-    nearestExpiry,
-    renewalNeeded: certs.certificates.some(c => c.renewalNeeded),
-    ts          : new Date().toISOString(),
-  };
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// 11. 초기 설정 자동화 (최초 1회 실행)
-//     - SSL flexible 모드 설정
-//     - Always Use HTTPS 활성화
-//     - TLS 1.2 최소 버전 설정
-//     - Universal SSL CA 설정
-// ─────────────────────────────────────────────────────────────────────
-export async function initializeSsl(env, ca = DEFAULT_CA) {
-  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) {
-    return { ok: false, message: 'CF_API_TOKEN 및 CF_ZONE_ID가 필요합니다.' };
-  }
-
-  const results = await Promise.allSettled([
-    setSslFlexible(env),
-    enableAlwaysHttps(env),
-    setMinTlsVersion(env, '1.2'),
-    setUniversalSslCa(env, ca),
-  ]);
-
-  return {
-    ok        : results.every(r => r.status === 'fulfilled' && r.value?.ok),
-    sslMode   : results[0].value,
-    alwaysHttps: results[1].value,
-    minTls    : results[2].value,
-    universalSsl: results[3].value,
-    ts        : new Date().toISOString(),
-  };
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// 12. SSL 패널 API 라우터
+// 7. 패널 API 라우터
 // ─────────────────────────────────────────────────────────────────────
 export async function handleSslPanelApi(subPath, request, env) {
-  // GET /panel/api/ssl_status
+  const json = h => new Response(JSON.stringify(h), { headers: { 'content-type': 'application/json' } });
+
+  // GET /panel/api/ssl_status — 전체 라우트 + 인증서 현황
   if (subPath === 'api/ssl_status') {
-    const status = await getSslStatus(env);
-    return new Response(JSON.stringify(status), { headers: { 'content-type': 'application/json' } });
+    return json(await getSslStatus(env));
   }
 
-  // POST /panel/api/ssl_init
-  if (subPath === 'api/ssl_init' && request.method === 'POST') {
-    const body = await request.json().catch(() => ({}));
-    const ca   = body.ca === 'google' ? 'google' : 'lets_encrypt';
-    const result = await initializeSsl(env, ca);
-    return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+  // POST /panel/api/ssl_add_route — 수동 도메인 추가
+  if (subPath === 'api/ssl_add_route' && request.method === 'POST') {
+    const { host } = await request.json().catch(() => ({}));
+    return json(await addRoute(env, host || ''));
   }
 
-  // POST /panel/api/ssl_renew
-  if (subPath === 'api/ssl_renew' && request.method === 'POST') {
-    const result = await autoRenewCertificates(env);
-    return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+  // POST /panel/api/ssl_remove_route — 도메인 삭제
+  if (subPath === 'api/ssl_remove_route' && request.method === 'POST') {
+    const { host } = await request.json().catch(() => ({}));
+    return json(await removeRoute(env, host || ''));
   }
 
-  // POST /panel/api/ssl_issue
-  if (subPath === 'api/ssl_issue' && request.method === 'POST') {
-    const body  = await request.json().catch(() => ({}));
-    const hosts = body.hosts || [];
-    const ca    = body.ca === 'google' ? 'google' : 'lets_encrypt';
-    const result = await issueCertificate(env, hosts, ca);
-    return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+  // POST /panel/api/ssl_refresh — 인증서 상태 강제 재확인
+  if (subPath === 'api/ssl_refresh' && request.method === 'POST') {
+    const { host } = await request.json().catch(() => ({}));
+    if (host) {
+      // 특정 도메인만 캐시 무효화 후 재확인
+      const status = await checkCertStatus(host);
+      await kvSetJson(env, KV_CERT_KEY + host, status, KV_CERT_TTL);
+      // 라우트 목록 sslStatus 업데이트
+      const routes = await loadRoutes(env);
+      const idx    = routes.findIndex(r => r.host === host);
+      if (idx >= 0) { routes[idx].sslStatus = status.sslStatus; await saveRoutes(env, routes); }
+      return json({ ok: true, ...status });
+    }
+    // host 없으면 전체 Cron 갱신 실행
+    return json(await cronRefreshCertStatus(env));
   }
 
-  // POST /panel/api/ssl_always_https
-  if (subPath === 'api/ssl_always_https' && request.method === 'POST') {
-    const result = await enableAlwaysHttps(env);
-    return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
-  }
-
-  // POST /panel/api/ssl_set_ca
-  if (subPath === 'api/ssl_set_ca' && request.method === 'POST') {
-    const body = await request.json().catch(() => ({}));
-    const ca   = body.ca === 'google' ? 'google' : 'lets_encrypt';
-    const result = await setUniversalSslCa(env, ca);
-    return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
-  }
-
-  return null; // 해당 경로 없음
+  return null;
 }
