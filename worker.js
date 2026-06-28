@@ -54,6 +54,12 @@ export { MyDurableObject } from './src/redis-do.js';
 // 신규 모듈 import
 import { applyAllSeoFeatures, pingIndexNow, pingSearchEngines,
          buildServerTimingHeader, buildSecurityHeaders, buildImageSitemapXml } from './src/seo-features.js';
+import {
+  enforceHttpsRedirect,
+  handleSslPanelApi,
+  autoRenewCertificates,
+  getSslStatus,
+} from './src/ssl.js';
 import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
 import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
 
@@ -101,6 +107,10 @@ async function handleFetch(request, env, ctx) {
   // ── 실제 개인도메인 자동 감지 + 저장 (Cron이 수동 설정 없이 꺼내 씀) ──
   // 첫 요청 때만 비동기로 저장하여 Cron, 사이트맵/RSS 생성에 자동 활용
   ctx.waitUntil(autoDetectAndSaveSiteInfo(request, env, host, url).catch(() => {}));
+
+  // ── HTTP → HTTPS 강제 리디렉션 (항상 최우선) ──────────────────────
+  const httpsRedirect = enforceHttpsRedirect(request);
+  if (httpsRedirect) return httpsRedirect;
 
   // ── IP 차단 체크 ──────────────────────────────────────────────────
   const clientIp = request.headers.get('cf-connecting-ip') ||
@@ -485,6 +495,10 @@ async function runScheduledHourly(env) {
   if (base) {
     await pingSearchEngines(base + '/sitemap.xml').catch(() => {});
   }
+  // ── SSL/TLS 인증서 자동 갱신 (만료 30일 전 자동 처리) ──────────────
+  if (env.CF_API_TOKEN && env.CF_ZONE_ID) {
+    await autoRenewCertificates(env).catch(() => {});
+  }
 }
 
 // 캐시 초기화 타임스탬프 기록 (관리 패널 표시용)
@@ -808,6 +822,10 @@ async function handlePanel(request, url, env, ctx) {
     const result = await generateRss(env, base, title);
     return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
   }
+
+  // SSL/TLS 관리 API
+  const sslApiResp = await handleSslPanelApi(subPath, request, env);
+  if (sslApiResp) return sslApiResp;
 
   // K8s 클러스터 상태
   if (subPath === 'api/k8s_status') {
@@ -1175,6 +1193,7 @@ tr:hover td{background:#334155}
   <div class="nav-item" onclick="showSection('security')">🛡️ 보안/IP 관리</div>
   <div class="nav-item" onclick="showSection('sitemap')">🗺️ 사이트맵/RSS</div>
   <div class="nav-item" onclick="showSection('domain')">🌍 도메인 설정</div>
+  <div class="nav-item" onclick="showSection('ssl')">🔒 SSL/TLS 인증서</div>
   <div class="nav-item" onclick="showSection('k8s')">☸️ 컨테이너/K8s</div>
   <div class="nav-item" onclick="showSection('cachepolicy')">⏱️ 캐시 TTL 정책</div>
 </div>
@@ -1350,6 +1369,123 @@ tr:hover td{background:#334155}
     </div>
   </div>
 
+  <!-- SSL/TLS 인증서 관리 -->
+  <div id="s-ssl" style="display:none">
+    <h2>🔒 SSL/TLS 인증서 관리</h2>
+    <!-- 요약 카드 -->
+    <div class="grid" id="ssl-summary-cards">
+      <div class="card">
+        <div class="card-title">SSL 모드</div>
+        <div class="card-value" id="ssl-mode">-</div>
+        <div class="card-sub">Flexible (Blogger 최적)</div>
+      </div>
+      <div class="card">
+        <div class="card-title">HTTPS 강제</div>
+        <div class="card-value" id="ssl-always-https">-</div>
+        <div class="card-sub">Always Use HTTPS</div>
+      </div>
+      <div class="card">
+        <div class="card-title">최소 TLS 버전</div>
+        <div class="card-value" id="ssl-min-tls">-</div>
+        <div class="card-sub">TLS 1.2 이상 권장</div>
+      </div>
+      <div class="card">
+        <div class="card-title">인증서 수</div>
+        <div class="card-value" id="ssl-cert-count">-</div>
+        <div class="card-sub">발급된 인증서 총 수</div>
+      </div>
+    </div>
+
+    <!-- Universal SSL 상태 -->
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-title" style="margin-bottom:10px">🏛️ Universal SSL 설정</div>
+      <div id="ssl-universal-info" style="color:#94a3b8;font-size:13px;line-height:2">로딩 중...</div>
+      <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="setSslCa('lets_encrypt')">
+          Let's Encrypt로 설정
+        </button>
+        <button class="btn btn-primary btn-sm" onclick="setSslCa('google')" style="background:#1d4ed8">
+          Google Trust Services로 설정
+        </button>
+      </div>
+    </div>
+
+    <!-- 인증서 목록 -->
+    <div class="section">
+      <h2 style="font-size:16px;margin-bottom:12px">📋 발급된 인증서 목록</h2>
+      <div id="ssl-no-certs" style="display:none;color:#64748b;font-size:13px;margin-bottom:16px">
+        발급된 Advanced 인증서가 없습니다. 아래에서 새 인증서를 발급하세요.
+      </div>
+      <div class="table-wrap" id="ssl-cert-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>도메인</th>
+              <th>인증 기관</th>
+              <th>상태</th>
+              <th>발급일</th>
+              <th>만료일</th>
+              <th>남은 일수</th>
+            </tr>
+          </thead>
+          <tbody id="ssl-cert-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 새 인증서 발급 -->
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-title" style="margin-bottom:12px">➕ 새 인증서 발급 (Advanced Certificate)</div>
+      <div style="color:#94a3b8;font-size:12px;margin-bottom:12px;line-height:1.8">
+        블로그스팟 커스텀 도메인에 대해 Let's Encrypt 또는 Google Trust Services 인증서를 발급합니다.<br>
+        발급 후 Cloudflare가 자동으로 도메인 소유권을 검증합니다 (DNS TXT 방식).
+      </div>
+      <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+        <input class="ip-input" id="ssl-issue-domain" placeholder="example.com, www.example.com" style="width:280px">
+        <select id="ssl-issue-ca" style="background:#0f172a;border:1px solid #475569;border-radius:8px;color:#f8fafc;padding:8px 12px;font-size:13px">
+          <option value="lets_encrypt">Let's Encrypt</option>
+          <option value="google">Google Trust Services</option>
+        </select>
+      </div>
+      <button class="btn btn-primary" onclick="issueCert()">🔐 인증서 발급 요청</button>
+    </div>
+
+    <!-- 자동 초기화 / 수동 액션 -->
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-title" style="margin-bottom:10px">⚡ 자동화 액션</div>
+      <div style="color:#94a3b8;font-size:12px;margin-bottom:14px;line-height:1.8">
+        <strong>초기 설정</strong>: SSL Flexible 모드 + HTTPS 강제 + TLS 1.2 + Universal SSL CA를 한 번에 설정합니다.<br>
+        <strong>자동 갱신</strong>: 만료 30일 전 인증서를 자동으로 갱신합니다. (Cron: 매 1시간 자동 실행)
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="sslInit('lets_encrypt')">🚀 초기 설정 (Let's Encrypt)</button>
+        <button class="btn btn-primary" onclick="sslInit('google')" style="background:#1d4ed8">🚀 초기 설정 (Google Trust)</button>
+        <button class="btn btn-primary" onclick="sslRenew()" style="background:#0d9488">🔄 지금 갱신 확인</button>
+        <button class="btn btn-primary" onclick="enableAlwaysHttps()" style="background:#7c3aed">🔒 HTTPS 강제 활성화</button>
+      </div>
+    </div>
+
+    <!-- 블로그스팟 안내 -->
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-title" style="margin-bottom:10px">ℹ️ 블로그스팟 SSL 설정 안내</div>
+      <div style="color:#94a3b8;font-size:13px;line-height:2">
+        ✅ <strong>블로그스팟에서 별도 SSL 설정 불필요</strong> — Cloudflare Worker가 앞단에서 HTTPS를 처리합니다.<br>
+        ✅ 방문자 ↔ Cloudflare: <strong>HTTPS (TLS 1.2+)</strong> — 완전한 암호화<br>
+        ✅ Cloudflare ↔ 블로그스팟 원본: <strong>HTTP (ghs.google.com)</strong> — 내부 구간 (Flexible 모드)<br>
+        ✅ HTTP 접속 시 → <strong>301 HTTPS 자동 리디렉션</strong> (Worker 레벨에서 즉시 처리)<br>
+        ✅ 인증서 만료 30일 전 <strong>자동 갱신</strong> (Cron 매 1시간 실행)<br>
+        ✅ Let's Encrypt 또는 Google Trust Services 중 선택 가능<br><br>
+        📌 필수 설정 (wrangler secret put으로 등록):<br>
+        <code style="background:#0f172a;padding:2px 8px;border-radius:4px">CF_API_TOKEN</code> — Cloudflare API 토큰 (Zone:SSL and Certificates:Edit 권한)<br>
+        <code style="background:#0f172a;padding:2px 8px;border-radius:4px">CF_ZONE_ID</code> — wrangler.toml에 입력 가능
+      </div>
+    </div>
+
+    <div class="flex">
+      <button class="btn btn-primary" onclick="loadSslStatus()">🔄 새로고침</button>
+    </div>
+  </div>
+
   <!-- K8s / 컨테이너 관리 -->
   <div id="s-k8s" style="display:none">
     <h2>☸️ 자체 K8s 오케스트레이션</h2>
@@ -1426,6 +1562,7 @@ function showSection(name){
   else if(name==='analytics') loadAnalytics();
   else if(name==='security') loadIps();
   else if(name==='domain') loadDomainInfo();
+  else if(name==='ssl') loadSslStatus();
   else if(name==='k8s') loadK8s();
   else if(name==='cachepolicy') loadCachePolicyInfo();
 }
@@ -1562,6 +1699,114 @@ async function genSitemap(){
 async function genRss(){
   const r=await api('api/generate_rss');
   toast('RSS 생성 완료 ('+r.count+'개 항목)');
+}
+
+// ── SSL/TLS 관리 함수 ──────────────────────────────────────────────
+async function loadSslStatus() {
+  const d = await api('api/ssl_status');
+
+  if (!d.configured) {
+    document.getElementById('ssl-mode').innerHTML = '<span class="badge badge-red">미설정</span>';
+    document.getElementById('ssl-always-https').innerHTML = '<span class="badge badge-yellow">-</span>';
+    document.getElementById('ssl-min-tls').textContent = '-';
+    document.getElementById('ssl-cert-count').textContent = '0';
+    document.getElementById('ssl-universal-info').innerHTML =
+      \`<span style="color:#f87171">⚠️ \${d.message || 'CF_API_TOKEN 및 CF_ZONE_ID를 설정하세요.'}</span>\`;
+    return;
+  }
+
+  // 요약 카드
+  const modeColor = d.sslMode === 'flexible' || d.sslMode === 'full' ? 'badge-green' : 'badge-yellow';
+  document.getElementById('ssl-mode').innerHTML = \`<span class="badge \${modeColor}">\${d.sslMode || '-'}</span>\`;
+  document.getElementById('ssl-always-https').innerHTML = d.alwaysHttps
+    ? '<span class="badge badge-green">✅ 활성화</span>'
+    : '<span class="badge badge-red">❌ 비활성</span>';
+  document.getElementById('ssl-min-tls').textContent = d.minTls ? 'TLS ' + d.minTls : '-';
+  document.getElementById('ssl-cert-count').textContent = d.certCount ?? 0;
+
+  // Universal SSL
+  const u = d.universal || {};
+  document.getElementById('ssl-universal-info').innerHTML = [
+    \`🔑 Universal SSL: <strong>\${u.enabled ? '✅ 활성화' : '❌ 비활성'}</strong>\`,
+    \`🏛️ 현재 CA: <strong>\${u.caLabel || u.ca || '-'}</strong>\`,
+    d.nearestExpiry
+      ? \`⏰ 가장 빠른 만료: <strong>\${d.nearestExpiry.daysRemaining}일 남음</strong>\${d.nearestExpiry.renewalNeeded ? ' <span class="badge badge-red">갱신 필요</span>' : ''}\`
+      : '⏰ 만료 정보 없음',
+  ].join('<br>');
+
+  // 인증서 테이블
+  const certs = d.certificates || [];
+  const tb = document.getElementById('ssl-cert-tbody');
+  if (certs.length === 0) {
+    document.getElementById('ssl-no-certs').style.display = '';
+    tb.innerHTML = '';
+  } else {
+    document.getElementById('ssl-no-certs').style.display = 'none';
+    tb.innerHTML = certs.map(c => {
+      const statusClass = c.status === 'active' ? 'badge-green' : c.status === 'pending_validation' ? 'badge-yellow' : 'badge-red';
+      const daysClass   = c.daysRemaining <= 30 ? 'badge-red' : c.daysRemaining <= 60 ? 'badge-yellow' : 'badge-green';
+      const hosts       = (c.hosts || []).join(', ') || '-';
+      return \`<tr>
+        <td style="font-size:12px">\${hosts}</td>
+        <td>\${c.ca === 'google' ? 'Google Trust' : "Let's Encrypt"}</td>
+        <td><span class="badge \${statusClass}">\${c.status || '-'}</span></td>
+        <td style="font-size:11px">\${c.issuedOn ? new Date(c.issuedOn).toLocaleDateString('ko-KR') : '-'}</td>
+        <td style="font-size:11px">\${c.expiresOn ? new Date(c.expiresOn).toLocaleDateString('ko-KR') : '-'}</td>
+        <td>\${c.daysRemaining != null ? \`<span class="badge \${daysClass}">\${c.daysRemaining}일</span>\` : '-'}</td>
+      </tr>\`;
+    }).join('');
+  }
+}
+
+async function sslInit(ca) {
+  const label = ca === 'google' ? 'Google Trust Services' : "Let's Encrypt";
+  if (!confirm(\`SSL 초기 설정을 실행합니다.\\n· SSL Flexible 모드\\n· HTTPS 강제 (Always Use HTTPS)\\n· TLS 1.2 최소 버전\\n· Universal SSL CA: \${label}\\n\\n계속하시겠습니까?\`)) return;
+  const r = await fetch('/panel/api/ssl_init?secret='+encodeURIComponent(SECRET), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ ca }),
+  }).then(r=>r.json());
+  toast(r.ok ? 'SSL 초기 설정 완료!' : '일부 설정 실패: ' + JSON.stringify(r));
+  loadSslStatus();
+}
+
+async function sslRenew() {
+  toast('인증서 갱신 확인 중...');
+  const r = await fetch('/panel/api/ssl_renew?secret='+encodeURIComponent(SECRET), {method:'POST'}).then(r=>r.json());
+  const msg = r.renewed && r.renewed.length > 0
+    ? \`\${r.renewed.length}개 인증서 갱신 완료\`
+    : r.checked > 0 ? \`\${r.checked}개 인증서 확인 — 갱신 불필요\` : '갱신할 인증서 없음';
+  toast(msg);
+  loadSslStatus();
+}
+
+async function issueCert() {
+  const raw  = document.getElementById('ssl-issue-domain').value.trim();
+  const ca   = document.getElementById('ssl-issue-ca').value;
+  const hosts = raw.split(',').map(h=>h.trim()).filter(Boolean);
+  if (!hosts.length) { toast('도메인을 입력하세요'); return; }
+  toast('인증서 발급 요청 중...');
+  const r = await fetch('/panel/api/ssl_issue?secret='+encodeURIComponent(SECRET), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ hosts, ca }),
+  }).then(r=>r.json());
+  toast(r.ok ? r.message : '발급 실패: ' + r.message);
+  loadSslStatus();
+}
+
+async function setSslCa(ca) {
+  const label = ca === 'google' ? 'Google Trust Services' : "Let's Encrypt";
+  const r = await fetch('/panel/api/ssl_set_ca?secret='+encodeURIComponent(SECRET), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ ca }),
+  }).then(r=>r.json());
+  toast(r.ok ? \`CA를 \${label}로 변경했습니다\` : '변경 실패: ' + r.message);
+  loadSslStatus();
+}
+
+async function enableAlwaysHttps() {
+  const r = await fetch('/panel/api/ssl_always_https?secret='+encodeURIComponent(SECRET), {method:'POST'}).then(r=>r.json());
+  toast(r.ok ? 'HTTPS 강제 활성화 완료!' : '실패: ' + r.message);
+  loadSslStatus();
 }
 
 // 초기 로드
