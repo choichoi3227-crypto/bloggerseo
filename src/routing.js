@@ -124,6 +124,20 @@ const BOT_PATTERNS = [
 ];
 const MOBILE_PATTERNS = [/mobile/i, /android/i, /iphone/i, /ipad/i, /tablet/i];
 
+// ── 페이지 타입별 TTL (요청사항: 포스트 1h, 페이지 4h, 홈 30분) ─────────
+const PAGE_TYPE_TTL = {
+  home  : 1800,   // 홈: 30분
+  post  : 3600,   // 포스트: 1시간
+  page  : 14400,  // 정적 페이지: 4시간
+  label : 3600,   // 카테고리/라벨: 1시간
+  search: 300,    // 검색: 5분
+  other : 1800,   // 기타: 30분
+};
+
+export function getPageTypeTtl(pageType) {
+  return PAGE_TYPE_TTL[pageType] || PAGE_TYPE_TTL.other;
+}
+
 export function priorityRoute(request) {
   const ua = request.headers.get('user-agent') || '';
   if (BOT_PATTERNS.some(p => p.test(ua))) {
@@ -131,6 +145,7 @@ export function priorityRoute(request) {
   }
   const isMobile = MOBILE_PATTERNS.some(p => p.test(ua));
   if (isMobile) {
+    // maxAge는 worker에서 pageType 확정 후 덮어씀
     return { tier: 2, label: 'mobile', maxAge: 3600, priority: 'high' };
   }
   const accept = request.headers.get('accept') || '';
