@@ -1,10 +1,10 @@
 /**
- * BloggerSEO v6 — 자체 Cache Reserve 엔진
+ * BloggerSEO v7 — 자체 Cache Reserve 엔진
  * ─────────────────────────────────────────────────────────────────────
  * 클라우드플레어 Cache Reserve 방식을 100% 자체 구현
  * - 만료 기간: 4시간 (14400초)
- * - 저장소: Upstash Redis (store.js kvSet/kvGet)
- * - 계층: L1(메모리 30초) → L2(Redis 4시간) → Origin
+ * - 저장소: store.js의 kvSet/kvGet (1순위 DO Redis → KV → Upstash → 메모리)
+ * - 계층: L1(메모리 30초) → L2(영속 스토리지 4시간) → Origin
  * - 전략: SWR(Stale-While-Revalidate) + Background revalidation
  * - 키: cache:{fnv1a(url+vary)} → { body, status, headers, ts, ttl, region }
  */
@@ -100,20 +100,38 @@ export async function cacheReservePut(env, request, response, options = {}) {
   return true;
 }
 
+// ── 배치 동시 처리 헬퍼 ───────────────────────────────────────────────
+// DO Redis는 키 1개 조회당 서브리퀘스트 1개를 소비하므로, 1000개 키를
+// 한 번에 동시 요청하면 Free 플랜의 invocation당 서브리퀘스트 한도를
+// 초과할 수 있다. BATCH_SIZE만큼 묶어서 순차적으로 동시 처리한다.
+const BATCH_SIZE = 25;
+
+async function mapBatched(items, fn) {
+  const results = [];
+  for (let i = 0; i < items.length; i += BATCH_SIZE) {
+    const batch = items.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(fn));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
 // ── Cache Reserve 정리 (만료된 항목) ─────────────────────────────────
 export async function cacheReservePurge(env, pattern = 'cache:*') {
   const keys = await kvScan(env, pattern, 500);
-  let purged = 0;
   const now = Date.now();
-  for (const k of keys) {
+  let purged = 0;
+
+  await mapBatched(keys, async (k) => {
     const entry = await kvGetJson(env, k);
-    if (!entry) continue;
+    if (!entry) return;
     const age = (now - entry.ts) / 1000;
     if (age > entry.ttl) {
       await kvDel(env, k);
       purged++;
     }
-  }
+  });
+
   return { purged };
 }
 
@@ -121,28 +139,47 @@ export async function cacheReservePurge(env, pattern = 'cache:*') {
 export async function cacheReserveInvalidate(env, url) {
   const keys = await kvScan(env, 'cache:*', 500);
   let invalidated = 0;
-  for (const k of keys) {
+
+  await mapBatched(keys, async (k) => {
     const entry = await kvGetJson(env, k);
     if (entry && entry.url && entry.url.includes(url)) {
       await kvDel(env, k);
       invalidated++;
     }
-  }
+  });
+
   return { invalidated };
 }
 
 // ── 캐시 통계 ────────────────────────────────────────────────────────
+// 키 개수가 많을 때 매 요청마다 전체를 다 훑으면 서브리퀘스트/CPU 비용이
+// 커지므로 STATS_SAMPLE_CAP까지만 표본 조회하고, 전체 키 개수는 SCAN
+// 결과(total)로만 보고한다 (alive/stale 비율은 표본 기준 추정치).
+const STATS_SAMPLE_CAP = 300;
+
 export async function cacheReserveStats(env) {
   const keys  = await kvScan(env, 'cache:*', 1000);
   const now   = Date.now();
-  let alive   = 0, stale = 0, total = keys.length;
+  const total = keys.length;
+  const sample = keys.slice(0, STATS_SAMPLE_CAP);
+  let alive = 0, stale = 0;
 
-  for (const k of keys) {
+  await mapBatched(sample, async (k) => {
     const entry = await kvGetJson(env, k);
-    if (!entry) continue;
+    if (!entry) return;
     const age = (now - entry.ts) / 1000;
     if (age < entry.ttl) alive++;
     else stale++;
+  });
+
+  // 표본 비율로 전체 추정 (표본 크기가 total과 같으면 정확한 값)
+  const sampled = alive + stale;
+  if (sampled > 0 && sample.length < total) {
+    const ratio = total / sampled;
+    return {
+      total, alive: Math.round(alive * ratio), stale: Math.round(stale * ratio),
+      ttlSec: RESERVE_TTL_SEC, estimated: true,
+    };
   }
-  return { total, alive, stale, ttlSec: RESERVE_TTL_SEC };
+  return { total, alive, stale, ttlSec: RESERVE_TTL_SEC, estimated: false };
 }
