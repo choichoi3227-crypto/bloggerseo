@@ -46,7 +46,7 @@ CACHE_RESERVE_TTL_SEC  = "14400"      # 4시간 = 14400초
 MAX_WORKER_INSTANCES   = "50"         # 로드밸런싱: 최대 워커 인스턴스
 ARGO_REGIONS           = "KR,JP,US,EU"
 PRIORITY_ROUTING_TIERS = "3"
-REDIS_SHARD_COUNT      = "999"         # 자체 Redis 샤드 수 (늘릴수록 총 용량 선형 증가)
+REDIS_SHARD_COUNT      = "100"         # 자체 Redis 샤드 수 (늘릴수록 총 용량 선형 증가)
 NAVER_SITE_VERIFY      = ""           # 네이버 서치어드바이저 인증키
 BING_SITE_VERIFY       = ""           # 빙 웹마스터 인증키
 GOOGLE_SITE_VERIFY     = ""           # 구글 서치콘솔 인증키
