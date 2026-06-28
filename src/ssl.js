@@ -247,6 +247,45 @@ export async function cronRefreshCertStatus(env) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 6-b. 라우트 기반 자동 도메인 감지 (API 없이, 설정 제로)
+// ─────────────────────────────────────────────────────────────────────
+/**
+ * KV에 저장된 라우트 목록(ssl:routes)에서 실제 사용 도메인을 자동 탐지한다.
+ *
+ * 우선순위:
+ *   1. 수동 addedBy:'manual' 항목 중 최신 것 (사용자가 명시 등록한 것 우선)
+ *   2. 자동 addedBy:'auto' 항목 중 가장 오래된 것 (첫 번째로 들어온 실서비스 도메인)
+ *
+ * 제외 조건 (isExcludedHost):
+ *   *.blogspot.com / *.workers.dev / *.pages.dev / localhost / 127.x / 192.168.x
+ *
+ * 반환: 감지된 hostname 문자열 | null
+ */
+export async function resolveHostFromRoutes(env) {
+  try {
+    const routes = await loadRoutes(env);
+    if (!routes.length) return null;
+
+    const valid = routes.filter(r => r.host && !isExcludedHost(r.host));
+    if (!valid.length) return null;
+
+    // 수동 등록 최우선
+    const manual = valid.filter(r => r.addedBy === 'manual');
+    if (manual.length) {
+      // 가장 최근에 수동 추가된 항목
+      manual.sort((a, b) => (b.addedAt || '').localeCompare(a.addedAt || ''));
+      return manual[0].host;
+    }
+
+    // 자동 감지 — 가장 오래된(첫 번째) 항목이 실제 서비스 도메인일 가능성 높음
+    valid.sort((a, b) => (a.addedAt || '').localeCompare(b.addedAt || ''));
+    return valid[0].host;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 7. 패널 API 라우터
 // ─────────────────────────────────────────────────────────────────────
 export async function handleSslPanelApi(subPath, request, env) {
