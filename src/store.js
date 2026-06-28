@@ -171,38 +171,75 @@ async function redisScan(env, pattern, count = 100) {
 //   2. 영속 계층(DO Redis / KV / Upstash)을 모두 "동시에" 호출해서
 //      가장 먼저 도착한 유효 값을 채택 (순차 대기 제거)
 //   3. 영속 계층이 전부 비어있거나 실패하면 L4 메모리로 최후 폴백
+// ── 데이터 최대 보유 기간 제한 (최대 1시간) ───────────────────────────
+const MAX_DATA_TTL_SEC = 3600; // 1시간 — DO 요청 폭증 방지 + 데이터 신선도 보장
+
+function clampTtl(ttlSec) {
+  if (!ttlSec || ttlSec <= 0) return MAX_DATA_TTL_SEC; // 무제한 → 1시간으로 캡
+  return Math.min(ttlSec, MAX_DATA_TTL_SEC);
+}
+
+// ── DO 호출 쓰로틀 (분당 요청 폭증 방지) ─────────────────────────────
+// DO는 고비용 바인딩이므로, 같은 키를 짧은 시간 안에 반복 조회할 때
+// L1 메모리로 막아서 DO RPC 횟수를 극적으로 줄인다.
+// 읽기 쓰로틀: L1 히트 시 DO 완전 건너뜀 (이미 위에서 처리)
+// 쓰기 쓰로틀: 같은 키에 대해 DO 쓰기를 5초에 1회로 제한
+const _doWriteThrottle = new Map(); // key → lastDoWriteTs
+const DO_WRITE_THROTTLE_MS = 5000; // 5초
+
+function shouldWriteToDo(key) {
+  const last = _doWriteThrottle.get(key) || 0;
+  const now  = Date.now();
+  if (now - last < DO_WRITE_THROTTLE_MS) return false;
+  _doWriteThrottle.set(key, now);
+  // 오래된 항목 정리 (메모리 누수 방지)
+  if (_doWriteThrottle.size > 5000) {
+    const cutoff = now - DO_WRITE_THROTTLE_MS * 10;
+    for (const [k, ts] of _doWriteThrottle) {
+      if (ts < cutoff) _doWriteThrottle.delete(k);
+    }
+  }
+  return true;
+}
+
+// ── 키 분류: slug/state 키는 DO 우선, cache 키는 KV 우선 ────────────
+// DO는 slug/state 등 쓰기 빈도가 낮고 일관성이 중요한 데이터에 집중
+// cache 키는 KV(글로벌 저지연)로 보내 DO 부하 최소화
+function preferKvFirst(key) {
+  return key.startsWith('cache:') || key.startsWith('schema:') ||
+         key.startsWith('sitemap:') || key.startsWith('rss:');
+}
+
 export async function kvGet(env, key) {
-  // 0순위: L1 메모리 (동기, 네트워크 호출 없음)
+  // L1 메모리 (동기, 0ms) — DO 호출 없이 즉시 반환
   const fromL1 = l1get(key);
   if (fromL1 !== undefined) return fromL1;
 
-  // 영속 계층 동시 호출 — 가장 먼저 "유효한 값"을 반환한 쪽을 즉시 채택한다.
-  // (단순 Promise.race는 먼저 끝난 게 null이어도 그대로 받아버리므로 부적합.
-  //  각 소스를 감싸서 "값이 있는 것만" resolve하고, 전부 실패/null이면
-  //  Promise.allSettled로 한 번 더 모아서 null 여부를 최종 확인한다.)
-  const sources = [
-    doRedisAvailable(env) ? doRedisGet(env, key).catch(() => null) : Promise.resolve(null),
-    kvNativeGet(env, key).catch(() => null),
-    redisGet(env, key).catch(() => null),
-  ];
+  // 키 유형에 따라 조회 순서 결정:
+  //   cache/schema/sitemap/rss → KV 먼저 (저지연 글로벌), DO 건너뜀
+  //   slug/state              → DO 먼저 (일관성 중요), KV 폴백
+  let value = null;
 
-  let resolved = false;
-  const firstValid = new Promise((resolve) => {
-    let remaining = sources.length;
-    for (const p of sources) {
-      p.then((v) => {
-        remaining--;
-        if (!resolved && v !== null && v !== undefined) {
-          resolved = true;
-          resolve(v);
-        } else if (remaining === 0 && !resolved) {
-          resolve(null); // 전부 끝났는데 유효 값이 하나도 없음
-        }
-      });
+  if (preferKvFirst(key)) {
+    // 1순위: KV
+    value = await kvNativeGet(env, key).catch(() => null);
+    // 2순위: Upstash (KV 미스 시만)
+    if (value === null) value = await redisGet(env, key).catch(() => null);
+    // 3순위: DO (최후 — 고비용이므로 마지막)
+    if (value === null && doRedisAvailable(env)) {
+      value = await doRedisGet(env, key).catch(() => null);
     }
-  });
+  } else {
+    // 1순위: DO Redis (slug/state 데이터 — 일관성 우선)
+    if (doRedisAvailable(env)) {
+      value = await doRedisGet(env, key).catch(() => null);
+    }
+    // 2순위: KV 폴백
+    if (value === null) value = await kvNativeGet(env, key).catch(() => null);
+    // 3순위: Upstash 폴백
+    if (value === null) value = await redisGet(env, key).catch(() => null);
+  }
 
-  const value = await firstValid;
   if (value !== null && value !== undefined) {
     l1set(key, value);
     l4set(key, value);
@@ -217,20 +254,38 @@ export async function kvGet(env, key) {
 }
 
 export async function kvSet(env, key, value, ttlSec = 0) {
-  // 모든 영속 계층에 동시 쓰기 — 일부 실패해도 나머지는 계속 진행
-  const writes = [
-    doRedisAvailable(env) ? doRedisSet(env, key, value, ttlSec) : Promise.resolve(false),
-    kvNativePut(env, key, value, ttlSec),
-    redisSet(env, key, value, ttlSec),
-  ];
-  const results = await Promise.allSettled(writes);
-  l1set(key, value, ttlSec > 0 ? Math.min(ttlSec * 1000, L1_TTL_MS) : L1_TTL_MS);
-  l4set(key, value, ttlSec);
+  // 최대 1시간으로 캡핑 (DO 데이터 보유 기간 제한 요청사항)
+  const effectiveTtl = clampTtl(ttlSec);
 
-  const doOk    = results[0].status === 'fulfilled' && results[0].value === true;
-  const kvOk    = results[1].status === 'fulfilled' && results[1].value === true;
-  const redisOk = results[2].status === 'fulfilled' && results[2].value !== null && results[2].value !== false;
-  return doOk || kvOk || redisOk; // 영속 계층 중 하나라도 성공하면 true
+  // 메모리 계층은 항상 즉시 갱신
+  l1set(key, value, Math.min(effectiveTtl * 1000, L1_TTL_MS));
+  l4set(key, value, effectiveTtl);
+
+  if (preferKvFirst(key)) {
+    // cache/schema 등: KV + Upstash 동시 쓰기, DO는 쓰로틀 적용
+    const writes = [
+      kvNativePut(env, key, value, effectiveTtl),
+      redisSet(env, key, value, effectiveTtl),
+    ];
+    // DO는 쓰로틀 통과 시에만 비동기 백그라운드 쓰기 (응답 블로킹 없음)
+    if (doRedisAvailable(env) && shouldWriteToDo(key)) {
+      writes.push(doRedisSet(env, key, value, effectiveTtl));
+    }
+    const results = await Promise.allSettled(writes);
+    return results.some(r => r.status === 'fulfilled' && r.value);
+  } else {
+    // slug/state: DO 우선 + KV 동시 (Upstash는 선택적 추가 백업)
+    const doWrite  = doRedisAvailable(env) && shouldWriteToDo(key)
+                      ? doRedisSet(env, key, value, effectiveTtl)
+                      : Promise.resolve(false);
+    const kvWrite  = kvNativePut(env, key, value, effectiveTtl);
+    const upWrite  = redisSet(env, key, value, effectiveTtl);
+    const results  = await Promise.allSettled([doWrite, kvWrite, upWrite]);
+    const doOk     = results[0].status === 'fulfilled' && results[0].value === true;
+    const kvOk     = results[1].status === 'fulfilled' && results[1].value === true;
+    const upOk     = results[2].status === 'fulfilled' && results[2].value !== null;
+    return doOk || kvOk || upOk;
+  }
 }
 
 export async function kvDel(env, key) {
