@@ -1,19 +1,19 @@
 /**
- * BloggerSEO Worker v6
+ * BloggerSEO Worker v7
  * ─────────────────────────────────────────────────────────────────────
- * 신규 기능:
- *   1. 자동 스키마 마크업 (Article/FAQ/Breadcrumb/Product) + AI FAQ 추출
+ * 신규/변경 기능:
+ *   1. 자동 스키마 마크업 (필수: Article/FAQ, 선택: Breadcrumb/Product) + AI FAQ 추출
  *   2. 자체 Argo Smart Routing (지역별 레이턴시 기반 최적 경로)
  *   3. 자체 Regional Tiered Cache (KR→JP→US→EU 계층)
  *   4. 모바일·데스크탑 환경 최적화 (Priority Routing 연동)
  *   5. 자체 Priority Routing (봇/모바일/데스크탑 티어)
  *   6. 구글·네이버·빙 상위노출 극대화
- *   7. 자체 실시간 상태 저장 엔진 (Upstash Redis, KV/D1 미사용)
+ *   7. 자체 실시간 상태 저장 엔진 (DO Redis 1순위, KV/Upstash 백업, D1 미사용)
  *   8. 자체 Cache Reserve (4시간 TTL, SWR 지원)
- *   9. Upstash Redis 기반 서버리스 NoSQL 스토리지
+ *   9. 100% 자체 제작 서버리스 Redis (Durable Objects, 64-way 샤딩 → 사실상 무제한 확장)
  *  10. Cron: 사이트맵(1h) + RSS(30m)
  *  11. 자체 로드밸런서 (inFlight 기반, Retry-After)
- *  12. 관리 패널 (/panel)
+ *  12. 관리 패널 (/panel) — Redis 클러스터 관리 탭 포함
  */
 
 import { wasmCore }           from './src/wasm-loader.js';
@@ -23,6 +23,7 @@ import {
   slugOriginGet, slugAliasGet, upsertSlug, purgeAllSlugs,
   isIpBlocked, blockIp, unblockIp, listBlockedIps,
   recordAnalytics, getAnalytics,
+  doRedisAvailable, doRedisClusterStats, doRedisFlushAll,
 } from './src/store.js';
 import {
   cacheReserveGet, cacheReservePut,
@@ -42,6 +43,12 @@ import {
   buildMetaDescription, extractFirstImage, extractSiteName, extractLogoUrl,
   extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform, retryAsync,
 } from './src/utils.js';
+
+// wrangler.toml의 durable_objects.bindings가 이 클래스를 찾으려면
+// main 파일(worker.js)에서 named export로 노출되어 있어야 한다.
+// 클래스 이름은 Cloudflare 대시보드에서 먼저 만든 네임스페이스(class_name)와 맞춰
+// MyDurableObject로 되어 있다 — 역할은 자체 제작 Redis 샤드(구 RedisShard)와 동일.
+export { MyDurableObject } from './src/redis-do.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
@@ -491,6 +498,11 @@ async function handlePanel(request, url, env, ctx) {
   if (subPath === 'api/regional_cache')  return new Response(JSON.stringify(await regionalCacheStats(env)), jsonHeaders());
   if (subPath === 'api/analytics')       return new Response(JSON.stringify(await getAnalytics(env, 200)), jsonHeaders());
   if (subPath === 'api/blocked_ips')     return new Response(JSON.stringify(await listBlockedIps(env)), jsonHeaders());
+  if (subPath === 'api/redis_stats')     return new Response(JSON.stringify(await doRedisClusterStats(env)), jsonHeaders());
+  if (subPath === 'api/redis_flush' && request.method === 'POST') {
+    const result = await doRedisFlushAll(env);
+    return new Response(JSON.stringify(result), jsonHeaders());
+  }
   if (subPath === 'api/purge_cache')     {
     const result = await cacheReservePurge(env);
     return new Response(JSON.stringify(result), jsonHeaders());
@@ -529,12 +541,13 @@ async function debugInfo(url, env) {
   const host = url.hostname;
   const cnameOk = cnameGet(host);
   const info = {
-    host, version: 'v6',
+    host, version: 'v7',
     workerId   : lbWorkerId(),
     load       : lbLoad(),
     cnameOk,
     features   : ['argo-routing','tiered-cache','priority-routing','cache-reserve-4h',
-                  'schema-markup','faq-ai','sitemap-cron','rss-cron','load-balancer','panel'],
+                  'schema-markup','faq-ai','sitemap-cron','rss-cron','load-balancer','panel',
+                  'redis-do' + (doRedisAvailable(env) ? ':active' : ':unavailable')],
   };
   return new Response(JSON.stringify(info, null, 2), { status: 200, ...jsonHeaders() });
 }
@@ -694,7 +707,7 @@ function stripInternalHeaders(resp, isStaticAsset) {
   try {
     const h = new Headers(resp.headers);
     ['cf-cache-status','cf-ray','nel','report-to','server'].forEach(k => h.delete(k));
-    h.set('x-powered-by', 'BloggerSEO-v6');
+    h.set('x-powered-by', 'BloggerSEO-v7');
     if (isStaticAsset && resp.ok) {
       const cc = h.get('cache-control') || '';
       if (!cc || /no-store|no-cache|max-age=0/i.test(cc)) {
@@ -730,7 +743,7 @@ function buildResponseHeaders(etag, cacheControl = 'no-store') {
   h.set('x-frame-options',        'SAMEORIGIN');
   h.set('referrer-policy',        'strict-origin-when-cross-origin');
   h.set('vary',                   'Accept-Encoding, Cookie');
-  h.set('x-powered-by',           'BloggerSEO-v6');
+  h.set('x-powered-by',           'BloggerSEO-v7');
   if (etag) h.set('etag', etag);
   return h;
 }
@@ -777,7 +790,7 @@ function panelHtml(secret) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BloggerSEO v6 — 관리 패널</title>
+<title>BloggerSEO v7 — 관리 패널</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
@@ -829,9 +842,10 @@ tr:hover td{background:#334155}
 </head>
 <body>
 <div class="sidebar">
-  <div class="logo">🚀 BloggerSEO v6</div>
+  <div class="logo">🚀 BloggerSEO v7</div>
   <div class="nav-item active" onclick="showSection('dashboard')">📊 대시보드</div>
   <div class="nav-item" onclick="showSection('cache')">💾 캐시 관리</div>
+  <div class="nav-item" onclick="showSection('redis')">🧬 Redis 관리</div>
   <div class="nav-item" onclick="showSection('routing')">🌐 라우팅 상태</div>
   <div class="nav-item" onclick="showSection('lb')">⚖️ 로드밸런서</div>
   <div class="nav-item" onclick="showSection('analytics')">📈 캐시 애널리틱스</div>
@@ -870,6 +884,34 @@ tr:hover td{background:#334155}
     <div class="flex">
       <button class="btn btn-primary" onclick="loadCacheStats()">🔄 새로고침</button>
       <button class="btn btn-danger" onclick="purgeCache()">🗑️ 캐시 전체 삭제</button>
+    </div>
+  </div>
+
+  <!-- Redis 관리 (100% 자체 제작, Durable Objects 기반) -->
+  <div id="s-redis" style="display:none">
+    <h2>🧬 자체 제작 서버리스 Redis 관리</h2>
+    <div class="grid">
+      <div class="card"><div class="card-title">상태</div><div class="card-value" id="r-available">-</div></div>
+      <div class="card"><div class="card-title">샤드 수</div><div class="card-value" id="r-shardcount">-</div></div>
+      <div class="card"><div class="card-title">총 키 개수</div><div class="card-value" id="r-totalkeys">-</div></div>
+      <div class="card"><div class="card-title">총 용량(추정)</div><div class="card-value" id="r-totalbytes">-</div></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">참고</div>
+      <div style="margin-top:8px;color:#94a3b8;font-size:13px;line-height:1.7">
+        Durable Objects(SQLite storage backend)로 100% 자체 구현한 Redis 호환 엔진입니다.
+        샤드(독립 DO 인스턴스)를 늘릴수록 총 용량이 선형으로 늘어나는 구조이며,
+        wrangler.toml의 <code>REDIS_SHARD_COUNT</code> 값으로 조절합니다.
+        KV/Upstash는 이 엔진이 죽었을 때만 사용되는 백업 계층입니다.
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th>샤드</th><th>키 개수</th><th>용량(bytes, 추정)</th></tr></thead>
+      <tbody id="redis-shard-table"></tbody></table>
+    </div>
+    <div class="flex" style="margin-top:16px">
+      <button class="btn btn-primary" onclick="loadRedis()">🔄 새로고침</button>
+      <button class="btn btn-danger" onclick="flushRedis()">🗑️ Redis 전체 비우기 (FLUSHALL)</button>
     </div>
   </div>
 
@@ -961,6 +1003,7 @@ tr:hover td{background:#334155}
 <script>
 const SECRET = '${secret}';
 const api = (path) => fetch('/panel/'+path+'?secret='+encodeURIComponent(SECRET)).then(r=>r.json());
+const apiPost = (path) => fetch('/panel/'+path+'?secret='+encodeURIComponent(SECRET), {method:'POST'}).then(r=>r.json());
 
 function toast(msg='완료'){
   const t=document.getElementById('toast');
@@ -975,6 +1018,7 @@ function showSection(name){
   event.target.classList.add('active');
   if(name==='dashboard') loadDashboard();
   else if(name==='cache') loadCacheStats();
+  else if(name==='redis') loadRedis();
   else if(name==='routing') loadRegional();
   else if(name==='lb') loadLb();
   else if(name==='analytics') loadAnalytics();
@@ -1003,6 +1047,28 @@ async function loadCacheStats(){
   document.getElementById('c-total').textContent=(c.total||0).toLocaleString();
   document.getElementById('c-alive').textContent=(c.alive||0).toLocaleString();
   document.getElementById('c-stale').textContent=(c.stale||0).toLocaleString();
+}
+
+async function loadRedis(){
+  const r=await api('api/redis_stats');
+  document.getElementById('r-available').innerHTML = r.available
+    ? '<span class="badge badge-green">활성</span>'
+    : '<span class="badge badge-red">미연동</span>';
+  document.getElementById('r-shardcount').textContent=r.shardCount||0;
+  document.getElementById('r-totalkeys').textContent=(r.totalKeys||0).toLocaleString();
+  const kb=(r.totalBytesApprox||0)/1024;
+  document.getElementById('r-totalbytes').textContent = kb>1024 ? (kb/1024).toFixed(2)+' MB' : kb.toFixed(1)+' KB';
+  const tb=document.getElementById('redis-shard-table');
+  tb.innerHTML=(r.shards||[]).filter(s=>s.keys>0).map(s=>\`<tr>
+    <td>#\${s.shard}</td><td>\${(s.keys||0).toLocaleString()}</td><td>\${(s.bytesApprox||0).toLocaleString()}</td>
+  </tr>\`).join('')||\`<tr><td colspan="3" style="color:#64748b;text-align:center">저장된 키 없음</td></tr>\`;
+}
+
+async function flushRedis(){
+  if(!confirm('자체 제작 Redis(DO)의 모든 키를 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.')) return;
+  await apiPost('api/redis_flush');
+  toast('Redis 전체 비우기 완료');
+  loadRedis();
 }
 
 async function loadRegional(){
