@@ -784,7 +784,7 @@ function stripInternalHeaders(resp, isStaticAsset) {
     if (isStaticAsset && resp.ok) {
       const cc = h.get('cache-control') || '';
       if (!cc || /no-store|no-cache|max-age=0/i.test(cc)) {
-        h.set('cache-control', 'public, max-age=86400, stale-while-revalidate=3600');
+        h.set('cache-control', 'public, max-age=1800, stale-while-revalidate=3600');
       }
       const vary = h.get('vary') || '';
       if (!/accept-encoding/i.test(vary)) h.set('vary', vary ? vary + ', Accept-Encoding' : 'Accept-Encoding');
