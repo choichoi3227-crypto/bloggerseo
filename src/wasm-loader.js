@@ -1,5 +1,5 @@
 /**
- * BloggerSEO v6 — WASM 로더 (v5 호환)
+ * BloggerSEO v7 — WASM 로더 (v5 호환)
  * wasmCore.generateSlug(title) → 한글 제목에서 SEO 슬러그 생성
  * wasmCore.warmup()            → WASM 사전 초기화
  *
