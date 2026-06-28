@@ -163,39 +163,53 @@ async function redisScan(env, pattern, count = 100) {
   return keys[1] || [];
 }
 
-// ── 통합 KV 연산: 1(DO Redis)→2(KV)→3(Upstash)→4(L1)→5(L4) 순차 읽기 / 전체 동시 쓰기 ──
+// ── 통합 KV 연산 ──────────────────────────────────────────────────────
+// [v7.1 변경] 기존에는 DO Redis→KV→Upstash를 순차로 await했는데, 이러면
+// 캐시 MISS(키가 어디에도 없음)일 때마다 최대 3단계 네트워크 왕복이
+// 직렬로 쌓여 레이턴시가 크게 늘어났다. 이제는:
+//   1. L1 메모리를 먼저 확인 (0ms, 동기) — 있으면 즉시 반환
+//   2. 영속 계층(DO Redis / KV / Upstash)을 모두 "동시에" 호출해서
+//      가장 먼저 도착한 유효 값을 채택 (순차 대기 제거)
+//   3. 영속 계층이 전부 비어있거나 실패하면 L4 메모리로 최후 폴백
 export async function kvGet(env, key) {
-  // 1순위: 자체 제작 DO Redis
-  if (doRedisAvailable(env)) {
-    const fromDo = await doRedisGet(env, key);
-    if (fromDo !== null && fromDo !== undefined) {
-      l1set(key, fromDo);
-      l4set(key, fromDo);
-      return fromDo;
-    }
-  }
-
-  // 2순위: SLUG_KV
-  const fromKv = await kvNativeGet(env, key);
-  if (fromKv !== null && fromKv !== undefined) {
-    l1set(key, fromKv);
-    l4set(key, fromKv);
-    return fromKv;
-  }
-
-  // 3순위: Upstash Redis (선택적 백업 — 바인딩 없으면 자동 스킵)
-  const fromRedis = await redisGet(env, key);
-  if (fromRedis !== null && fromRedis !== undefined) {
-    l1set(key, fromRedis);
-    l4set(key, fromRedis);
-    return fromRedis;
-  }
-
-  // 4순위: L1 메모리 (초고속, 30초 TTL)
+  // 0순위: L1 메모리 (동기, 네트워크 호출 없음)
   const fromL1 = l1get(key);
   if (fromL1 !== undefined) return fromL1;
 
-  // 5순위: L4 메모리 (최후 안전망)
+  // 영속 계층 동시 호출 — 가장 먼저 "유효한 값"을 반환한 쪽을 즉시 채택한다.
+  // (단순 Promise.race는 먼저 끝난 게 null이어도 그대로 받아버리므로 부적합.
+  //  각 소스를 감싸서 "값이 있는 것만" resolve하고, 전부 실패/null이면
+  //  Promise.allSettled로 한 번 더 모아서 null 여부를 최종 확인한다.)
+  const sources = [
+    doRedisAvailable(env) ? doRedisGet(env, key).catch(() => null) : Promise.resolve(null),
+    kvNativeGet(env, key).catch(() => null),
+    redisGet(env, key).catch(() => null),
+  ];
+
+  let resolved = false;
+  const firstValid = new Promise((resolve) => {
+    let remaining = sources.length;
+    for (const p of sources) {
+      p.then((v) => {
+        remaining--;
+        if (!resolved && v !== null && v !== undefined) {
+          resolved = true;
+          resolve(v);
+        } else if (remaining === 0 && !resolved) {
+          resolve(null); // 전부 끝났는데 유효 값이 하나도 없음
+        }
+      });
+    }
+  });
+
+  const value = await firstValid;
+  if (value !== null && value !== undefined) {
+    l1set(key, value);
+    l4set(key, value);
+    return value;
+  }
+
+  // 최후 폴백: L4 메모리
   const fromL4 = l4get(key);
   if (fromL4 !== undefined) return fromL4;
 
