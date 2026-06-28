@@ -59,12 +59,72 @@ import {
   autoRegisterRoute,
   handleSslPanelApi,
   cronRefreshCertStatus,
+  resolveHostFromRoutes,
 } from './src/ssl.js';
 import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
 import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
+
+// ─────────────────────────────────────────────
+// K8s 클러스터 부트스트랩 (모듈 로드 시 1회 실행)
+// Workers는 V8 Isolate당 모듈을 한 번만 평가하므로
+// 여기서 만든 Namespace/Deployment/Service는 인스턴스가 살아있는 동안 유지된다.
+// ─────────────────────────────────────────────
+(function bootstrapK8s() {
+  try {
+    // ── 이미지 빌드 & 레지스트리 등록 ────────────────────────────────
+    // ContainerLifecycle.run()이 호출되기 전에 레지스트리에 이미지가 있어야 함
+    new ImageBuilder('bloggerseo/worker', 'v7')
+      .env('ROLE', 'worker')
+      .env('VERSION', 'v7')
+      .expose(443)
+      .healthCheck('/__debug')
+      .build();
+
+    new ImageBuilder('bloggerseo/crawler', 'v1')
+      .env('ROLE', 'seo-crawler')
+      .expose(8080)
+      .healthCheck('/health')
+      .build();
+
+    // ── 네임스페이스 ────────────────────────────────────────────────
+    Cluster.createNamespace('default', { maxContainers: 20, maxCpuMs: 10000, maxMemKb: 40960 });
+    Cluster.createNamespace('seo',     { maxContainers: 10, maxCpuMs: 5000,  maxMemKb: 20480 });
+
+    // ── Deployment (이미지 문자열은 레지스트리에 등록된 'name:tag') ──
+    Cluster.createDeployment({
+      name     : 'bloggerseo-worker',
+      namespace: 'default',
+      replicas : 3,
+      image    : 'bloggerseo/worker:v7',
+      resources: { cpuMs: 50, memKb: 512 },
+      healthCheck: { path: '/__debug', intervalMs: 30000 },
+    });
+
+    Cluster.createDeployment({
+      name     : 'seo-crawler',
+      namespace: 'seo',
+      replicas : 1,
+      image    : 'bloggerseo/crawler:v1',
+      resources: { cpuMs: 100, memKb: 1024 },
+      healthCheck: { path: '/health', intervalMs: 60000 },
+    });
+
+    // ── 서비스 (로드밸런서 추상화) ───────────────────────────────────
+    Cluster.createService({ name: 'bloggerseo-svc', namespace: 'default',
+      selector: { app: 'bloggerseo-worker' }, port: 443, protocol: 'HTTPS' });
+    Cluster.createService({ name: 'crawler-svc', namespace: 'seo',
+      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP' });
+
+    EventBus.emit('cluster-bootstrap', { ts: Date.now(), status: 'ok',
+      images: 2, namespaces: 2, deployments: 2, services: 2 });
+  } catch (e) {
+    // 부트스트랩 실패는 워커 동작에 영향 없음
+    try { EventBus.emit('cluster-bootstrap-error', { error: String(e?.message ?? e) }); } catch (_) {}
+  }
+})();
 
 // ─────────────────────────────────────────────
 // 메인 핸들러
@@ -75,6 +135,8 @@ export default {
     ctx.waitUntil(wasmCore.warmup().catch(() => {}));
     // 로드밸런서 heartbeat (비동기)
     ctx.waitUntil(lbHeartbeat(env).catch(() => {}));
+    // K8s 상태 reconcile (비동기 — 블로킹 없음)
+    ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
     try {
       return await handleFetch(request, env, ctx);
     } catch (e) {
@@ -92,6 +154,8 @@ export default {
     } else {
       ctx.waitUntil(runScheduledHourly(env).catch(() => {}));
     }
+    // K8s Reconcile — Cron마다 원하는 상태(desired state) 조정
+    ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
   },
 };
 
@@ -368,9 +432,11 @@ async function transformHtml(html, ctx, url, env, pRoute) {
   // ── 추가 SEO 기능 20+ (목차/읽기시간 제외) ──────────────────────
   // env 대신 autoEnv를 넘겨 자동감지 host/title이 함수 내부에서 사용되도록
   try {
-    // 메모리 캐시된 자동감지 host를 env에 임시 주입 (SITE_BASE_URL 미설정 시)
+    // ①환경변수 ②라우트(자동탐지) ③메모리캐시 순으로 resolvedBase 결정
+    // resolveSiteBase()는 메모리 캐시를 통해 라우트 기반 감지값도 반환함
+    const resolvedBase = resolveSiteBase(env);
     const autoEnv = (!env.SITE_BASE_URL || env.SITE_BASE_URL === '' || env.SITE_BASE_URL === 'https://example.com')
-      ? { ...env, SITE_BASE_URL: _detectedHost ? 'https://' + _detectedHost : undefined }
+      ? { ...env, SITE_BASE_URL: resolvedBase || undefined }
       : env;
     o = safeTransform(o, h => applyAllSeoFeatures(h, ctx, url, autoEnv));
   } catch (_) {}
@@ -574,56 +640,63 @@ async function autoDetectAndSaveSiteInfo(request, env, host, url) {
   // 환경변수가 이미 명시 설정됐으면 스킵 (수동 > 자동)
   if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com' && env.SITE_BASE_URL !== '') return;
 
-  // ── 사이트 제목 자동 추출 (SITE_TITLE 미설정 시) ──────────────────
-  // 페이지 응답의 <title>을 파싱해서 자동 저장. 비용이 크므로 24h에 1회만 실행
+  // ── ① 라우트 목록(ssl:routes) 우선 탐지 — API 없이 설정 제로 ────────
+  // autoRegisterRoute()가 매 요청마다 host를 ssl:routes 에 자동 저장하므로
+  // state:site_host 에 중복 저장하지 않고 라우트에서 꺼내 쓴다.
+  try {
+    const routeHost = await resolveHostFromRoutes(env);
+    if (routeHost) {
+      _detectedHost   = routeHost;
+      _detectedHostTs = Date.now();
+      // 라우트엔 사이트 제목이 없으므로 별도 추출
+      await saveTitleIfNeeded(env, url).catch(() => {});
+      return;
+    }
+  } catch (_) {}
+
+  // ── ② 라우트에 없으면 기존 KV 저장 방식 유지 (최초 요청 시 폴백) ───
   const saveHost = async () => {
     const { kvGet, kvSet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null, kvSet: async () => {} }));
     const existing = await kvGet(env, 'state:site_host');
     if (existing === host) {
-      // 이미 저장된 값과 동일 → 메모리 캐시만 갱신
       _detectedHost   = host;
       _detectedHostTs = Date.now();
       return;
     }
-    // 새 host 저장 (TTL: 24시간)
     await kvSet(env, 'state:site_host', host, 86400);
     _detectedHost   = host;
     _detectedHostTs = Date.now();
   };
 
-  // 사이트 제목 자동 추출 (24h 캐시)
-  const saveTitle = async () => {
-    if (env.SITE_TITLE && env.SITE_TITLE !== '') return; // 수동 설정 존중
-    const { kvGet, kvSet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null, kvSet: async () => {} }));
-    const existingTitle = await kvGet(env, 'state:site_title');
-    if (existingTitle) return; // 이미 저장됨
+  await Promise.all([saveHost(), saveTitleIfNeeded(env, url).catch(() => {})]);
+}
 
-    // 홈페이지에서만 제목 추출 (포스트 페이지 등에선 하지 않음)
-    if (url.pathname !== '/' && url.pathname !== '') return;
-
-    try {
-      const resp = await fetch(url.origin + '/', {
-        headers: { 'user-agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' },
-        cf: { cacheTtl: 0, cacheEverything: false },
-      });
-      if (!resp.ok) return;
-      const html  = await resp.text();
-      // <title>텍스트</title> 추출
-      const m = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
-      if (m && m[1]) {
-        const title = m[1].trim()
-          .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#?\w+;/g,'');
-        if (title) await kvSet(env, 'state:site_title', title, 86400);
-      }
-    } catch (_) {}
-  };
-
-  await Promise.all([saveHost(), saveTitle()]);
+// 사이트 제목 자동 추출 헬퍼 (24h 캐시, 홈 요청 시에만)
+async function saveTitleIfNeeded(env, url) {
+  if (env.SITE_TITLE && env.SITE_TITLE !== '') return;
+  const { kvGet, kvSet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null, kvSet: async () => {} }));
+  const existingTitle = await kvGet(env, 'state:site_title');
+  if (existingTitle) return;
+  if (url.pathname !== '/' && url.pathname !== '') return;
+  try {
+    const resp = await fetch(url.origin + '/', {
+      headers: { 'user-agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' },
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    if (!resp.ok) return;
+    const html = await resp.text();
+    const m = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
+    if (m && m[1]) {
+      const title = m[1].trim()
+        .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#?\w+;/g,'');
+      if (title) await kvSet(env, 'state:site_title', title, 86400);
+    }
+  } catch (_) {}
 }
 
 // 사이트 베이스 URL 결정
-// 우선순위: ①환경변수(명시) → ②KV 자동감지 host → ③빈 문자열
-// ②번이 자동화의 핵심: 수동 설정 없이도 실제 개인도메인이 자동으로 사용됨
+// 우선순위: ①환경변수(명시) → ②라우트 목록(자동, API 없이) → ③KV state:site_host → ④빈 문자열
+// ②번이 핵심: ssl:routes KV에 자동 저장된 라우트 목록에서 실제 도메인을 API 없이 탐지
 async function resolveSiteBaseAsync(env) {
   // ① 환경변수 명시 설정 최우선
   if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com' && env.SITE_BASE_URL !== '') {
@@ -632,10 +705,20 @@ async function resolveSiteBaseAsync(env) {
   if (env.SITE_HOST && env.SITE_HOST !== '') {
     return 'https://' + env.SITE_HOST.replace(/^https?:\/\//, '').replace(/\/$/, '');
   }
-  // ② KV에 자동 감지된 host (메모리 캐시 먼저)
+  // ② 라우트 목록(ssl:routes) 기반 자동 탐지 — 설정 제로, API 없이
+  try {
+    const routeHost = await resolveHostFromRoutes(env);
+    if (routeHost) {
+      _detectedHost   = routeHost;
+      _detectedHostTs = Date.now();
+      return 'https://' + routeHost;
+    }
+  } catch (_) {}
+  // ③ 메모리 캐시 (이전 요청 자동 감지)
   if (_detectedHost && Date.now() - _detectedHostTs < DETECTED_HOST_TTL_MS) {
     return 'https://' + _detectedHost;
   }
+  // ④ KV state:site_host (기존 자동감지 저장값 — 하위 호환)
   try {
     const { kvGet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null }));
     const savedHost = await kvGet(env, 'state:site_host');
@@ -645,7 +728,7 @@ async function resolveSiteBaseAsync(env) {
       return 'https://' + savedHost;
     }
   } catch (_) {}
-  // ③ 폴백: 빈 문자열 (사이트맵 생성 스킵)
+  // ⑤ 폴백: 빈 문자열 (사이트맵 생성 스킵)
   return '';
 }
 
@@ -660,7 +743,9 @@ async function resolveSiteTitleAsync(env) {
   return 'BloggerSEO';
 }
 
-// 동기 버전 (하위 호환용 — 메모리 캐시 값만 사용, Cron에서는 비동기 버전 사용)
+// 동기 버전 — 메모리 캐시 값만 사용 (Cron에서는 비동기 버전 사용)
+// 비동기 resolveSiteBaseAsync()가 먼저 호출되어 _detectedHost 가 채워진 상태라면
+// 라우트 기반 감지 결과도 여기서 즉시 반환된다 (캐시 공유).
 function resolveSiteBase(env) {
   if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com' && env.SITE_BASE_URL !== '') {
     return env.SITE_BASE_URL.replace(/\/$/, '');
@@ -668,7 +753,7 @@ function resolveSiteBase(env) {
   if (env.SITE_HOST && env.SITE_HOST !== '') {
     return 'https://' + env.SITE_HOST.replace(/^https?:\/\//, '').replace(/\/$/, '');
   }
-  // 메모리 캐시 (이전 요청에서 감지된 값)
+  // 메모리 캐시 (resolveSiteBaseAsync가 라우트 목록에서 채워둔 값 포함)
   if (_detectedHost && Date.now() - _detectedHostTs < DETECTED_HOST_TTL_MS) {
     return 'https://' + _detectedHost;
   }
@@ -836,6 +921,21 @@ async function handlePanel(request, url, env, ctx) {
   if (subPath === 'api/k8s_events') {
     return new Response(JSON.stringify(EventBus.recent(100), null, 2), jsonHeaders());
   }
+  // K8s Reconcile 강제 실행
+  if (subPath === 'api/k8s_reconcile' && request.method === 'POST') {
+    const results = await Cluster.reconcileAll().catch(e => [{ ok: false, error: e.message }]);
+    return new Response(JSON.stringify({ ok: true, results }), jsonHeaders());
+  }
+  // K8s Apply (선언적 manifest 적용)
+  if (subPath === 'api/k8s_apply' && request.method === 'POST') {
+    try {
+      const manifest = await request.json();
+      const result   = await Cluster.apply(manifest);
+      return new Response(JSON.stringify({ ok: true, kind: manifest.kind, name: manifest.metadata?.name }), jsonHeaders());
+    } catch (e) {
+      return new Response(JSON.stringify({ ok: false, error: e.message }), jsonHeaders());
+    }
+  }
   // 컨테이너 목록
   if (subPath === 'api/containers') {
     return new Response(JSON.stringify(ContainerLifecycle.stats(), null, 2), jsonHeaders());
@@ -853,17 +953,21 @@ async function handlePanel(request, url, env, ctx) {
     const { kvGet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null }));
     const kvHost  = await kvGet(env, 'state:site_host').catch(() => null);
     const kvTitle = await kvGet(env, 'state:site_title').catch(() => null);
+    // 라우트 목록에서 탐지된 실사용 도메인
+    const routeHost = await resolveHostFromRoutes(env).catch(() => null);
     return new Response(JSON.stringify({
-      SITE_BASE_URL  : env.SITE_BASE_URL  || '(미설정 — 자동감지 사용 중)',
-      SITE_HOST      : env.SITE_HOST      || '(미설정 — 자동감지 사용 중)',
-      SITE_TITLE     : env.SITE_TITLE     || '(미설정 — 자동감지 사용 중)',
+      SITE_BASE_URL    : env.SITE_BASE_URL  || '(미설정 — 자동감지 사용 중)',
+      SITE_HOST        : env.SITE_HOST      || '(미설정 — 자동감지 사용 중)',
+      SITE_TITLE       : env.SITE_TITLE     || '(미설정 — 자동감지 사용 중)',
       autoDetectedHost : kvHost   || '(미감지 — 첫 요청 후 자동저장)',
       autoDetectedTitle: kvTitle  || '(미감지)',
-      resolved       : autoBase  || url.origin,
-      resolvedTitle  : autoTitle,
-      workerOrigin   : url.origin,
-      isExampleCom   : !autoBase || autoBase === 'https://example.com',
-      memCacheHost   : _detectedHost || null,
+      routeDetectedHost: routeHost || '(미감지 — 첫 요청 후 라우트 자동저장)',
+      resolved         : autoBase  || url.origin,
+      resolvedTitle    : autoTitle,
+      workerOrigin     : url.origin,
+      isExampleCom     : !autoBase || autoBase === 'https://example.com',
+      memCacheHost     : _detectedHost || null,
+      detectionMethod  : routeHost ? 'route(ssl:routes KV)' : (kvHost ? 'state:site_host KV' : 'fallback'),
     }), jsonHeaders());
   }
 
@@ -1351,6 +1455,10 @@ tr:hover td{background:#334155}
       <div class="card"><div class="card-title">실제 사용 도메인</div><div class="card-value" id="d-resolved" style="font-size:14px">-</div></div>
       <div class="card"><div class="card-title">example.com 여부</div><div class="card-value" id="d-example">-</div></div>
     </div>
+    <div class="grid" style="margin-top:12px">
+      <div class="card"><div class="card-title">🛣️ 라우트 감지 도메인</div><div class="card-value" id="d-route" style="font-size:14px">-</div><div class="card-sub">ssl:routes KV 자동탐지</div></div>
+      <div class="card"><div class="card-title">📡 감지 방법</div><div class="card-value" id="d-method" style="font-size:13px">-</div><div class="card-sub">설정 제로, API 없이</div></div>
+    </div>
     <div class="card" style="margin-top:16px">
       <div class="card-title" style="margin-bottom:10px">🤖 자동 감지 현황</div>
       <div id="d-auto-info" style="color:#94a3b8;font-size:13px;line-height:2">로딩 중...</div>
@@ -1359,6 +1467,7 @@ tr:hover td{background:#334155}
       <div class="card-title" style="margin-bottom:10px">ℹ️ 자동화 안내</div>
       <div style="color:#94a3b8;font-size:13px;line-height:1.9">
         ✅ <strong>설정 불필요</strong> — 개인도메인으로 첫 HTTP 요청이 들어오는 순간 자동으로 도메인이 감지·저장됩니다.<br>
+        ✅ 라우트(ssl:routes) → state:site_host KV 순으로 탐지 (API 없이, 설정 제로).<br>
         ✅ 이후 사이트맵, RSS, 스키마 마크업 등 모든 URL이 실제 개인도메인으로 자동 생성됩니다.<br>
         ✅ 블로그 제목도 홈페이지 &lt;title&gt;에서 자동으로 추출됩니다.<br><br>
         📌 수동 강제 설정이 필요할 때만 wrangler.toml에 입력:<br>
@@ -1464,6 +1573,7 @@ tr:hover td{background:#334155}
       <div class="card"><div class="card-title">Deployment</div><div class="card-value" id="k8s-dep">-</div></div>
       <div class="card"><div class="card-title">서비스</div><div class="card-value" id="k8s-svc">-</div></div>
       <div class="card"><div class="card-title">컨테이너</div><div class="card-value" id="k8s-ctr">-</div></div>
+      <div class="card"><div class="card-title">이벤트</div><div class="card-value" id="k8s-ev-count">-</div></div>
     </div>
     <div class="table-wrap" style="margin-top:16px">
       <table><thead><tr><th>컨테이너 ID</th><th>이미지</th><th>상태</th><th>CPU</th><th>요청수</th><th>헬스</th></tr></thead>
@@ -1477,6 +1587,7 @@ tr:hover td{background:#334155}
     </div>
     <div class="flex" style="margin-top:16px">
       <button class="btn btn-primary" onclick="loadK8s()">🔄 새로고침</button>
+      <button class="btn btn-primary" onclick="k8sReconcile()">⚙️ Reconcile 실행</button>
     </div>
   </div>
 
@@ -1766,41 +1877,62 @@ async function loadDomainInfo() {
   document.getElementById('d-example').innerHTML = d.isExampleCom
     ? '<span class="badge badge-red">⚠️ example.com 감지</span>'
     : '<span class="badge badge-green">✅ 정상</span>';
+  // 라우트 기반 감지 정보
+  const routeEl = document.getElementById('d-route');
+  if (routeEl) routeEl.textContent = d.routeDetectedHost || '-';
+  const methodEl = document.getElementById('d-method');
+  if (methodEl) methodEl.textContent = d.detectionMethod || '-';
   // 자동감지 정보 표시
   const autoEl = document.getElementById('d-auto-info');
   if (autoEl) {
     autoEl.innerHTML = [
-      d.autoDetectedHost  ? '🔍 자동감지 도메인: <strong>' + d.autoDetectedHost  + '</strong>' : '🔍 자동감지 도메인: (첫 요청 후 자동저장)',
-      d.autoDetectedTitle ? '📝 자동감지 제목: <strong>'   + d.autoDetectedTitle + '</strong>' : '📝 자동감지 제목: (홈 첫 방문 후 자동저장)',
-      d.memCacheHost      ? '⚡ 메모리 캐시: <strong>'     + d.memCacheHost      + '</strong>' : '⚡ 메모리 캐시: (비어있음)',
+      d.routeDetectedHost && d.routeDetectedHost !== '(미감지 — 첫 요청 후 라우트 자동저장)'
+        ? '🛣️ 라우트 감지 도메인: <strong>' + d.routeDetectedHost + '</strong>'
+        : '🛣️ 라우트 감지 도메인: (첫 요청 후 ssl:routes에 자동저장)',
+      d.autoDetectedHost  ? '🔍 KV 감지 도메인: <strong>' + d.autoDetectedHost  + '</strong>' : '🔍 KV 감지 도메인: (첫 요청 후 자동저장)',
+      d.autoDetectedTitle ? '📝 자동감지 제목: <strong>'  + d.autoDetectedTitle + '</strong>' : '📝 자동감지 제목: (홈 첫 방문 후 자동저장)',
+      d.memCacheHost      ? '⚡ 메모리 캐시: <strong>'    + d.memCacheHost      + '</strong>' : '⚡ 메모리 캐시: (비어있음)',
     ].join('<br>');
   }
 }
 
 async function loadK8s() {
   const [status, events] = await Promise.all([api('api/k8s_status'), api('api/k8s_events')]);
-  document.getElementById('k8s-ns').textContent  = (status.namespaces  || []).length;
-  document.getElementById('k8s-dep').textContent = (status.deployments || []).length;
-  document.getElementById('k8s-svc').textContent = (status.services    || []).length;
-  document.getElementById('k8s-ctr').textContent = (status.containers?.total || 0);
+  document.getElementById('k8s-ns').textContent       = (status.namespaces  || []).length;
+  document.getElementById('k8s-dep').textContent      = (status.deployments || []).length;
+  document.getElementById('k8s-svc').textContent      = (status.services    || []).length;
+  document.getElementById('k8s-ctr').textContent      = (status.containers?.total || 0);
+  document.getElementById('k8s-ev-count').textContent = (events || []).length;
 
   const ctrs = status.containers?.containers || [];
   const tb = document.getElementById('k8s-ctr-table');
   tb.innerHTML = ctrs.length
-    ? ctrs.map(c => \`<tr>
-        <td><code>\${c.id?.slice(0,14)||'-'}</code></td>
-        <td>\${c.image||'-'}</td>
-        <td><span class="badge \${c.state==='running'?'badge-green':c.state==='stopped'?'badge-yellow':'badge-red'}">\${c.state||'-'}</span></td>
-        <td>\${c.cpu?.usedMs?.toFixed(1)||0}ms</td>
-        <td>\${c.requests?.count||0}</td>
-        <td><span class="badge \${c.health?.status==='healthy'?'badge-green':'badge-yellow'}">\${c.health?.status||'unknown'}</span></td>
-      </tr>\`).join('')
-    : '<tr><td colspan="6" style="color:#64748b;text-align:center">실행 중인 컨테이너 없음</td></tr>';
+    ? ctrs.map(c => `<tr>
+        <td><code>${c.id?.slice(0,14)||'-'}</code></td>
+        <td>${c.image||'-'}</td>
+        <td><span class="badge ${c.state==='running'?'badge-green':c.state==='stopped'?'badge-yellow':'badge-red'}">${c.state||'-'}</span></td>
+        <td>${c.cpu?.usedMs?.toFixed(1)||0}ms</td>
+        <td>${c.requests?.count||0}</td>
+        <td><span class="badge ${c.health?.status==='healthy'?'badge-green':'badge-yellow'}">${c.health?.status||'unknown'}</span></td>
+      </tr>`).join('')
+    : '<tr><td colspan="6" style="color:#64748b;text-align:center">실행 중인 컨테이너 없음 — Reconcile 실행 후 새로고침</td></tr>';
 
   const evDiv = document.getElementById('k8s-events');
-  evDiv.innerHTML = (events || []).slice(0, 20).map(e =>
-    \`<div>[<span style="color:#60a5fa">\${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] \${e.type} \${e.deployment||e.pod||''}</div>\`
-  ).join('') || '<div style="color:#475569">이벤트 없음</div>';
+  evDiv.innerHTML = (events || []).slice(0, 30).map(e =>
+    `<div>[<span style="color:#60a5fa">${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style="color:#a78bfa">${e.type}</span> ${e.deployment||e.pod||e.namespace||''}</div>`
+  ).join('') || '<div style="color:#475569">이벤트 없음 — Worker 첫 요청 후 자동 생성됩니다</div>';
+}
+
+async function k8sReconcile() {
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = '⏳ 실행 중...';
+  try {
+    const r = await fetch('/panel/api/k8s_reconcile?secret='+encodeURIComponent(SECRET), {method:'POST'}).then(r=>r.json());
+    toast(r.ok ? 'Reconcile 완료 (' + (r.results||[]).length + '개)' : '오류: ' + r.error);
+    await loadK8s();
+  } finally {
+    btn.disabled = false; btn.textContent = '⚙️ Reconcile 실행';
+  }
 }
 
 async function loadCachePolicyInfo() {
