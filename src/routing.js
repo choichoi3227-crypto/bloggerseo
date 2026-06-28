@@ -1,5 +1,5 @@
 /**
- * BloggerSEO v6 — 자체 Argo Smart Routing + Priority Routing
+ * BloggerSEO v7 — 자체 Argo Smart Routing + Priority Routing
  *                  + Regional Tiered Cache + Load Balancer
  * ─────────────────────────────────────────────────────────────────────
  *
