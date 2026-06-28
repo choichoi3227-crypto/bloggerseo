@@ -1,5 +1,5 @@
 /**
- * BloggerSEO v6 — 자동 스키마 마크업 엔진
+ * BloggerSEO v7 — 자동 스키마 마크업 엔진
  * ─────────────────────────────────────────────────────────────────────
  * 생성 스키마:
  *   필수: Article, FAQ
@@ -321,7 +321,7 @@ async function extractFaqsWithAI(html, ctx, env) {
 본문: ${bodyText}`;
 
   try {
-    const result = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+    const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 1000,
     });
