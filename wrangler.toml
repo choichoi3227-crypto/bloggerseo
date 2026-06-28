@@ -1,4 +1,4 @@
-# wrangler.toml — BloggerSEO Worker v8
+# wrangler.toml — BloggerSEO Worker v7
 # ─────────────────────────────────────────────────────────────────────
 # v7 신규/변경 기능:
 #   1. 자동 스키마 마크업 (Article/FAQ/Breadcrumb/Product, 필수: Article/FAQ)
@@ -42,15 +42,29 @@ new_sqlite_classes = ["MyDurableObject"]
 # ─── 환경 변수 (비밀이 아닌 값만) ────────────────────────────────────────
 [vars]
 RATE_LIMIT_PER_MIN     = "600"
-CACHE_RESERVE_TTL_SEC  = "14400"      # 4시간 = 14400초
-MAX_WORKER_INSTANCES   = "50"         # 로드밸런싱: 최대 워커 인스턴스
+CACHE_RESERVE_TTL_SEC  = "1800"      # 4시간 = 14400초
+MAX_WORKER_INSTANCES   = "100"         # 로드밸런싱: 최대 워커 인스턴스
 ARGO_REGIONS           = "KR,JP,US,EU"
 PRIORITY_ROUTING_TIERS = "3"
 REDIS_SHARD_COUNT      = "100"         # 자체 Redis 샤드 수 (늘릴수록 총 용량 선형 증가)
+# 개인도메인 설정 — 설정 불필요 (자동 감지)
+# ─────────────────────────────────────────────────────────────────────────
+# BloggerSEO v8은 아무것도 설정하지 않아도 개인도메인을 자동으로 감지합니다:
+#   1. 개인도메인으로 첫 HTTP 요청이 들어오는 순간 host를 자동 저장
+#   2. 블로그 제목은 홈페이지 <title>에서 자동 추출
+#   3. 이후 사이트맵/RSS/스키마 등 모든 URL이 실제 도메인으로 자동 생성
+#
+# 강제로 덮어씌우고 싶을 때만 아래 값을 채우세요 (보통 불필요):
+SITE_BASE_URL          = ""           # 예: "https://your-domain.com" (비워두면 자동감지)
+SITE_HOST              = ""           # 예: "your-domain.com" (비워두면 자동감지)
+SITE_TITLE             = ""           # 블로그 제목 (비워두면 <title>에서 자동추출)
+SITE_LANG              = "ko"         # 기본 언어 (hreflang 주입)
+
 NAVER_SITE_VERIFY      = ""           # 네이버 서치어드바이저 인증키
 BING_SITE_VERIFY       = ""           # 빙 웹마스터 인증키
 GOOGLE_SITE_VERIFY     = ""           # 구글 서치콘솔 인증키
 AI_FAQ_ENABLED         = "true"       # Workers AI로 FAQ 자동 추출 (env.AI 바인딩 필요)
+INDEXNOW_KEY           = ""           # IndexNow API 키 (Bing/Yandex 빠른 색인 — wrangler secret 추천)
 
 # Cloudflare API (관리 패널의 "워커/라우트 연동" 기능용 — 토큰은 secret으로 등록)
 CF_ZONE_ID             = ""           # Zone ID (비밀 아님, 여기 직접 입력 가능)
