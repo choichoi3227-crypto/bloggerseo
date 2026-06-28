@@ -59,7 +59,55 @@ wrangler secret put UPSTASH_REDIS_TOKEN
 
 # 관리 패널의 Cloudflare 연동 기능(워커/라우트 자동 관리)을 쓸 경우
 wrangler secret put CF_API_TOKEN
+
+# ── SSL/TLS 인증서 자동 관리 (필요 권한: Zone:SSL and Certificates:Edit, Zone Settings:Edit)
+wrangler secret put CF_API_TOKEN   # (위와 동일 토큰으로 SSL도 관리)
 ```
+
+> **CF_API_TOKEN 권한 설정**: Cloudflare 대시보드 → My Profile → API Tokens → Create Token
+> - `Zone:SSL and Certificates:Edit`
+> - `Zone:Zone Settings:Edit`
+> - (선택) `Zone:Zone:Read`
+
+---
+
+### 🔒 SSL/TLS 자동 인증서 설정
+
+BloggerSEO v7은 **블로그스팟에서 별도 SSL 설정 없이** Cloudflare가 앞단에서 완전한 HTTPS를 처리합니다.
+
+#### 동작 구조
+```
+방문자 (HTTPS) ──▶ Cloudflare Worker ──▶ 블로그스팟 원본 (HTTP/ghs.google.com)
+                    ↑ TLS 1.2+, Let's Encrypt 또는 Google Trust Services
+```
+
+#### 설정 방법
+
+1. **wrangler.toml** 에서 Zone ID 설정:
+   ```toml
+   CF_ZONE_ID = "your-cloudflare-zone-id"
+   SSL_CA = "lets_encrypt"   # 또는 "google" (Google Trust Services)
+   ```
+
+2. **API 토큰 등록**:
+   ```bash
+   wrangler secret put CF_API_TOKEN
+   ```
+
+3. **패널에서 초기 설정 실행**: `/panel` → 🔒 SSL/TLS 인증서 → "초기 설정" 버튼 클릭
+
+#### 포함 기능
+| 기능 | 설명 |
+|------|------|
+| **HTTP → HTTPS 자동 리디렉션** | Worker 레벨에서 301 리디렉션, 즉시 처리 |
+| **Let's Encrypt 인증서** | Cloudflare Universal SSL 통해 자동 발급 |
+| **Google Trust Services 인증서** | 선택 가능, 구글 신뢰체인 |
+| **자동 갱신** | Cron (매 1시간) — 만료 30일 전 자동 갱신 |
+| **TLS 1.2 최소 버전** | 구식 TLS 차단 |
+| **패널에서 현황 확인** | `/panel` → 🔒 SSL/TLS 탭에서 인증서 목록, 만료일, 상태 조회 |
+| **블로그스팟 SSL 불필요** | Cloudflare Flexible 모드로 원본 HTTP 허용 |
+
+---
 
 > 기존에 `wrangler.toml`에 평문으로 들어있던 Upstash URL/토�큰과 `PANEL_SECRET`은
 > 모두 제거되었습니다. 이미 깃허브에 커밋된 적이 있다면 **반드시 해당 자격증명을
