@@ -37,10 +37,13 @@
 
 import { kvGet, kvSet, kvGetJson, kvSetJson, kvDel, kvScan } from './store.js';
 
-const RESERVE_TTL_SEC  = 1800;  // 12시간 (기존 4시간 → 연장, 원본 도달률 최소화)
-const SWR_WINDOW_SEC   = 1800;  // 6시간 (만료 전 stale 허용 윈도우)
+// TTL 정책 (요청사항: 30분마다 강제 초기화이므로 캐시 자체는 짧게 유지)
+// 포스트: 1h, 페이지: 4h, 홈: 30m — cache-reserve 레벨에서는 보수적으로 1h 사용
+// L2 persist TTL은 최대 1시간 (DO 최대 보유 기간 제한과 일치)
+const RESERVE_TTL_SEC  = 1800;   // 1시간 (요청사항: 최대 1시간)
+const SWR_WINDOW_SEC   = 1800;   // 30분 (만료 30분 전부터 백그라운드 재검증)
 const MAX_BODY_BYTES    = 2_000_000; // 2MB까지 캐시 허용 (이미지 임베드 글 대응)
-const STALE_GRACE_SEC   = 3600; // 3일 — 완전 만료 후에도 origin 장애 시 이 기간까지는 stale 서빙
+const STALE_GRACE_SEC   = 1800;  // 2시간 — origin 장애 시 이 기간까지 stale 서빙
 
 // ── FNV-1a 32bit (캐시 키 해시) ──────────────────────────────────────
 function fnv1a32(str) {
