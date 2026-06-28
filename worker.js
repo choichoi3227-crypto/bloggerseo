@@ -1,5 +1,5 @@
 /**
- * BloggerSEO Worker v7
+ * BloggerSEO Worker v8
  * ─────────────────────────────────────────────────────────────────────
  * 신규/변경 기능:
  *   1. 자동 스키마 마크업 (필수: Article/FAQ, 선택: Breadcrumb/Product) + AI FAQ 추출
@@ -24,6 +24,7 @@ import {
   isIpBlocked, blockIp, unblockIp, listBlockedIps,
   recordAnalytics, getAnalytics,
   doRedisAvailable, doRedisClusterStats, doRedisFlushAll,
+  kvSet, kvGet,
 } from './src/store.js';
 import {
   cacheReserveGet, cacheReservePut, cacheReserveGetStaleFallback,
@@ -35,10 +36,17 @@ import {
   regionalCacheRecord, regionalCacheStats,
   priorityRoute, buildDeviceHints, buildCacheControl,
   lbAcquire, lbRelease, lbLoad, lbWorkerId, lbHeartbeat, lbClusterLoad,
-  getPageTypeTtl,
 } from './src/routing.js';
 import { buildSchemas, injectSchemaMarkup, injectSearchEngineTags } from './src/schema.js';
 import { handleSitemapRequest, handleRssRequest, generateSitemap, generateRss } from './src/sitemap.js';
+import {
+  boostOgImage, injectReadingTime, injectTableOfContents,
+  injectLazyLoad, fillImageAlt, processExternalLinks,
+  injectSocialShare, injectHreflang, injectNaverSeoTags,
+  boostCodeBlocks, injectSpeakable, boostAdSenseCompatibility,
+  injectPreloadHints, getCacheTtlForType,
+  shouldForcePurge, recordCachePurgeTime,
+} from './src/features.js';
 import {
   fnv1a32Hex, extractMeta, extractTagContent, extractBodyText,
   buildMetaDescription, extractFirstImage, extractSiteName, extractLogoUrl,
@@ -50,12 +58,6 @@ import {
 // 클래스 이름은 Cloudflare 대시보드에서 먼저 만든 네임스페이스(class_name)와 맞춰
 // MyDurableObject로 되어 있다 — 역할은 자체 제작 Redis 샤드(구 RedisShard)와 동일.
 export { MyDurableObject } from './src/redis-do.js';
-
-// 신규 모듈 import
-import { applyAllSeoFeatures, pingIndexNow, pingSearchEngines,
-         buildServerTimingHeader, buildSecurityHeaders, buildImageSitemapXml } from './src/seo-features.js';
-import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
-import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
@@ -79,10 +81,14 @@ export default {
   // ── 스케줄드 (Cron) ────────────────────────────────────────────────
   async scheduled(event, env, ctx) {
     const cron = event.cron || '';
-    // */30 * * * *  → RSS 생성
+    // */30 * * * *  → RSS 생성 + 강제 캐시 초기화 (30분 주기)
     // 0 * * * *     → 사이트맵 + 슬러그 감사 + 캐시 만료 정리
     if (cron.startsWith('*/30')) {
-      ctx.waitUntil(runRssGeneration(env).catch(() => {}));
+      ctx.waitUntil(Promise.all([
+        runRssGeneration(env).catch(() => {}),
+        // 자동 캐싱 조절: 30분마다 강제 초기화
+        runAutoCachePurge(env).catch(() => {}),
+      ]));
     } else {
       ctx.waitUntil(Promise.all([
         runSitemapGeneration(env).catch(() => {}),
@@ -101,6 +107,18 @@ async function handleFetch(request, env, ctx) {
   const host   = url.hostname;
   const path   = url.pathname;
   const t0     = Date.now();
+
+  // ── 실제 호스트 저장 (Cron에서 사이트맵/RSS 생성 시 사용) ──────────
+  // 환경 변수가 없거나 example.com으로 설정된 경우를 위해, 실제 요청
+  // 호스트를 KV에 주기적으로 저장해둔다. (비율 조절: 1% 요청만 저장)
+  if (Math.random() < 0.01) {
+    const siteHost = 'https://' + host;
+    if (!siteHost.includes('example.com')) {
+      ctx.waitUntil(
+        import('./src/store.js').then(m => m.kvSet(env, 'state:site_host', siteHost, 86400 * 30)).catch(() => {})
+      );
+    }
+  }
 
   // ── IP 차단 체크 ──────────────────────────────────────────────────
   const clientIp = request.headers.get('cf-connecting-ip') ||
@@ -122,9 +140,9 @@ async function handleFetch(request, env, ctx) {
   if (path === '/__lb_status')   return lbStatus(env);
   if (path === '/__cache_stats') return cacheStats(env);
 
-  // ── 사이트맵 / RSS 직접 서빙 (실제 요청 host=개인도메인 사용) ───
-  if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return handleSitemapRequest(env, url, host);
-  if (path === '/rss.xml' || path === '/atom.xml') return handleRssRequest(env, url, host);
+  // ── 사이트맵 / RSS 직접 서빙 ────────────────────────────────────
+  if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return handleSitemapRequest(env, url);
+  if (path === '/rss.xml' || path === '/atom.xml') return handleRssRequest(env, url);
 
   // ── Priority Routing (티어 결정) ─────────────────────────────────
   const pRoute  = priorityRoute(request);
@@ -234,6 +252,37 @@ async function handleFetch(request, env, ctx) {
   // 3xx 그대로
   if (originResp.status >= 300 && originResp.status < 400) {
     recordMetric(originResp.status, Date.now() - t0);
+    // 카테고리(라벨) 페이지 무한 리디렉션 방지:
+    // Blogger가 /search/label/X 로 보내는 3xx 리디렉션의 Location 헤더가
+    // ghs.google.com 또는 *.blogspot.com 도메인을 가리킬 경우,
+    // 현재 요청의 호스트(개인도메인)로 바꿔서 반환한다.
+    // 그렇지 않으면 클라이언트 → Worker → Blogger → Worker → ... 루프가 생긴다.
+    try {
+      const location = originResp.headers.get('location');
+      if (location) {
+        let targetUrl;
+        try { targetUrl = new URL(location); } catch (_) { targetUrl = null; }
+        if (targetUrl) {
+          const isBloggerHost = targetUrl.hostname === 'ghs.google.com' ||
+            targetUrl.hostname.endsWith('.blogspot.com') ||
+            targetUrl.hostname.endsWith('.blogger.com');
+          if (isBloggerHost) {
+            // Location을 현재 요청 호스트(개인도메인)로 교체
+            targetUrl.hostname = host;
+            targetUrl.protocol = url.protocol;
+            const newResp = new Response(null, {
+              status: originResp.status,
+              statusText: originResp.statusText,
+              headers: originResp.headers,
+            });
+            const h = new Headers(newResp.headers);
+            h.set('location', targetUrl.toString());
+            h.set('x-powered-by', 'BloggerSEO-v8');
+            return new Response(null, { status: originResp.status, headers: h });
+          }
+        }
+      }
+    } catch (_) {}
     return stripInternalHeaders(originResp);
   }
   if (originResp.status >= 500) {
@@ -290,9 +339,13 @@ async function handleFetch(request, env, ctx) {
   // 위해 쓰기는 사람 방문자 기준으로만 — 단, 읽기는 모두에게 적용됨)
   if (!isBot && pageCtx) {
     const respForCache = new Response(result, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
-    ctx.waitUntil(
-      cacheReservePut(env, request, respForCache, { region: argoCtx.region }).catch(() => {})
-    );
+    // 페이지 유형별 캐시 TTL 자동 조정 (자동 캐싱 조절 시스템 v8)
+    const pageTtl = getCacheTtlForType(pageCtx.type || 'other');
+    if (pageTtl > 0) {
+      ctx.waitUntil(
+        cacheReservePut(env, request, respForCache, { region: argoCtx.region, ttl: pageTtl }).catch(() => {})
+      );
+    }
   }
 
   ctx.waitUntil(recordAnalytics(env, {
@@ -301,11 +354,7 @@ async function handleFetch(request, env, ctx) {
   }).catch(() => {}));
 
   recordMetric(200, Date.now() - t0);
-  // 페이지 타입별 TTL 적용 (포스트 1h, 페이지 4h, 홈 30분, 라벨 1h)
-  const pageType     = pageCtx?.type || detectPageType(url);
-  const pageTtl      = getPageTypeTtl(pageType);
-  const effectiveRoute = { ...pRoute, maxAge: pageTtl };
-  const cacheControl = buildCacheControl(effectiveRoute, isBot);
+  const cacheControl = buildCacheControl(pRoute, isBot);
   return new Response(result, { status: 200, headers: buildResponseHeaders(etag, cacheControl) });
 }
 
@@ -327,6 +376,7 @@ async function backgroundRevalidate(request, env, url, argoCtx, pRoute) {
 // ─────────────────────────────────────────────
 async function transformHtml(html, ctx, url, env, pRoute) {
   let o = html;
+  // ── 기존 파이프라인 ──────────────────────────────────────────────
   o = safeTransform(o, stripMobileParam);
   o = safeTransform(o, enforceHttps);
   o = safeTransform(o, h => injectMetaDescription(h, ctx));
@@ -336,10 +386,33 @@ async function transformHtml(html, ctx, url, env, pRoute) {
   o = safeTransform(o, injectPerformanceOptimizations);
   o = safeTransform(o, h => injectDeviceOptimizations(h, pRoute));
 
-  // ── 추가 SEO 기능 20+ (목차/읽기시간 제외) ──────────────────────
-  try {
-    o = safeTransform(o, h => applyAllSeoFeatures(h, ctx, url, env));
-  } catch (_) {}
+  // ── v8 신기능 파이프라인 (에러 격리, 순서 중요) ─────────────────
+  // 1. OG 이미지 보강
+  o = safeTransform(o, h => boostOgImage(h, ctx, url));
+  // 2. 네이버 SEO 메타태그
+  o = safeTransform(o, h => injectNaverSeoTags(h, ctx));
+  // 3. Hreflang
+  o = safeTransform(o, h => injectHreflang(h, ctx, url));
+  // 4. Preload 힌트 (LCP 최적화)
+  o = safeTransform(o, h => injectPreloadHints(h, ctx));
+  // 5. 이미지 alt 자동 채우기
+  o = safeTransform(o, h => fillImageAlt(h, ctx));
+  // 6. 이미지 Lazy Load
+  o = safeTransform(o, injectLazyLoad);
+  // 7. 코드 블록 하이라이트
+  o = safeTransform(o, boostCodeBlocks);
+  // 8. 외부 링크 보안 처리
+  o = safeTransform(o, h => processExternalLinks(h, url));
+  // 9. 읽기 시간 (포스트만)
+  o = safeTransform(o, h => injectReadingTime(h, ctx));
+  // 10. 목차 자동 생성 (포스트만)
+  o = safeTransform(o, h => injectTableOfContents(h, ctx));
+  // 11. 소셜 공유 버튼 (포스트만)
+  o = safeTransform(o, h => injectSocialShare(h, ctx));
+  // 12. SpeakableSpecification (음성 검색)
+  o = safeTransform(o, h => injectSpeakable(h, ctx));
+  // 13. AdSense 호환성 보강
+  o = safeTransform(o, boostAdSenseCompatibility);
 
   // 스키마 마크업 (비동기, AI FAQ 포함)
   try {
@@ -360,11 +433,7 @@ function isPostPath(path) {
 function isReservedFlatPath(p) {
   if (p === '/' || p === '') return true;
   if (p.startsWith('/feeds/') || p.startsWith('/b/') || p.startsWith('/admin')) return true;
-  // /search, /search/label/* 등 Blogger 네이티브 경로 — 슬러그 라우팅에서 제외해 리디렉션 루프 차단
   if (p.startsWith('/search') || p === '/ncr') return true;
-  // 다중 세그먼트 경로(예: /search/label/여행)는 isReservedFlatPath 외에
-  // resolveSlugRoute의 /^\/[^/]+$/ 체크에도 걸리지 않으므로 이중 안전장치
-  if (p.startsWith('/p/')) return true;
   if (p === '/__debug' || p === '/__metrics' || p === '/__purge_all' ||
       p === '/__lb_status' || p === '/__cache_stats') return true;
   if (/^\/sitemap(-[^/]+)?\.xml$/i.test(p)) return true;
@@ -386,13 +455,6 @@ function decodePathSafe(path) {
 
 async function resolveSlugRoute(rawPath, env) {
   const path = decodePathSafe(rawPath);
-
-  // 다중 세그먼트(예: /search/label/여행, /p/about 등) — 슬러그 라우팅 완전 제외
-  // 이걸 빠뜨리면 /search/label/* 가 여기서 잡혀 리디렉션→다시 resolveSlug→무한루프
-  if (path.indexOf('/', 1) !== -1) {
-    // /YYYY/MM/post.html 형태는 포스트 경로로 허용
-    if (!isPostPath(path)) return { type: 'passthrough' };
-  }
 
   if (isPostPath(path)) {
     const rec = await slugOriginGet(env, path);
@@ -422,31 +484,46 @@ async function updateSlugKV(pageCtx, originPath, env) {
 // Cron 작업
 // ─────────────────────────────────────────────
 async function runSitemapGeneration(env) {
-  // 실제 개인도메인 우선 사용 — SITE_BASE_URL 미설정 시 example.com 대신
-  // SITE_HOST 또는 PRIMARY_HOST 환경변수로도 지정 가능
-  const base = resolveSiteBase(env);
+  // SITE_BASE_URL이 없으면 KV에 저장된 마지막 방문 호스트를 사용,
+  // 그것도 없으면 스킵 (example.com으로 오염시키지 않음)
+  const base = await resolveSiteBaseUrl(env);
+  if (!base) return;
   await generateSitemap(env, base);
 }
 
 async function runRssGeneration(env) {
-  const base  = resolveSiteBase(env);
+  const base  = await resolveSiteBaseUrl(env);
+  if (!base) return;
   const title = env.SITE_TITLE || 'BloggerSEO';
   await generateRss(env, base, title);
 }
 
-// 사이트 베이스 URL 결정 (우선순위: SITE_BASE_URL > SITE_HOST > 빈 문자열로 상대경로)
-// Cron 작업에서는 요청 객체가 없으므로 환경변수에서만 가져온다.
-// 실제 요청 처리 시에는 url.origin을 직접 사용하므로 Cron에서만 이 함수가 의미 있다.
-function resolveSiteBase(env) {
-  if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com') {
+// 실제 사이트 도메인 확인: 환경 변수 > KV에 저장된 마지막 호스트 > null
+async function resolveSiteBaseUrl(env) {
+  if (env.SITE_BASE_URL && !env.SITE_BASE_URL.includes('example.com')) {
     return env.SITE_BASE_URL.replace(/\/$/, '');
   }
-  if (env.SITE_HOST) {
-    const host = env.SITE_HOST.replace(/^https?:\/\//, '').replace(/\/$/, '');
-    return 'https://' + host;
-  }
-  // 폴백: 빈 base (사이트맵 loc이 상대경로가 됨 — 개인도메인 설정 미흡 시 경고)
-  return '';
+  // KV에 저장된 마지막 실제 호스트
+  try {
+    const stored = await kvGet(env, 'state:site_host');
+    if (stored && !stored.includes('example.com')) {
+      return stored.startsWith('http') ? stored.replace(/\/$/, '') : 'https://' + stored;
+    }
+  } catch (_) {}
+  return null;
+}
+
+// ── 자동 캐싱 조절: 30분 강제 초기화 ──────────────────────────────
+// shouldForcePurge()로 30분이 지났는지 확인하고, 지났으면 강제 초기화.
+// 초기화 후 다음 캐시 생존 시간(TTL)은 페이지 유형별로 자동 조정.
+// (페이지 유형별 TTL: home=30분, post=12시간, page=24시간, label=1시간)
+async function runAutoCachePurge(env) {
+  const needsPurge = await shouldForcePurge(env);
+  if (!needsPurge) return;
+  // 만료된 캐시 항목만 정리 (stale grace 초과분)
+  await cacheReservePurge(env);
+  // 다음 초기화 시간 기록
+  await recordCachePurgeTime(env);
 }
 
 async function runSlugAudit(env) {
@@ -586,19 +663,14 @@ async function handlePanel(request, url, env, ctx) {
     return new Response(JSON.stringify({ unblocked: ip }), jsonHeaders());
   }
   if (subPath === 'api/generate_sitemap') {
-    // 패널 요청 시 실제 블로그 도메인 사용 (SITE_BASE_URL 환경변수 또는 Referer 기반)
-    const base   = (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com')
-                    ? env.SITE_BASE_URL.replace(/\/$/, '')
-                    : (env.SITE_HOST ? 'https://' + env.SITE_HOST : url.origin.replace('/panel', ''));
+    const base   = env.SITE_BASE_URL || url.origin;
     const result = await generateSitemap(env, base);
-    return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
+    return new Response(JSON.stringify({ count: result.count }), jsonHeaders());
   }
   if (subPath === 'api/generate_rss') {
-    const base   = (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com')
-                    ? env.SITE_BASE_URL.replace(/\/$/, '')
-                    : (env.SITE_HOST ? 'https://' + env.SITE_HOST : url.origin.replace('/panel', ''));
+    const base   = env.SITE_BASE_URL || url.origin;
     const result = await generateRss(env, base, env.SITE_TITLE || 'Blog');
-    return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
+    return new Response(JSON.stringify({ count: result.count }), jsonHeaders());
   }
 
   // 관리 패널 HTML
@@ -614,7 +686,7 @@ async function debugInfo(url, env) {
   const host = url.hostname;
   const cnameOk = cnameGet(host);
   const info = {
-    host, version: 'v7',
+    host, version: 'v8',
     workerId   : lbWorkerId(),
     load       : lbLoad(),
     cnameOk,
@@ -647,10 +719,11 @@ async function purgeAll(env) {
 // HTML 변환 함수들
 // ─────────────────────────────────────────────
 function stripMobileParam(html) {
+  // 모바일 파라미터(?m=1, &m=1) 제거 — 정규식 이스케이프 버그 수정
   return html
-    .replace(/((?:href|src|action)=["'][^"']*)\\?m=\\d+&/gi, '$1?')
-    .replace(/((?:href|src|action)=["'][^"']*)&m=\\d+/gi, '$1')
-    .replace(/((?:href|src|action)=["'][^"']*)\\?m=\\d+/gi, '$1');
+    .replace(/((?:href|src|action)=["'][^"']*)[?]m=\d+&/gi, '$1?')
+    .replace(/((?:href|src|action)=["'][^"']*)&m=\d+/gi, '$1')
+    .replace(/((?:href|src|action)=["'][^"']*)[?]m=\d+/gi, '$1');
 }
 
 function enforceHttps(html) {
@@ -780,7 +853,7 @@ function stripInternalHeaders(resp, isStaticAsset) {
   try {
     const h = new Headers(resp.headers);
     ['cf-cache-status','cf-ray','nel','report-to','server'].forEach(k => h.delete(k));
-    h.set('x-powered-by', 'BloggerSEO-v7');
+    h.set('x-powered-by', 'BloggerSEO-v8');
     if (isStaticAsset && resp.ok) {
       const cc = h.get('cache-control') || '';
       if (!cc || /no-store|no-cache|max-age=0/i.test(cc)) {
@@ -816,7 +889,7 @@ function buildResponseHeaders(etag, cacheControl = 'no-store') {
   h.set('x-frame-options',        'SAMEORIGIN');
   h.set('referrer-policy',        'strict-origin-when-cross-origin');
   h.set('vary',                   'Accept-Encoding, Cookie');
-  h.set('x-powered-by',           'BloggerSEO-v7');
+  h.set('x-powered-by',           'BloggerSEO-v8');
   if (etag) h.set('etag', etag);
   return h;
 }
@@ -863,7 +936,7 @@ function panelHtml(secret) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BloggerSEO v7 — 관리 패널</title>
+<title>BloggerSEO v8 — 관리 패널</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
@@ -915,7 +988,7 @@ tr:hover td{background:#334155}
 </head>
 <body>
 <div class="sidebar">
-  <div class="logo">🚀 BloggerSEO v7</div>
+  <div class="logo">🚀 BloggerSEO v8</div>
   <div class="nav-item active" onclick="showSection('dashboard')">📊 대시보드</div>
   <div class="nav-item" onclick="showSection('cache')">💾 캐시 관리</div>
   <div class="nav-item" onclick="showSection('redis')">🧬 Redis 관리</div>
@@ -924,6 +997,7 @@ tr:hover td{background:#334155}
   <div class="nav-item" onclick="showSection('analytics')">📈 캐시 애널리틱스</div>
   <div class="nav-item" onclick="showSection('security')">🛡️ 보안/IP 관리</div>
   <div class="nav-item" onclick="showSection('sitemap')">🗺️ 사이트맵/RSS</div>
+  <div class="nav-item" onclick="showSection('features')">✨ v8 신기능</div>
 </div>
 <div class="main">
   <!-- 대시보드 -->
@@ -1039,6 +1113,34 @@ tr:hover td{background:#334155}
   </div>
 
   <!-- 사이트맵/RSS -->
+  <div id="s-features" style="display:none">
+    <h2>✨ v8 신기능 목록</h2>
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">자동 적용 기능 (HTML 변환 파이프라인)</div>
+      <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;color:#cbd5e1">
+        <div>✅ OG 이미지 자동 보강</div><div>✅ 읽기 시간 자동 표시</div>
+        <div>✅ 목차(TOC) 자동 생성</div><div>✅ 이미지 Lazy Load</div>
+        <div>✅ 이미지 alt 자동 채우기</div><div>✅ 외부 링크 보안 처리</div>
+        <div>✅ 소셜 공유 버튼 삽입</div><div>✅ Hreflang 자동 주입</div>
+        <div>✅ 네이버 SEO 메타태그</div><div>✅ 코드 블록 하이라이트</div>
+        <div>✅ SpeakableSpecification</div><div>✅ AdSense 호환성 보강</div>
+        <div>✅ Preload 힌트 LCP 최적화</div><div>✅ 카테고리 리디렉션 버그 수정</div>
+        <div>✅ 실제 도메인 사이트맵/RSS</div><div>✅ 30분 자동 캐시 초기화</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">자동 캐싱 조절 시스템 (v8)</div>
+      <div style="margin-top:10px;color:#94a3b8;font-size:13px;line-height:1.9">
+        🔄 30분마다 강제 캐시 초기화 <span class="tag">Cron */30</span><br>
+        🏠 홈 페이지 캐시 TTL: <span class="tag">30분</span><br>
+        📝 포스트 캐시 TTL: <span class="tag">12시간</span><br>
+        📄 정적 페이지 캐시 TTL: <span class="tag">24시간</span><br>
+        🏷️ 카테고리 페이지 캐시 TTL: <span class="tag">1시간</span><br>
+        🔍 검색 페이지: <span class="tag">캐시 없음 (실시간)</span>
+      </div>
+    </div>
+  </div>
+
   <div id="s-sitemap" style="display:none">
     <h2>🗺️ 사이트맵 / RSS 관리</h2>
     <div class="grid">
