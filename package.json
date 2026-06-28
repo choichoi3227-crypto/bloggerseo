@@ -1,7 +1,7 @@
 {
   "name": "bloggerseo",
-  "version": "6.0.0",
-  "description": "BloggerSEO Worker v6: Argo Smart Routing + Regional Tiered Cache + Priority Routing + Cache Reserve (4h) + 자동 스키마 마크업 + 관리 패널",
+  "version": "7.0.0",
+  "description": "BloggerSEO Worker v7: 100% 자체 제작 서버리스 Redis(Durable Objects) + Argo Smart Routing + Regional Tiered Cache + Priority Routing + Cache Reserve (4h) + 자동 스키마 마크업(Article/FAQ 필수) + 관리 패널",
   "type": "module",
   "main": "worker.js",
   "scripts": {
@@ -10,7 +10,7 @@
     "build:wasm": "cd wasm-src && npx asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime && node build-blob.js",
     "panel": "open http://localhost:8787/panel"
   },
-  "keywords": ["cloudflare-workers","blogger","seo","schema-markup","cache","routing"],
+  "keywords": ["cloudflare-workers","blogger","seo","schema-markup","cache","routing","durable-objects","redis"],
   "author": "",
   "license": "ISC",
   "devDependencies": {
