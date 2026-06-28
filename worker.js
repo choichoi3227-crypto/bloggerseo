@@ -35,6 +35,7 @@ import {
   regionalCacheRecord, regionalCacheStats,
   priorityRoute, buildDeviceHints, buildCacheControl,
   lbAcquire, lbRelease, lbLoad, lbWorkerId, lbHeartbeat, lbClusterLoad,
+  getPageTypeTtl,
 } from './src/routing.js';
 import { buildSchemas, injectSchemaMarkup, injectSearchEngineTags } from './src/schema.js';
 import { handleSitemapRequest, handleRssRequest, generateSitemap, generateRss } from './src/sitemap.js';
@@ -49,6 +50,12 @@ import {
 // 클래스 이름은 Cloudflare 대시보드에서 먼저 만든 네임스페이스(class_name)와 맞춰
 // MyDurableObject로 되어 있다 — 역할은 자체 제작 Redis 샤드(구 RedisShard)와 동일.
 export { MyDurableObject } from './src/redis-do.js';
+
+// 신규 모듈 import
+import { applyAllSeoFeatures, pingIndexNow, pingSearchEngines,
+         buildServerTimingHeader, buildSecurityHeaders, buildImageSitemapXml } from './src/seo-features.js';
+import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
+import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
@@ -115,9 +122,9 @@ async function handleFetch(request, env, ctx) {
   if (path === '/__lb_status')   return lbStatus(env);
   if (path === '/__cache_stats') return cacheStats(env);
 
-  // ── 사이트맵 / RSS 직접 서빙 ────────────────────────────────────
-  if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return handleSitemapRequest(env, url);
-  if (path === '/rss.xml' || path === '/atom.xml') return handleRssRequest(env, url);
+  // ── 사이트맵 / RSS 직접 서빙 (실제 요청 host=개인도메인 사용) ───
+  if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return handleSitemapRequest(env, url, host);
+  if (path === '/rss.xml' || path === '/atom.xml') return handleRssRequest(env, url, host);
 
   // ── Priority Routing (티어 결정) ─────────────────────────────────
   const pRoute  = priorityRoute(request);
@@ -294,7 +301,11 @@ async function handleFetch(request, env, ctx) {
   }).catch(() => {}));
 
   recordMetric(200, Date.now() - t0);
-  const cacheControl = buildCacheControl(pRoute, isBot);
+  // 페이지 타입별 TTL 적용 (포스트 1h, 페이지 4h, 홈 30분, 라벨 1h)
+  const pageType     = pageCtx?.type || detectPageType(url);
+  const pageTtl      = getPageTypeTtl(pageType);
+  const effectiveRoute = { ...pRoute, maxAge: pageTtl };
+  const cacheControl = buildCacheControl(effectiveRoute, isBot);
   return new Response(result, { status: 200, headers: buildResponseHeaders(etag, cacheControl) });
 }
 
@@ -325,6 +336,11 @@ async function transformHtml(html, ctx, url, env, pRoute) {
   o = safeTransform(o, injectPerformanceOptimizations);
   o = safeTransform(o, h => injectDeviceOptimizations(h, pRoute));
 
+  // ── 추가 SEO 기능 20+ (목차/읽기시간 제외) ──────────────────────
+  try {
+    o = safeTransform(o, h => applyAllSeoFeatures(h, ctx, url, env));
+  } catch (_) {}
+
   // 스키마 마크업 (비동기, AI FAQ 포함)
   try {
     const schemas = await buildSchemas(o, ctx, url, env);
@@ -344,7 +360,11 @@ function isPostPath(path) {
 function isReservedFlatPath(p) {
   if (p === '/' || p === '') return true;
   if (p.startsWith('/feeds/') || p.startsWith('/b/') || p.startsWith('/admin')) return true;
+  // /search, /search/label/* 등 Blogger 네이티브 경로 — 슬러그 라우팅에서 제외해 리디렉션 루프 차단
   if (p.startsWith('/search') || p === '/ncr') return true;
+  // 다중 세그먼트 경로(예: /search/label/여행)는 isReservedFlatPath 외에
+  // resolveSlugRoute의 /^\/[^/]+$/ 체크에도 걸리지 않으므로 이중 안전장치
+  if (p.startsWith('/p/')) return true;
   if (p === '/__debug' || p === '/__metrics' || p === '/__purge_all' ||
       p === '/__lb_status' || p === '/__cache_stats') return true;
   if (/^\/sitemap(-[^/]+)?\.xml$/i.test(p)) return true;
@@ -366,6 +386,13 @@ function decodePathSafe(path) {
 
 async function resolveSlugRoute(rawPath, env) {
   const path = decodePathSafe(rawPath);
+
+  // 다중 세그먼트(예: /search/label/여행, /p/about 등) — 슬러그 라우팅 완전 제외
+  // 이걸 빠뜨리면 /search/label/* 가 여기서 잡혀 리디렉션→다시 resolveSlug→무한루프
+  if (path.indexOf('/', 1) !== -1) {
+    // /YYYY/MM/post.html 형태는 포스트 경로로 허용
+    if (!isPostPath(path)) return { type: 'passthrough' };
+  }
 
   if (isPostPath(path)) {
     const rec = await slugOriginGet(env, path);
@@ -395,15 +422,31 @@ async function updateSlugKV(pageCtx, originPath, env) {
 // Cron 작업
 // ─────────────────────────────────────────────
 async function runSitemapGeneration(env) {
-  // 사이트맵은 호스트가 없으므로 환경 변수에서 가져오거나 스킵
-  const base = env.SITE_BASE_URL || 'https://example.com';
+  // 실제 개인도메인 우선 사용 — SITE_BASE_URL 미설정 시 example.com 대신
+  // SITE_HOST 또는 PRIMARY_HOST 환경변수로도 지정 가능
+  const base = resolveSiteBase(env);
   await generateSitemap(env, base);
 }
 
 async function runRssGeneration(env) {
-  const base  = env.SITE_BASE_URL || 'https://example.com';
-  const title = env.SITE_TITLE    || 'BloggerSEO';
+  const base  = resolveSiteBase(env);
+  const title = env.SITE_TITLE || 'BloggerSEO';
   await generateRss(env, base, title);
+}
+
+// 사이트 베이스 URL 결정 (우선순위: SITE_BASE_URL > SITE_HOST > 빈 문자열로 상대경로)
+// Cron 작업에서는 요청 객체가 없으므로 환경변수에서만 가져온다.
+// 실제 요청 처리 시에는 url.origin을 직접 사용하므로 Cron에서만 이 함수가 의미 있다.
+function resolveSiteBase(env) {
+  if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com') {
+    return env.SITE_BASE_URL.replace(/\/$/, '');
+  }
+  if (env.SITE_HOST) {
+    const host = env.SITE_HOST.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    return 'https://' + host;
+  }
+  // 폴백: 빈 base (사이트맵 loc이 상대경로가 됨 — 개인도메인 설정 미흡 시 경고)
+  return '';
 }
 
 async function runSlugAudit(env) {
@@ -543,14 +586,19 @@ async function handlePanel(request, url, env, ctx) {
     return new Response(JSON.stringify({ unblocked: ip }), jsonHeaders());
   }
   if (subPath === 'api/generate_sitemap') {
-    const base   = env.SITE_BASE_URL || url.origin;
+    // 패널 요청 시 실제 블로그 도메인 사용 (SITE_BASE_URL 환경변수 또는 Referer 기반)
+    const base   = (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com')
+                    ? env.SITE_BASE_URL.replace(/\/$/, '')
+                    : (env.SITE_HOST ? 'https://' + env.SITE_HOST : url.origin.replace('/panel', ''));
     const result = await generateSitemap(env, base);
-    return new Response(JSON.stringify({ count: result.count }), jsonHeaders());
+    return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
   }
   if (subPath === 'api/generate_rss') {
-    const base   = env.SITE_BASE_URL || url.origin;
+    const base   = (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com')
+                    ? env.SITE_BASE_URL.replace(/\/$/, '')
+                    : (env.SITE_HOST ? 'https://' + env.SITE_HOST : url.origin.replace('/panel', ''));
     const result = await generateRss(env, base, env.SITE_TITLE || 'Blog');
-    return new Response(JSON.stringify({ count: result.count }), jsonHeaders());
+    return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
   }
 
   // 관리 패널 HTML
