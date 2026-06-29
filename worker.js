@@ -1757,9 +1757,10 @@ tr:hover td{background:#334155}
 </div>
 
 <div id="toast">✅ 완료</div>
+<script id="panel-cfg" type="application/json">${ JSON.stringify({ s: secret }) }</script>
 
 <script>
-const SECRET = '${secret}';
+const SECRET = JSON.parse(document.getElementById('panel-cfg').textContent).s;
 const api = (path) => fetch('/panel/'+path+'?secret='+encodeURIComponent(SECRET)).then(r=>r.json());
 const apiPost = (path) => fetch('/panel/'+path+'?secret='+encodeURIComponent(SECRET), {method:'POST'}).then(r=>r.json());
 
