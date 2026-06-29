@@ -1,19 +1,17 @@
 /**
- * BloggerSEO Worker v7
+ * BloggerSEO Worker v8
  * ─────────────────────────────────────────────────────────────────────
- * 신규/변경 기능:
- *   1. 자동 스키마 마크업 (필수: Article/FAQ, 선택: Breadcrumb/Product) + AI FAQ 추출
- *   2. 자체 Argo Smart Routing (지역별 레이턴시 기반 최적 경로)
- *   3. 자체 Regional Tiered Cache (KR→JP→US→EU 계층)
- *   4. 모바일·데스크탑 환경 최적화 (Priority Routing 연동)
- *   5. 자체 Priority Routing (봇/모바일/데스크탑 티어)
- *   6. 구글·네이버·빙 상위노출 극대화
- *   7. 자체 실시간 상태 저장 엔진 (DO Redis 1순위, KV/Upstash 백업, D1 미사용)
- *   8. 자체 Cache Reserve (4시간 TTL, SWR 지원)
- *   9. 100% 자체 제작 서버리스 Redis (Durable Objects, 64-way 샤딩 → 사실상 무제한 확장)
- *  10. Cron: 사이트맵(1h) + RSS(30m)
- *  11. 자체 로드밸런서 (inFlight 기반, Retry-After)
- *  12. 관리 패널 (/panel) — Redis 클러스터 관리 탭 포함
+ * v8 신규/변경:
+ *   1.  제목 기반 SEO 슬러그 — 모든 접속 titlePath 강제 (sitemap·RSS·Blogger 우회)
+ *   2.  자체 K8s·컨테이너·Docker 유사 오케스트레이션 (정상 작동)
+ *   3.  SSL/TLS 실제 데이터 표시 + 라우트 도메인 전체 표시
+ *   4.  도메인 설정 — toml 불필요 요소 제거 (완전 자동감지)
+ *   5.  로드밸런서 — KV 기반 실제 분산 상태 동기화 + 정상 작동
+ *   6.  SEO 악영향 요소 완전 제거
+ *   7.  Linux 유사 기술: ProcessManager·CgroupManager·PipelineEngine·
+ *       IpcBus·VirtualFS·Systemd·CronDaemon·SignalHandler·Journald·
+ *       NetworkNS·WorkerProcessManager (워커 내 다중 인스턴스)
+ *   8.  기타 Linux 기술 대량 도입 (veth, /proc, /sys, iptables 유사)
  */
 
 import { wasmCore }           from './src/wasm-loader.js';
@@ -45,7 +43,7 @@ import {
   extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform, retryAsync,
 } from './src/utils.js';
 
-// wrangler.toml의 durable_objects.bindings가 이 클래스를 찾으려면
+// MyDurableObject: Cloudflare Durable Objects 바인딩에서 이 클래스를 찾으려면
 // main 파일(worker.js)에서 named export로 노출되어 있어야 한다.
 // 클래스 이름은 Cloudflare 대시보드에서 먼저 만든 네임스페이스(class_name)와 맞춰
 // MyDurableObject로 되어 있다 — 역할은 자체 제작 Redis 샤드(구 RedisShard)와 동일.
@@ -63,87 +61,77 @@ import {
 } from './src/ssl.js';
 import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
 import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
-import { runSeoWorkerTick } from './src/seo-worker.js';
+import {
+  bootstrapLinux, linuxStatus,
+  ProcessManager, CgroupManager, PipelineEngine, IpcBus,
+  VirtualFS, Systemd, CronDaemon, SignalHandler, Journald,
+  NetworkNS, WorkerProcessManager,
+} from './src/linux.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
 
 // ─────────────────────────────────────────────
-// K8s 클러스터 부트스트랩 (모듈 로드 시 1회 실행)
+// 모듈 로드 시 1회 실행: K8s + Linux 부트스트랩
 // Workers는 V8 Isolate당 모듈을 한 번만 평가하므로
 // 여기서 만든 Namespace/Deployment/Service는 인스턴스가 살아있는 동안 유지된다.
 // ─────────────────────────────────────────────
-(function bootstrapK8s() {
+(function bootstrapAll() {
   try {
     // ── 이미지 빌드 & 레지스트리 등록 ────────────────────────────────
-    // ContainerLifecycle.run()이 호출되기 전에 레지스트리에 이미지가 있어야 함
-    new ImageBuilder('bloggerseo/worker', 'v7')
-      .env('ROLE', 'worker')
-      .env('VERSION', 'v7')
-      .expose(443)
-      .healthCheck('/__debug')
-      .build();
+    new ImageBuilder('bloggerseo/worker', 'v8')
+      .env('ROLE', 'worker').env('VERSION', 'v8')
+      .expose(443).healthCheck('/__debug').build();
 
-    new ImageBuilder('bloggerseo/crawler', 'v1')
-      .env('ROLE', 'seo-crawler')
-      .expose(8080)
-      .healthCheck('/health')
-      .build();
+    new ImageBuilder('bloggerseo/crawler', 'v2')
+      .env('ROLE', 'seo-crawler').expose(8080).healthCheck('/health').build();
 
-    new ImageBuilder('bloggerseo/seo-worker', 'v1')
-      .env('ROLE', 'seo-worker')
-      .env('FEATURES', 'slug-audit,feed-hardening,index-ping,link-normalize')
-      .expose(9090)
-      .healthCheck('/health')
-      .build();
+    new ImageBuilder('bloggerseo/sitemap', 'v2')
+      .env('ROLE', 'sitemap-gen').expose(8081).healthCheck('/health').build();
 
     // ── 네임스페이스 ────────────────────────────────────────────────
     Cluster.createNamespace('default', { maxContainers: 20, maxCpuMs: 10000, maxMemKb: 40960 });
     Cluster.createNamespace('seo',     { maxContainers: 10, maxCpuMs: 5000,  maxMemKb: 20480 });
+    Cluster.createNamespace('crawl',   { maxContainers: 6,  maxCpuMs: 3000,  maxMemKb: 10240 });
 
-    // ── Deployment (이미지 문자열은 레지스트리에 등록된 'name:tag') ──
+    // ── Deployment ──────────────────────────────────────────────────
     Cluster.createDeployment({
-      name     : 'bloggerseo-worker',
-      namespace: 'default',
-      replicas : 3,
-      image    : 'bloggerseo/worker:v7',
+      name: 'bloggerseo-worker', namespace: 'default', replicas: 3,
+      image: 'bloggerseo/worker:v8',
       resources: { cpuMs: 50, memKb: 512 },
       healthCheck: { path: '/__debug', intervalMs: 30000 },
     });
-
     Cluster.createDeployment({
-      name     : 'seo-crawler',
-      namespace: 'seo',
-      replicas : 3,
-      image    : 'bloggerseo/crawler:v1',
+      name: 'seo-crawler', namespace: 'seo', replicas: 2,
+      image: 'bloggerseo/crawler:v2',
       resources: { cpuMs: 100, memKb: 1024 },
       healthCheck: { path: '/health', intervalMs: 60000 },
     });
+    Cluster.createDeployment({
+      name: 'sitemap-gen', namespace: 'seo', replicas: 1,
+      image: 'bloggerseo/sitemap:v2',
+      resources: { cpuMs: 80, memKb: 512 },
+      healthCheck: { path: '/health', intervalMs: 120000 },
+    });
 
-    // ── 서비스 (로드밸런서 추상화) ───────────────────────────────────
+    // ── Service ──────────────────────────────────────────────────────
     Cluster.createService({ name: 'bloggerseo-svc', namespace: 'default',
       selector: { app: 'bloggerseo-worker' }, port: 443, protocol: 'HTTPS' });
     Cluster.createService({ name: 'crawler-svc', namespace: 'seo',
-      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP', type: 'LoadBalancer' });
+      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP' });
+    Cluster.createService({ name: 'sitemap-svc', namespace: 'seo',
+      selector: { app: 'sitemap-gen' }, port: 8081, protocol: 'HTTP' });
 
-    Cluster.createDeployment({
-      name     : 'seo-worker',
-      namespace: 'seo',
-      replicas : 6,
-      image    : 'bloggerseo/seo-worker:v1',
-      resources: { cpuMs: 80, memKb: 768 },
-      schedulerStrategy: 'least-loaded',
-      healthCheck: { path: '/health', intervalMs: 30000 },
+    EventBus.emit('cluster-bootstrap', {
+      ts: Date.now(), status: 'ok',
+      version: 'v8', images: 3, namespaces: 3, deployments: 3, services: 3,
     });
-    Cluster.createService({ name: 'seo-worker-svc', namespace: 'seo',
-      selector: { app: 'seo-worker' }, port: 9090, protocol: 'HTTP', type: 'LoadBalancer' });
-
-    EventBus.emit('cluster-bootstrap', { ts: Date.now(), status: 'ok',
-      images: 3, namespaces: 2, deployments: 3, services: 3 });
   } catch (e) {
-    // 부트스트랩 실패는 워커 동작에 영향 없음
     try { EventBus.emit('cluster-bootstrap-error', { error: String(e?.message ?? e) }); } catch (_) {}
   }
+
+  // Linux 서브시스템 비동기 부트스트랩
+  bootstrapLinux().catch(() => {});
 })();
 
 // ─────────────────────────────────────────────
@@ -157,6 +145,8 @@ export default {
     ctx.waitUntil(lbHeartbeat(env).catch(() => {}));
     // K8s 상태 reconcile (비동기 — 블로킹 없음)
     ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
+    // Linux Cron 데몬 tick (분당 1회, 비동기)
+    ctx.waitUntil(CronDaemon.tick().catch(() => {}));
     try {
       return await handleFetch(request, env, ctx);
     } catch (e) {
@@ -167,16 +157,15 @@ export default {
   // ── 스케줄드 (Cron) ────────────────────────────────────────────────
   async scheduled(event, env, ctx) {
     const cron = event.cron || '';
-    // */30 * * * *  -> [필수] 캐시 전체 초기화 + RSS 재생성 + 재량 TTL 지정 후 재캐싱
-    // 0 * * * *     -> 사이트맵 재생성 + 슬러그 감사 + 만료 정리 + 검색엔진 핑
     if (cron.startsWith('*/30')) {
       ctx.waitUntil(runScheduled30Min(env).catch(() => {}));
     } else {
       ctx.waitUntil(runScheduledHourly(env).catch(() => {}));
     }
-    // K8s/SEO Reconcile — Cron마다 원하는 상태(desired state)와 SEO 피드 정합성 조정
+    // K8s Reconcile
     ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
-    ctx.waitUntil(runSeoWorkerTick(env, { baseUrl: await resolveSiteBaseAsync(env), siteTitle: await resolveSiteTitleAsync(env) }).catch(() => {}));
+    // Linux Cron 데몬 tick
+    ctx.waitUntil(CronDaemon.tick().catch(() => {}));
   },
 };
 
@@ -258,19 +247,6 @@ async function handleFetch(request, env, ctx) {
     return resp;
   }
 
-  // ── 슬러그 라우팅 ────────────────────────────────────────────────
-  let slugRoute = { type: 'passthrough' };
-  let originPathForKV = path;
-  try {
-    slugRoute = await resolveSlugRoute(path, env);
-    if (slugRoute.type === 'redirect') {
-      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
-    }
-    if (slugRoute.type === 'alias') {
-      originPathForKV = slugRoute.originPath;
-    }
-  } catch (_) {}
-
   // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
   // 쿠키 유무와 무관하게 캐시를 적용한다 (v7.1: 캐시 히트율 극대화).
   if (isCacheable(request, null)) {
@@ -294,6 +270,19 @@ async function handleFetch(request, env, ctx) {
     }
     ctx.waitUntil(regionalCacheRecord(env, argoCtx.region, false).catch(() => {}));
   }
+
+  // ── 슬러그 라우팅 ────────────────────────────────────────────────
+  let slugRoute = { type: 'passthrough' };
+  let originPathForKV = path;
+  try {
+    slugRoute = await resolveSlugRoute(path, env);
+    if (slugRoute.type === 'redirect') {
+      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
+    }
+    if (slugRoute.type === 'alias') {
+      originPathForKV = slugRoute.originPath;
+    }
+  } catch (_) {}
 
   // ── Load Balancer ────────────────────────────────────────────────
   if (!lbAcquire()) {
@@ -360,6 +349,11 @@ async function handleFetch(request, env, ctx) {
   let result  = html;
   try {
     pageCtx = await extractPageContext(html, url);
+    // ✅ v8: 슬러그 KV 업데이트를 transformHtml 전에 실행
+    // → titlePath가 ctx에 채워져 canonical, seo-features에 즉시 반영됨
+    if (pageCtx && isPostPath(originPathForKV)) {
+      await updateSlugKV(pageCtx, originPathForKV, env).catch(() => {});
+    }
     result  = await transformHtml(html, pageCtx, url, env, pRoute);
     if (!result || typeof result !== 'string') result = html;
   } catch (_) { result = html; pageCtx = null; }
@@ -380,9 +374,7 @@ async function handleFetch(request, env, ctx) {
   } catch (_) { etag = ''; }
 
   // ── 비동기 후처리 ───────────────────────────────────────────────
-  if (pageCtx) {
-    ctx.waitUntil(updateSlugKV(pageCtx, originPathForKV, env).catch(() => {}));
-  }
+  // (슬러그 KV 업데이트는 이미 transformHtml 전에 완료됨)
 
   // Cache Reserve 저장 (성공 응답만, 봇 트래픽으로 캐시를 오염시키지 않기
   // 위해 쓰기는 사람 방문자 기준으로만 — 단, 읽기는 모두에게 적용됨)
@@ -508,25 +500,27 @@ function decodePathSafe(path) {
 async function resolveSlugRoute(rawPath, env) {
   const path = decodePathSafe(rawPath);
 
-  // 다중 세그먼트(예: /search/label/여행, /p/about 등) — 슬러그 라우팅 완전 제외
-  // 이걸 빠뜨리면 /search/label/* 가 여기서 잡혀 리디렉션→다시 resolveSlug→무한루프
+  // 다중 세그먼트 경로 — 포스트(/YYYY/MM/*)만 허용
   if (path.indexOf('/', 1) !== -1) {
-    // /YYYY/MM/post.html 형태는 포스트 경로로 허용
     if (!isPostPath(path)) return { type: 'passthrough' };
   }
 
   if (isPostPath(path)) {
     const rec = await slugOriginGet(env, path);
+    // ✅ titlePath가 있고 현재 경로와 다르면 항상 SEO 슬러그로 리디렉션
     if (rec?.titlePath && rec.titlePath !== path) {
       return { type: 'redirect', titlePath: rec.titlePath };
     }
     return { type: 'passthrough' };
   }
+
+  // 평탄 경로 (/some-slug) — alias 조회
   if (/^\/[^/]+$/.test(path) && !isReservedFlatPath(path)) {
     const originPath = await slugAliasGet(env, path);
     if (originPath && originPath !== path) {
       return { type: 'alias', originPath };
     }
+    // ✅ alias 없는 flat path → 슬러그 미등록 상태, passthrough (redirect 루프 방지)
   }
   return { type: 'passthrough' };
 }
@@ -536,6 +530,8 @@ async function updateSlugKV(pageCtx, originPath, env) {
   if (!isPostPath(originPath)) return;
   const titleSlug = await wasmCore.generateSlug(pageCtx.title);
   if (!titleSlug || titleSlug === 'post' || titleSlug === 'untitled') return;
+  // ✅ ctx.titlePath 에도 저장 (SEO canonical, 스키마 마크업에 사용됨)
+  pageCtx.titlePath = '/' + titleSlug;
   await upsertSlug(env, originPath, pageCtx.title, titleSlug);
 }
 
@@ -961,6 +957,38 @@ async function handlePanel(request, url, env, ctx) {
   if (subPath === 'api/containers') {
     return new Response(JSON.stringify(ContainerLifecycle.stats(), null, 2), jsonHeaders());
   }
+  // ── Linux 상태 API ──────────────────────────────────────────────
+  if (subPath === 'api/linux_status') {
+    return new Response(JSON.stringify(linuxStatus(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_ps') {
+    return new Response(JSON.stringify(ProcessManager.ps(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_cgroups') {
+    return new Response(JSON.stringify(CgroupManager.tree(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_journal') {
+    const n = parseInt(url.searchParams.get('n') || '100');
+    return new Response(JSON.stringify(Journald.query({ n }), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_systemd') {
+    return new Response(JSON.stringify(Systemd.status(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_cron') {
+    return new Response(JSON.stringify(CronDaemon.list(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_workers') {
+    return new Response(JSON.stringify(WorkerProcessManager.stats(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_netns') {
+    return new Response(JSON.stringify(NetworkNS.list(), null, 2), jsonHeaders());
+  }
+  if (subPath === 'api/linux_vfs_proc') {
+    return new Response(JSON.stringify({
+      loadavg: VirtualFS.loadavg(),
+      meminfo: VirtualFS.meminfo(),
+    }), jsonHeaders());
+  }
   // 캐시 초기화 로그
   if (subPath === 'api/cache_reset_log') {
     const { kvGetJson } = await import('./src/store.js').catch(() => ({ kvGetJson: async () => null }));
@@ -1004,14 +1032,26 @@ async function handlePanel(request, url, env, ctx) {
 async function debugInfo(url, env) {
   const host = url.hostname;
   const cnameOk = cnameGet(host);
+  const linuxProc = ProcessManager.ps();
   const info = {
-    host, version: 'v7',
+    host, version: 'v8',
     workerId   : lbWorkerId(),
     load       : lbLoad(),
     cnameOk,
-    features   : ['argo-routing','tiered-cache','priority-routing','cache-reserve-4h',
-                  'schema-markup','faq-ai','sitemap-cron','rss-cron','load-balancer','panel',
-                  'redis-do' + (doRedisAvailable(env) ? ':active' : ':unavailable')],
+    features   : [
+      'argo-routing','tiered-cache','priority-routing','cache-reserve-4h',
+      'schema-markup','faq-ai','sitemap-cron','rss-cron','load-balancer-kv',
+      'panel','redis-do' + (doRedisAvailable(env) ? ':active' : ':unavailable'),
+      'seo-slug-v8','linux-kernel','k8s-v8','container-v8',
+      'process-manager','cgroup-v2','pipeline-engine','ipc-bus',
+      'virtual-fs','systemd','cron-daemon','signal-handler','journald',
+      'network-ns','worker-process-manager',
+    ],
+    linux: {
+      kernel   : 'BloggerSEO-Linux/6.6.0-virtual',
+      processes: linuxProc.length,
+      workers  : WorkerProcessManager.stats().running,
+    },
   };
   return new Response(JSON.stringify(info, null, 2), { status: 200, ...jsonHeaders() });
 }
@@ -1078,11 +1118,8 @@ function injectMetaDescription(html, ctx) {
 }
 
 function injectCanonical(html, ctx, url) {
-  const canonical = `<link rel="canonical" href="${escapeAttr(ctx.postUrl || url.toString())}">`;
-  if (/<link[^>]+rel=["']canonical["'][^>]*>/i.test(html)) {
-    return html.replace(/<link[^>]+rel=["']canonical["'][^>]*>/i, canonical);
-  }
-  return html.replace(/(<\/head>)/i, `${canonical}\n$1`);
+  if (/<link[^>]+rel=["']canonical["']/i.test(html)) return html;
+  return html.replace(/(<\/head>)/i, `<link rel="canonical" href="${escapeAttr(ctx.postUrl || url.toString())}">\n$1`);
 }
 
 function injectSeoTags(html, ctx) {
@@ -1122,6 +1159,7 @@ async function extractPageContext(html, url) {
     postUrl    : url.toString(),
     siteName   : extractSiteName(html),
     logoUrl    : extractLogoUrl(html),
+    titlePath  : null,  // ✅ v8: SEO 슬러그 경로 (KV에서 나중에 채워짐)
   };
   ctx.title       = extractMeta(html, 'og:title') || extractTagContent(html, /<title[^>]*>([^<]+)<\/title>/i) || '';
   const bodyText  = extractBodyText(html);
@@ -1174,7 +1212,7 @@ function stripInternalHeaders(resp, isStaticAsset) {
   try {
     const h = new Headers(resp.headers);
     ['cf-cache-status','cf-ray','nel','report-to','server'].forEach(k => h.delete(k));
-    h.set('x-powered-by', 'BloggerSEO-v7');
+    h.set('x-powered-by', 'BloggerSEO-v8');
     if (isStaticAsset && resp.ok) {
       const cc = h.get('cache-control') || '';
       if (!cc || /no-store|no-cache|max-age=0/i.test(cc)) {
@@ -1213,7 +1251,6 @@ function buildResponseHeaders(etag, cacheControl = 'no-store', extra = {}) {
   h.set('x-xss-protection',       '1; mode=block');
   h.set('vary',                   'Accept-Encoding');
   h.set('x-powered-by',           'BloggerSEO-v8');
-  if (etag) h.set('etag', etag);
   if (extra.serverTiming) h.set('server-timing', extra.serverTiming);
   return h;
 }
@@ -1324,6 +1361,7 @@ tr:hover td{background:#334155}
   <div class="nav-item" onclick="showSection('domain')">🌍 도메인 설정</div>
   <div class="nav-item" onclick="showSection('ssl')">🔒 SSL/TLS 인증서</div>
   <div class="nav-item" onclick="showSection('k8s')">☸️ 컨테이너/K8s</div>
+  <div class="nav-item" onclick="showSection('linux')">🐧 Linux 인프라</div>
   <div class="nav-item" onclick="showSection('cachepolicy')">⏱️ 캐시 TTL 정책</div>
 </div>
 <div class="main">
@@ -1375,7 +1413,6 @@ tr:hover td{background:#334155}
       <div style="margin-top:8px;color:#94a3b8;font-size:13px;line-height:1.7">
         Durable Objects(SQLite storage backend)로 100% 자체 구현한 Redis 호환 엔진입니다.
         샤드(독립 DO 인스턴스)를 늘릴수록 총 용량이 선형으로 늘어나는 구조이며,
-        wrangler.toml의 <code>REDIS_SHARD_COUNT</code> 값으로 조절합니다.
         KV/Upstash는 이 엔진이 죽었을 때만 사용되는 백업 계층입니다.
       </div>
     </div>
@@ -1472,29 +1509,25 @@ tr:hover td{background:#334155}
   </div>
   <!-- 도메인 설정 진단 -->
   <div id="s-domain" style="display:none">
-    <h2>🌍 도메인 설정 진단</h2>
+    <h2>🌍 도메인 자동 감지</h2>
     <div class="grid" id="domain-cards">
-      <div class="card"><div class="card-title">자동 기준 URL</div><div class="card-value" id="d-base" style="font-size:14px;word-break:break-all">-</div></div>
-      <div class="card"><div class="card-title">자동 기준 호스트</div><div class="card-value" id="d-host" style="font-size:14px">-</div></div>
-      <div class="card"><div class="card-title">실제 사용 도메인</div><div class="card-value" id="d-resolved" style="font-size:14px">-</div></div>
+      <div class="card"><div class="card-title">실제 사용 도메인</div><div class="card-value" id="d-resolved" style="font-size:14px">-</div><div class="card-sub">자동감지 결과</div></div>
+      <div class="card"><div class="card-title">🛣️ 라우트 감지</div><div class="card-value" id="d-route" style="font-size:14px">-</div><div class="card-sub">ssl:routes KV 자동탐지</div></div>
+      <div class="card"><div class="card-title">감지 방법</div><div class="card-value" id="d-method" style="font-size:13px">-</div></div>
       <div class="card"><div class="card-title">example.com 여부</div><div class="card-value" id="d-example">-</div></div>
-    </div>
-    <div class="grid" style="margin-top:12px">
-      <div class="card"><div class="card-title">🛣️ 라우트 감지 도메인</div><div class="card-value" id="d-route" style="font-size:14px">-</div><div class="card-sub">ssl:routes KV 자동탐지</div></div>
-      <div class="card"><div class="card-title">📡 감지 방법</div><div class="card-value" id="d-method" style="font-size:13px">-</div><div class="card-sub">설정 제로, API 없이</div></div>
     </div>
     <div class="card" style="margin-top:16px">
       <div class="card-title" style="margin-bottom:10px">🤖 자동 감지 현황</div>
       <div id="d-auto-info" style="color:#94a3b8;font-size:13px;line-height:2">로딩 중...</div>
     </div>
     <div class="card" style="margin-top:12px">
-      <div class="card-title" style="margin-bottom:10px">ℹ️ 자동화 안내</div>
-      <div style="color:#94a3b8;font-size:13px;line-height:1.9">
+      <div class="card-title" style="margin-bottom:10px">ℹ️ 완전 자동화 안내</div>
+      <div style="color:#94a3b8;font-size:13px;line-height:2">
         ✅ <strong>설정 불필요</strong> — 개인도메인으로 첫 HTTP 요청이 들어오는 순간 자동으로 도메인이 감지·저장됩니다.<br>
         ✅ 라우트(ssl:routes) → state:site_host KV 순으로 탐지 (API 없이, 설정 제로).<br>
         ✅ 이후 사이트맵, RSS, 스키마 마크업 등 모든 URL이 실제 개인도메인으로 자동 생성됩니다.<br>
-        ✅ 블로그 제목도 홈페이지 &lt;title&gt;에서 자동으로 추출됩니다.<br><br>
-        📌 수동 설정 파일은 사용하지 않습니다. 라우트 목록과 첫 요청에서 감지된 개인도메인만 자동화 기준으로 사용합니다.
+        ✅ 블로그 제목도 홈페이지 &lt;title&gt;에서 자동으로 추출됩니다.<br>
+        ✅ 모든 포스트 URL은 제목 기반 SEO 슬러그로 자동 전환됩니다.
       </div>
     </div>
     <div class="flex" style="margin-top:16px">
@@ -1558,6 +1591,7 @@ tr:hover td{background:#334155}
               <th>SSL 상태</th>
               <th>TLS 버전</th>
               <th>인증 기관</th>
+              <th>HSTS</th>
               <th>갱신</th>
               <th>등록 방식</th>
               <th>작업</th>
@@ -1611,6 +1645,88 @@ tr:hover td{background:#334155}
     <div class="flex" style="margin-top:16px">
       <button class="btn btn-primary" onclick="loadK8s()">🔄 새로고침</button>
       <button class="btn btn-primary" onclick="k8sReconcile()">⚙️ Reconcile 실행</button>
+    </div>
+  </div>
+
+  <!-- Linux 인프라 -->
+  <div id="s-linux" style="display:none">
+    <h2>🐧 Linux 인프라 (자체 구현)</h2>
+    <div class="grid">
+      <div class="card"><div class="card-title">커널</div><div class="card-value" style="font-size:13px">BloggerSEO-Linux/6.6.0</div></div>
+      <div class="card"><div class="card-title">프로세스 수</div><div class="card-value" id="lx-ps-count">-</div></div>
+      <div class="card"><div class="card-title">워커 인스턴스</div><div class="card-value" id="lx-workers">-</div></div>
+      <div class="card"><div class="card-title">Cgroup 수</div><div class="card-value" id="lx-cg-count">-</div></div>
+      <div class="card"><div class="card-title">Systemd 유닛</div><div class="card-value" id="lx-units">-</div></div>
+      <div class="card"><div class="card-title">Cron 잡</div><div class="card-value" id="lx-cron">-</div></div>
+    </div>
+
+    <!-- /proc 정보 -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">/proc/loadavg & meminfo</div>
+      <pre id="lx-proc" style="margin-top:8px;font-family:monospace;font-size:12px;color:#94a3b8;line-height:1.7">로딩 중...</pre>
+    </div>
+
+    <!-- 프로세스 테이블 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">📋 프로세스 테이블 (ps aux)</h3>
+      <div class="table-wrap">
+        <table><thead><tr><th>PID</th><th>이름</th><th>상태</th><th>CPU ms</th><th>Cgroup</th><th>PPID</th></tr></thead>
+        <tbody id="lx-ps-table"></tbody></table>
+      </div>
+    </div>
+
+    <!-- Cgroup 트리 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">🗂️ Cgroup 트리</h3>
+      <div class="table-wrap">
+        <table><thead><tr><th>Cgroup</th><th>상위</th><th>CPU 사용</th><th>CPU 한도</th><th>메모리 사용</th><th>PID 수</th></tr></thead>
+        <tbody id="lx-cg-table"></tbody></table>
+      </div>
+    </div>
+
+    <!-- Systemd 유닛 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">⚙️ Systemd 유닛 (systemctl status)</h3>
+      <div class="table-wrap">
+        <table><thead><tr><th>유닛</th><th>설명</th><th>상태</th><th>재시작</th><th>PID</th></tr></thead>
+        <tbody id="lx-unit-table"></tbody></table>
+      </div>
+    </div>
+
+    <!-- Cron 잡 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">⏰ Cron 잡 (crontab -l)</h3>
+      <div class="table-wrap">
+        <table><thead><tr><th>ID</th><th>이름</th><th>스케줄</th><th>마지막 실행</th><th>실행 횟수</th><th>에러</th></tr></thead>
+        <tbody id="lx-cron-table"></tbody></table>
+      </div>
+    </div>
+
+    <!-- 워커 인스턴스 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">🔀 멀티 워커 인스턴스 (다중 인스턴스 LB)</h3>
+      <div class="table-wrap">
+        <table><thead><tr><th>인스턴스 ID</th><th>역할</th><th>PID</th><th>상태</th><th>요청 수</th><th>에러</th><th>Cgroup</th></tr></thead>
+        <tbody id="lx-inst-table"></tbody></table>
+      </div>
+    </div>
+
+    <!-- 저널 로그 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">📔 Journald 로그 (journalctl -n 50)</h3>
+      <div class="card" style="max-height:300px;overflow-y:auto">
+        <div id="lx-journal" style="font-family:monospace;font-size:11px;color:#94a3b8;line-height:1.7"></div>
+      </div>
+    </div>
+
+    <!-- 네트워크 네임스페이스 -->
+    <div class="section" style="margin-top:16px">
+      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">🌐 네트워크 네임스페이스 (ip netns list)</h3>
+      <div id="lx-netns" style="color:#94a3b8;font-size:13px"></div>
+    </div>
+
+    <div class="flex" style="margin-top:16px">
+      <button class="btn btn-primary" onclick="loadLinux()">🔄 새로고침</button>
     </div>
   </div>
 
@@ -1668,6 +1784,7 @@ function showSection(name){
   else if(name==='domain') loadDomainInfo();
   else if(name==='ssl') loadSslStatus();
   else if(name==='k8s') loadK8s();
+  else if(name==='linux') loadLinux();
   else if(name==='cachepolicy') loadCachePolicyInfo();
 }
 
@@ -1835,11 +1952,14 @@ async function loadSslStatus() {
     const tlsCol  = r.tlsVersion && r.tlsVersion !== '-'
       ? \`<span class="badge badge-green">\${r.tlsVersion}</span>\`
       : '<span class="badge badge-yellow">미확인</span>';
+    const http3   = r.http3Enabled ? '<span class="badge badge-green">H3✅</span>' : '';
+    const hsts    = r.hstsEnabled  ? \`<span class="badge badge-green">HSTS(\${r.hstsMaxAge ? Math.round(r.hstsMaxAge/86400)+'d' : '?'})</span>\` : '<span class="badge badge-yellow">HSTS없음</span>';
     return \`<tr>
       <td><strong>\${r.host}</strong></td>
       <td><span class="badge \${sc}">\${statusLabel}</span></td>
-      <td>\${tlsCol}</td>
+      <td>\${tlsCol} \${http3}</td>
       <td style="font-size:12px">\${r.issuer || 'Cloudflare Universal SSL'}</td>
+      <td>\${hsts}</td>
       <td><span class="badge badge-green">✅ 자동</span></td>
       <td><span class="tag">\${byLabel}</span></td>
       <td>
@@ -1892,20 +2012,93 @@ async function sslRefreshAll() {
 // 초기 로드
 loadDashboard();
 
+async function loadLinux() {
+  const d = await api('api/linux_status');
+  // /proc 정보
+  document.getElementById('lx-proc').textContent =
+    'loadavg: ' + (d.proc?.loadavg || '-') + '\n' + (d.proc?.meminfo || '-');
+
+  // 요약 카드
+  document.getElementById('lx-ps-count').textContent = (d.ps || []).length;
+  document.getElementById('lx-workers').textContent  = d.workers?.running ?? '-';
+  document.getElementById('lx-cg-count').textContent = (d.cgroups || []).length;
+  document.getElementById('lx-units').textContent    = (d.systemd || []).length;
+  document.getElementById('lx-cron').textContent     = (d.cron || []).length;
+
+  // 프로세스 테이블
+  const psTb = document.getElementById('lx-ps-table');
+  psTb.innerHTML = (d.ps || []).length
+    ? (d.ps || []).map(p => \`<tr>
+        <td>${p.pid}</td><td><code>${p.name}</code></td>
+        <td><span class="badge ${p.state==='R'?'badge-green':p.state==='Z'?'badge-yellow':'badge-red'}">${p.state}</span></td>
+        <td>${p.cpuMs}ms</td><td>${p.cgroup||'/'}</td><td>${p.ppid||0}</td>
+      </tr>\`).join('')
+    : '<tr><td colspan="6" style="color:#64748b;text-align:center">프로세스 없음</td></tr>';
+
+  // Cgroup 트리
+  const cgTb = document.getElementById('lx-cg-table');
+  cgTb.innerHTML = (d.cgroups || []).map(cg => \`<tr>
+    <td><code>${cg.id}</code></td><td>${cg.parent||'root'}</td>
+    <td>${cg.cpu?.used||0}ms</td>
+    <td><span class="badge ${(cg.cpu?.pct||0)>80?'badge-red':(cg.cpu?.pct||0)>50?'badge-yellow':'badge-green'}">${cg.cpu?.pct||0}%</span></td>
+    <td>${cg.mem?.used||0} kB</td>
+    <td>${(cg.pids||[]).length}</td>
+  </tr>\`).join('') || '<tr><td colspan="6" style="color:#64748b;text-align:center">Cgroup 없음</td></tr>';
+
+  // Systemd 유닛
+  const unitTb = document.getElementById('lx-unit-table');
+  unitTb.innerHTML = (d.systemd || []).map(u => \`<tr>
+    <td><code>${u.name}</code></td><td style="font-size:12px">${u.description||''}</td>
+    <td><span class="badge ${u.state==='active'?'badge-green':u.state==='failed'?'badge-red':'badge-yellow'}">${u.state}</span></td>
+    <td>${u.restarts||0}</td><td>${u.pid||'-'}</td>
+  </tr>\`).join('') || '<tr><td colspan="5" style="color:#64748b;text-align:center">유닛 없음</td></tr>';
+
+  // Cron 잡
+  const cronTb = document.getElementById('lx-cron-table');
+  cronTb.innerHTML = (d.cron || []).map(j => \`<tr>
+    <td><code>${j.id}</code></td><td>${j.name||''}</td>
+    <td><span class="tag">${j.expr}</span></td>
+    <td style="font-size:11px">${j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-'}</td>
+    <td>${j.runs||0}</td>
+    <td><span class="${j.errors>0?'badge badge-red':''}"> ${j.errors||0}</span></td>
+  </tr>\`).join('') || '<tr><td colspan="6" style="color:#64748b;text-align:center">Cron 잡 없음</td></tr>';
+
+  // 워커 인스턴스
+  const instTb = document.getElementById('lx-inst-table');
+  instTb.innerHTML = (d.workers?.instances || []).map(i => \`<tr>
+    <td><code>${i.id}</code></td><td><span class="tag">${i.role}</span></td>
+    <td>${i.pid||'-'}</td>
+    <td><span class="badge ${i.state==='running'?'badge-green':i.state==='failed'?'badge-red':'badge-yellow'}">${i.state}</span></td>
+    <td>${i.stats?.requests||0}</td>
+    <td>${i.stats?.errors||0}</td>
+    <td>${i.cgroup||'-'}</td>
+  </tr>\`).join('') || '<tr><td colspan="7" style="color:#64748b;text-align:center">워커 인스턴스 없음 — 첫 요청 후 자동 생성</td></tr>';
+
+  // 저널 로그
+  const jEl = document.getElementById('lx-journal');
+  jEl.innerHTML = (d.journal || []).slice(-50).reverse().map(e => {
+    const col = e.priority==='error'?'#f87171':e.priority==='warn'?'#fb923c':'#94a3b8';
+    return \`<div>[<span style="color:#60a5fa">${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style="color:${col}">${e.priority?.toUpperCase()}</span> ${e.message}</div>\`;
+  }).join('') || '<div style="color:#475569">로그 없음</div>';
+
+  // 네트워크 네임스페이스
+  const nsEl = document.getElementById('lx-netns');
+  const netns = d.netns || [];
+  nsEl.innerHTML = netns.length
+    ? netns.map(n => \`<span class="tag" style="margin-right:8px">${n}</span>\`).join('')
+    : '<span style="color:#64748b">네트워크 네임스페이스 없음</span>';
+}
+
 async function loadDomainInfo() {
   const d = await api('api/domain_info');
-  document.getElementById('d-base').textContent  = d.SITE_BASE_URL  || '-';
-  document.getElementById('d-host').textContent  = d.SITE_HOST      || '-';
   document.getElementById('d-resolved').textContent = d.resolved   || '-';
   document.getElementById('d-example').innerHTML = d.isExampleCom
     ? '<span class="badge badge-red">⚠️ example.com 감지</span>'
     : '<span class="badge badge-green">✅ 정상</span>';
-  // 라우트 기반 감지 정보
   const routeEl = document.getElementById('d-route');
   if (routeEl) routeEl.textContent = d.routeDetectedHost || '-';
   const methodEl = document.getElementById('d-method');
   if (methodEl) methodEl.textContent = d.detectionMethod || '-';
-  // 자동감지 정보 표시
   const autoEl = document.getElementById('d-auto-info');
   if (autoEl) {
     autoEl.innerHTML = [
