@@ -2011,14 +2011,11 @@ async function sslRefreshAll() {
   loadSslStatus();
 }
 
-// 초기 로드
-loadDashboard();
-
 async function loadLinux() {
   const d = await api('api/linux_status');
   // /proc 정보
   document.getElementById('lx-proc').textContent =
-    'loadavg: ' + (d.proc?.loadavg || '-') + '\n' + (d.proc?.meminfo || '-');
+    'loadavg: ' + (d.proc?.loadavg || '-') + '\\n' + (d.proc?.meminfo || '-');
 
   // 요약 카드
   document.getElementById('lx-ps-count').textContent = (d.ps || []).length;
@@ -2163,6 +2160,9 @@ async function loadCachePolicyInfo() {
     \${Object.entries(pol).map(([k,v])=>\`  &nbsp;&nbsp;<span class="tag">\${k}</span> \${v}초\`).join('<br>')}
   \`;
 }
+
+// 초기 로드 (모든 함수 정의 완료 후)
+document.addEventListener('DOMContentLoaded', () => { loadDashboard(); });
 </script>
 </body>
 </html>`;
