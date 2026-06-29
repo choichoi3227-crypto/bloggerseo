@@ -105,11 +105,10 @@ export function injectRobotsMeta(html, pageType) {
 }
 
 // ── 4. Canonical URL 강화 (중복 URL 패턴 정규화) ─────────────────────────
-export function strengthenCanonical(html, url) {
-  // 이미 canonical이 있으면 강제로 올바른 값으로 교체
-  const canonical = buildCanonical(url);
+export function strengthenCanonical(html, url, titlePath = null) {
+  // ✅ v8: SEO 슬러그(titlePath) 기반 canonical — 없으면 정규화 URL
+  const canonical = buildCanonical(url, titlePath);
   if (html.includes('rel="canonical"') || html.includes("rel='canonical'")) {
-    // 기존 canonical을 정규화된 값으로 교체
     return html.replace(
       /<link\s+rel=["']canonical["'][^>]*>/gi,
       `<link rel="canonical" href="${escapeAttr(canonical)}">`
@@ -120,13 +119,18 @@ export function strengthenCanonical(html, url) {
   );
 }
 
-function buildCanonical(url) {
-  // m=1 파라미터(Blogger 모바일) 제거, www 통일
+function buildCanonical(url, titlePath = null) {
   const u = new URL(url.toString());
-  u.searchParams.delete('m');
+  // ✅ SEO 악영향 파라미터 전부 제거
+  ['m','blogedit','postID','action','widgetType','fbclid',
+   'utm_source','utm_medium','utm_campaign','utm_content','utm_term',
+   'ref','source','_ga','gclid'].forEach(p => u.searchParams.delete(p));
   u.hash = '';
-  // https 강제
   u.protocol = 'https:';
+  // ✅ SEO 슬러그 경로 우선 사용
+  if (titlePath && titlePath !== '/') {
+    u.pathname = titlePath;
+  }
   return u.toString();
 }
 
@@ -515,12 +519,14 @@ export function applyAllSeoFeatures(html, ctx, url, env) {
   const hasImage  = !!ctx.imageUrl;
   const siteTitle = ctx.siteName || env?.SITE_TITLE || 'Blog';
   const lang      = env?.SITE_LANG || 'ko';
+  // ✅ v8: ctx에 titlePath가 있으면 canonical에 SEO 슬러그 URL 사용
+  const titlePath = ctx.titlePath || null;
 
   let o = html;
   o = injectHreflang(o, url, lang);
   o = injectBreadcrumb(o, url, pageType, siteTitle);
   o = injectRobotsMeta(o, pageType);
-  o = strengthenCanonical(o, url);
+  o = strengthenCanonical(o, url, titlePath);
   o = injectResourceHints(o);
   o = injectImageAlts(o, ctx.title);
   o = normalizeLinks(o, host);
