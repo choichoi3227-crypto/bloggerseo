@@ -1350,19 +1350,19 @@ tr:hover td{background:#334155}
 <body>
 <div class="sidebar">
   <div class="logo">🚀 BloggerSEO v7</div>
-  <div class="nav-item active" onclick="showSection('dashboard')">📊 대시보드</div>
-  <div class="nav-item" onclick="showSection('cache')">💾 캐시 관리</div>
-  <div class="nav-item" onclick="showSection('redis')">🧬 Redis 관리</div>
-  <div class="nav-item" onclick="showSection('routing')">🌐 라우팅 상태</div>
-  <div class="nav-item" onclick="showSection('lb')">⚖️ 로드밸런서</div>
-  <div class="nav-item" onclick="showSection('analytics')">📈 캐시 애널리틱스</div>
-  <div class="nav-item" onclick="showSection('security')">🛡️ 보안/IP 관리</div>
-  <div class="nav-item" onclick="showSection('sitemap')">🗺️ 사이트맵/RSS</div>
-  <div class="nav-item" onclick="showSection('domain')">🌍 도메인 설정</div>
-  <div class="nav-item" onclick="showSection('ssl')">🔒 SSL/TLS 인증서</div>
-  <div class="nav-item" onclick="showSection('k8s')">☸️ 컨테이너/K8s</div>
-  <div class="nav-item" onclick="showSection('linux')">🐧 Linux 인프라</div>
-  <div class="nav-item" onclick="showSection('cachepolicy')">⏱️ 캐시 TTL 정책</div>
+  <div class="nav-item active" onclick="showSection('dashboard',this)">📊 대시보드</div>
+  <div class="nav-item" onclick="showSection('cache',this)">💾 캐시 관리</div>
+  <div class="nav-item" onclick="showSection('redis',this)">🧬 Redis 관리</div>
+  <div class="nav-item" onclick="showSection('routing',this)">🌐 라우팅 상태</div>
+  <div class="nav-item" onclick="showSection('lb',this)">⚖️ 로드밸런서</div>
+  <div class="nav-item" onclick="showSection('analytics',this)">📈 캐시 애널리틱스</div>
+  <div class="nav-item" onclick="showSection('security',this)">🛡️ 보안/IP 관리</div>
+  <div class="nav-item" onclick="showSection('sitemap',this)">🗺️ 사이트맵/RSS</div>
+  <div class="nav-item" onclick="showSection('domain',this)">🌍 도메인 설정</div>
+  <div class="nav-item" onclick="showSection('ssl',this)">🔒 SSL/TLS 인증서</div>
+  <div class="nav-item" onclick="showSection('k8s',this)">☸️ 컨테이너/K8s</div>
+  <div class="nav-item" onclick="showSection('linux',this)">🐧 Linux 인프라</div>
+  <div class="nav-item" onclick="showSection('cachepolicy',this)">⏱️ 캐시 TTL 정책</div>
 </div>
 <div class="main">
   <!-- 대시보드 -->
@@ -1769,11 +1769,11 @@ function toast(msg='완료'){
   setTimeout(()=>t.style.opacity='0',2500);
 }
 
-function showSection(name){
+function showSection(name, navEl){
   document.querySelectorAll('[id^="s-"]').forEach(el=>el.style.display='none');
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   document.getElementById('s-'+name).style.display='';
-  event.target.classList.add('active');
+  if(navEl) navEl.classList.add('active');
   if(name==='dashboard') loadDashboard();
   else if(name==='cache') loadCacheStats();
   else if(name==='redis') loadRedis();
@@ -1781,6 +1781,7 @@ function showSection(name){
   else if(name==='lb') loadLb();
   else if(name==='analytics') loadAnalytics();
   else if(name==='security') loadIps();
+  else if(name==='sitemap') {}
   else if(name==='domain') loadDomainInfo();
   else if(name==='ssl') loadSslStatus();
   else if(name==='k8s') loadK8s();
