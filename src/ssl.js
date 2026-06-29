@@ -156,6 +156,7 @@ async function checkCertStatus(host) {
       sslStatus : ok ? 'active'  : 'error',
       tlsVersion,
       httpStatus: resp.status,
+      realProbe  : { url: `https://${host}/`, method: 'HEAD', status: resp.status, cfRay: resp.headers.get('cf-ray') || null, server: resp.headers.get('server') || null },
       issuer    : 'Cloudflare (Universal SSL)',  // Cloudflare Zone 내 도메인
       autoRenew : true,   // Cloudflare Universal SSL은 항상 자동 갱신
       expiryNote: '자동 갱신 (90일 주기, Cloudflare 관리)',
@@ -167,6 +168,7 @@ async function checkCertStatus(host) {
       sslStatus : 'unavailable',
       tlsVersion: '-',
       httpStatus: null,
+      realProbe  : { url: `https://${host}/`, method: 'HEAD', error: e.message },
       issuer    : null,
       error     : e.message,
       autoRenew : false,

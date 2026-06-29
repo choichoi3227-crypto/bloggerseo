@@ -237,6 +237,19 @@ async function handleFetch(request, env, ctx) {
     return resp;
   }
 
+  // ── 슬러그 라우팅 ────────────────────────────────────────────────
+  let slugRoute = { type: 'passthrough' };
+  let originPathForKV = path;
+  try {
+    slugRoute = await resolveSlugRoute(path, env);
+    if (slugRoute.type === 'redirect') {
+      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
+    }
+    if (slugRoute.type === 'alias') {
+      originPathForKV = slugRoute.originPath;
+    }
+  } catch (_) {}
+
   // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
   // 쿠키 유무와 무관하게 캐시를 적용한다 (v7.1: 캐시 히트율 극대화).
   if (isCacheable(request, null)) {
@@ -260,19 +273,6 @@ async function handleFetch(request, env, ctx) {
     }
     ctx.waitUntil(regionalCacheRecord(env, argoCtx.region, false).catch(() => {}));
   }
-
-  // ── 슬러그 라우팅 ────────────────────────────────────────────────
-  let slugRoute = { type: 'passthrough' };
-  let originPathForKV = path;
-  try {
-    slugRoute = await resolveSlugRoute(path, env);
-    if (slugRoute.type === 'redirect') {
-      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
-    }
-    if (slugRoute.type === 'alias') {
-      originPathForKV = slugRoute.originPath;
-    }
-  } catch (_) {}
 
   // ── Load Balancer ────────────────────────────────────────────────
   if (!lbAcquire()) {
@@ -1450,8 +1450,8 @@ tr:hover td{background:#334155}
   <div id="s-domain" style="display:none">
     <h2>🌍 도메인 설정 진단</h2>
     <div class="grid" id="domain-cards">
-      <div class="card"><div class="card-title">SITE_BASE_URL</div><div class="card-value" id="d-base" style="font-size:14px;word-break:break-all">-</div></div>
-      <div class="card"><div class="card-title">SITE_HOST</div><div class="card-value" id="d-host" style="font-size:14px">-</div></div>
+      <div class="card"><div class="card-title">자동 기준 URL</div><div class="card-value" id="d-base" style="font-size:14px;word-break:break-all">-</div></div>
+      <div class="card"><div class="card-title">자동 기준 호스트</div><div class="card-value" id="d-host" style="font-size:14px">-</div></div>
       <div class="card"><div class="card-title">실제 사용 도메인</div><div class="card-value" id="d-resolved" style="font-size:14px">-</div></div>
       <div class="card"><div class="card-title">example.com 여부</div><div class="card-value" id="d-example">-</div></div>
     </div>
@@ -1470,8 +1470,7 @@ tr:hover td{background:#334155}
         ✅ 라우트(ssl:routes) → state:site_host KV 순으로 탐지 (API 없이, 설정 제로).<br>
         ✅ 이후 사이트맵, RSS, 스키마 마크업 등 모든 URL이 실제 개인도메인으로 자동 생성됩니다.<br>
         ✅ 블로그 제목도 홈페이지 &lt;title&gt;에서 자동으로 추출됩니다.<br><br>
-        📌 수동 강제 설정이 필요할 때만 wrangler.toml에 입력:<br>
-        <code style="background:#0f172a;padding:4px 8px;border-radius:4px">SITE_BASE_URL = "https://your-domain.com"</code>
+        📌 수동 설정 파일은 사용하지 않습니다. 라우트 목록과 첫 요청에서 감지된 개인도메인만 자동화 기준으로 사용합니다.
       </div>
     </div>
     <div class="flex" style="margin-top:16px">

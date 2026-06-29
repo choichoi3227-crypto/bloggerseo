@@ -12,6 +12,7 @@
 import { kvScan, kvGetJson, saveSitemap, saveRss, getSitemap, getRss } from './store.js';
 
 const BLOGGER_GHS = 'ghs.google.com';
+const INTERNAL_HOST_RE = /https?:\/\/[^\s<>'"]*(?:blogspot\.com|workers\.dev|cloudflareworkers\.com|ghs\.google\.com)[^\s<>'"]*/gi;
 
 // ── 사이트맵 생성 ────────────────────────────────────────────────────
 export async function generateSitemap(env, baseUrl) {
@@ -120,9 +121,7 @@ export async function handleSitemapRequest(env, url, hostOverride) {
   const base   = resolveBaseForRequest(env, url, hostOverride);
   const cached = await getSitemap(env);
   if (cached) {
-    // 캐시에 저장된 XML의 도메인이 현재 호스트와 다를 수 있으므로
-    // 저장된 그대로 반환 (Cron이 SITE_BASE_URL로 생성했다면 그게 맞는 값)
-    return new Response(cached, {
+    return new Response(rewriteFeedBase(cached, base), {
       headers: {
         'content-type'  : 'application/xml; charset=utf-8',
         'cache-control' : 'public, max-age=3600, stale-while-revalidate=1800',
@@ -145,7 +144,7 @@ export async function handleRssRequest(env, url, hostOverride) {
   const base   = resolveBaseForRequest(env, url, hostOverride);
   const cached = await getRss(env);
   if (cached) {
-    return new Response(cached, {
+    return new Response(rewriteFeedBase(cached, base), {
       headers: {
         'content-type' : 'application/rss+xml; charset=utf-8',
         'cache-control': 'public, max-age=1800, stale-while-revalidate=900',
@@ -196,4 +195,13 @@ function escapeXml(str) {
   return String(str || '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+
+function rewriteFeedBase(xml, base) {
+  const cleanBase = String(base || '').replace(/\/$/, '');
+  if (!cleanBase || !xml) return xml;
+  return String(xml)
+    .replace(INTERNAL_HOST_RE, match => cleanBase + new URL(match).pathname)
+    .replace(/(<loc>|<link>|<guid[^>]*>)(\/(?!\/)[^<]*)/g, (_, tag, path) => tag + cleanBase + path);
 }

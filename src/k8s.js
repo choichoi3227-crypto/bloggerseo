@@ -246,9 +246,12 @@ export class Service {
   }
 
   _getReplicaSet() {
-    // Deployment 검색
+    // Deployment 검색: 문자열 selector, ReplicaSet명, Kubernetes식 {app: name} 모두 지원
+    const selectorName = typeof this.selector === 'string'
+      ? this.selector
+      : (this.selector?.app || this.selector?.name || this.selector?.deployment || null);
     for (const [, dep] of _cluster.deployments) {
-      if (dep.name === this.selector || dep.replicaSet?.name === this.selector) {
+      if (dep.name === selectorName || dep.replicaSet?.name === selectorName || dep.name === this.selector) {
         return dep.replicaSet;
       }
     }
@@ -276,6 +279,7 @@ export class Service {
       port      : this.port,
       endpoints : rs ? rs.runningCount : 0,
       selector  : this.selector,
+      loadBalancer: { algorithm: rs?.strategy || 'least-loaded', healthy: !!rs && rs.runningCount > 0 },
     };
   }
 }
