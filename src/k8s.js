@@ -142,7 +142,13 @@ export class ReplicaSet {
     this.image     = image;
     this.replicas  = replicas;
     this.env       = env;
-    this.limits    = limits;
+    const normalizedResources = {
+      ...(resources.cpuMs ? { maxCpuMs: resources.cpuMs } : {}),
+      ...(resources.memKb ? { maxMemKb: resources.memKb } : {}),
+      ...(resources.maxCpuMs ? { maxCpuMs: resources.maxCpuMs } : {}),
+      ...(resources.maxMemKb ? { maxMemKb: resources.maxMemKb } : {}),
+    };
+    this.limits    = { ...normalizedResources, ...limits };
     this.strategy  = strategy;
     this._pods     = new Set(); // container IDs
 
@@ -246,9 +252,12 @@ export class Service {
   }
 
   _getReplicaSet() {
-    // Deployment 검색
+    // Deployment 검색: 문자열 selector, ReplicaSet명, Kubernetes식 {app: name} 모두 지원
+    const selectorName = typeof this.selector === 'string'
+      ? this.selector
+      : (this.selector?.app || this.selector?.name || this.selector?.deployment || null);
     for (const [, dep] of _cluster.deployments) {
-      if (dep.name === this.selector || dep.replicaSet?.name === this.selector) {
+      if (dep.name === selectorName || dep.replicaSet?.name === selectorName || dep.name === this.selector) {
         return dep.replicaSet;
       }
     }
@@ -276,6 +285,7 @@ export class Service {
       port      : this.port,
       endpoints : rs ? rs.runningCount : 0,
       selector  : this.selector,
+      loadBalancer: { algorithm: rs?.strategy || 'least-loaded', healthy: !!rs && rs.runningCount > 0 },
     };
   }
 }
@@ -319,18 +329,24 @@ export class HPA {
 // ── Deployment (선언적 배포) ─────────────────────────────────────────────
 export class Deployment {
   constructor({ name, namespace = 'default', image, replicas = 1,
-                env = {}, limits = {}, strategy = 'RollingUpdate',
+                env = {}, limits = {}, resources = {}, strategy = 'RollingUpdate',
                 schedulerStrategy = 'least-loaded' }) {
     this.name      = name;
     this.namespace = namespace;
     this.image     = image;
     this.replicas  = replicas;
     this.env       = env;
-    this.limits    = limits;
+    const normalizedResources = {
+      ...(resources.cpuMs ? { maxCpuMs: resources.cpuMs } : {}),
+      ...(resources.memKb ? { maxMemKb: resources.memKb } : {}),
+      ...(resources.maxCpuMs ? { maxCpuMs: resources.maxCpuMs } : {}),
+      ...(resources.maxMemKb ? { maxMemKb: resources.maxMemKb } : {}),
+    };
+    this.limits    = { ...normalizedResources, ...limits };
     this.strategy  = strategy; // RollingUpdate | Recreate
 
     this.replicaSet = new ReplicaSet({
-      name: `${name}-rs`, namespace, image, replicas, env, limits,
+      name: `${name}-rs`, namespace, image, replicas, env, limits: this.limits,
       strategy: schedulerStrategy,
     });
 

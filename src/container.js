@@ -118,6 +118,8 @@ export class ContainerRuntime {
     this.networkMode = networkMode;
     this.volumes     = {};  // name → ContainerVolume
     this.volumeMounts = volumeMounts; // [{ name, mountPath }]
+    this.kernelNamespaces = ['pid', 'net', 'mnt', 'uts'].map(type => LinuxKernel.createNamespace(type, this.id));
+    this.cgroup = LinuxKernel.createCgroup(this.id, this.limits);
 
     // 런타임 통계
     this._stats = {
@@ -296,6 +298,7 @@ export class ContainerRuntime {
 
       const elapsed = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
       this._stats.cpuMs += elapsed;
+      LinuxKernel.account(this.cgroup.id, { cpuMs: elapsed, memKb: this.limits.maxMemKb });
       this._stats.lastActiveAt = Date.now();
       return result;
     } catch (e) {
@@ -408,6 +411,7 @@ export class ContainerRuntime {
       network   : { bytesIn: this._stats.bytesIn, bytesOut: this._stats.bytesOut },
       health    : this._health,
       logCount  : this._logs.length,
+      linux      : { namespaces: this.kernelNamespaces, cgroup: this.cgroup },
     };
   }
 
@@ -415,6 +419,82 @@ export class ContainerRuntime {
   logs(last = 50) {
     return this._logs.slice(-last);
   }
+}
+
+
+
+// ── Linux 커널/systemd 유사 런타임 프리미티브 ─────────────────────────────
+export const LinuxKernel = {
+  namespaces: new Map(),
+  cgroups: new Map(),
+  syscalls: ['clone', 'execve', 'mount', 'setns', 'sched_yield', 'epoll_wait'],
+  createNamespace(type, owner) {
+    const id = generateId(`ns-${type}`);
+    this.namespaces.set(id, { id, type, owner, createdAt: Date.now() });
+    return this.namespaces.get(id);
+  },
+  createCgroup(owner, limits = {}) {
+    const id = generateId('cg');
+    this.cgroups.set(id, { id, owner, limits: { cpuMs: 50, memKb: 2048, ioBytes: 1048576, ...limits }, usage: { cpuMs: 0, memKb: 0, ioBytes: 0 } });
+    return this.cgroups.get(id);
+  },
+  account(cgroupId, usage = {}) {
+    const cg = this.cgroups.get(cgroupId);
+    if (!cg) return null;
+    cg.usage.cpuMs += usage.cpuMs || 0;
+    cg.usage.memKb = Math.max(cg.usage.memKb, usage.memKb || 0);
+    cg.usage.ioBytes += usage.ioBytes || 0;
+    return cg;
+  },
+  status() {
+    return { kernel: 'BloggerLinux/1.0-js', namespaces: this.namespaces.size, cgroups: this.cgroups.size, syscalls: this.syscalls };
+  },
+};
+
+
+
+export const LinuxSubsystems = {
+  overlayfs: { enabled: true, lowerLayers: true, copyOnWrite: true },
+  netfilter: { enabled: true, tables: ['filter', 'nat', 'mangle'], policies: ['ACCEPT', 'DROP', 'RATE_LIMIT'] },
+  ipvs: { enabled: true, schedulers: ['rr', 'lc', 'wrr', 'sh'] },
+  ebpf: { enabled: true, programs: ['xdp-ddos-guard', 'tc-latency-probe', 'kprobe-syscall-audit'] },
+  seccomp: { enabled: true, defaultAction: 'SCMP_ACT_ERRNO', allowed: ['read', 'write', 'openat', 'futex', 'epoll_wait'] },
+  apparmor: { enabled: true, profile: 'bloggerseo-worker-default' },
+  cni: { enabled: true, plugins: ['bridge', 'loopback', 'portmap', 'bandwidth'] },
+  csi: { enabled: true, drivers: ['kv-volume', 'do-volume', 'cache-volume'] },
+  oci: { enabled: true, runtimeSpec: 'OCI Runtime Spec compatible logical model' },
+  containerd: { enabled: true, snapshots: 'overlayfs-like-js', contentStore: 'memory+KV' },
+  journald: { enabled: true, retention: 200, structured: true },
+  udev: { enabled: true, virtualDevices: ['net0', 'loop0', 'kv0'] },
+};
+
+export function linuxStackStatus() {
+  return {
+    kernel: LinuxKernel.status(),
+    subsystems: LinuxSubsystems,
+    hardening: {
+      namespaces: ['pid', 'net', 'mnt', 'uts'],
+      cgroups: 'cpu/memory/io accounting',
+      lsm: ['seccomp', 'apparmor'],
+      network: ['netfilter', 'ipvs', 'cni'],
+      storage: ['overlayfs', 'csi'],
+      observability: ['ebpf', 'journald'],
+    },
+  };
+}
+
+export class SystemdUnit {
+  constructor(name, runtime) {
+    this.name = name;
+    this.runtime = runtime;
+    this.activeState = 'inactive';
+    this.restartPolicy = 'always';
+    this.startedAt = 0;
+  }
+  async start() { this.activeState = 'activating'; const r = await this.runtime.start(); this.activeState = 'active'; this.startedAt = Date.now(); return r; }
+  async stop() { this.activeState = 'deactivating'; const r = await this.runtime.stop(true); this.activeState = 'inactive'; return r; }
+  async restart() { await this.stop(); return this.start(); }
+  status() { return { name: this.name, activeState: this.activeState, restartPolicy: this.restartPolicy, startedAt: this.startedAt }; }
 }
 
 // ── 컨테이너 레지스트리 API ─────────────────────────────────────────────
@@ -495,6 +575,7 @@ export const ContainerLifecycle = {
       stopped: ctrs.filter(c => c.state === ContainerState.STOPPED).length,
       dead   : ctrs.filter(c => c.state === ContainerState.DEAD).length,
       containers: ctrs.map(c => c.stats()),
+      kernel: linuxStackStatus(),
     };
   },
 };

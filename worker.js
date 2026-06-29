@@ -63,6 +63,7 @@ import {
 } from './src/ssl.js';
 import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
 import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
+import { runSeoWorkerTick } from './src/seo-worker.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
@@ -89,6 +90,13 @@ const DOH_URL    = 'https://1.1.1.1/dns-query';
       .healthCheck('/health')
       .build();
 
+    new ImageBuilder('bloggerseo/seo-worker', 'v1')
+      .env('ROLE', 'seo-worker')
+      .env('FEATURES', 'slug-audit,feed-hardening,index-ping,link-normalize')
+      .expose(9090)
+      .healthCheck('/health')
+      .build();
+
     // ── 네임스페이스 ────────────────────────────────────────────────
     Cluster.createNamespace('default', { maxContainers: 20, maxCpuMs: 10000, maxMemKb: 40960 });
     Cluster.createNamespace('seo',     { maxContainers: 10, maxCpuMs: 5000,  maxMemKb: 20480 });
@@ -106,7 +114,7 @@ const DOH_URL    = 'https://1.1.1.1/dns-query';
     Cluster.createDeployment({
       name     : 'seo-crawler',
       namespace: 'seo',
-      replicas : 1,
+      replicas : 3,
       image    : 'bloggerseo/crawler:v1',
       resources: { cpuMs: 100, memKb: 1024 },
       healthCheck: { path: '/health', intervalMs: 60000 },
@@ -116,10 +124,22 @@ const DOH_URL    = 'https://1.1.1.1/dns-query';
     Cluster.createService({ name: 'bloggerseo-svc', namespace: 'default',
       selector: { app: 'bloggerseo-worker' }, port: 443, protocol: 'HTTPS' });
     Cluster.createService({ name: 'crawler-svc', namespace: 'seo',
-      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP' });
+      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP', type: 'LoadBalancer' });
+
+    Cluster.createDeployment({
+      name     : 'seo-worker',
+      namespace: 'seo',
+      replicas : 6,
+      image    : 'bloggerseo/seo-worker:v1',
+      resources: { cpuMs: 80, memKb: 768 },
+      schedulerStrategy: 'least-loaded',
+      healthCheck: { path: '/health', intervalMs: 30000 },
+    });
+    Cluster.createService({ name: 'seo-worker-svc', namespace: 'seo',
+      selector: { app: 'seo-worker' }, port: 9090, protocol: 'HTTP', type: 'LoadBalancer' });
 
     EventBus.emit('cluster-bootstrap', { ts: Date.now(), status: 'ok',
-      images: 2, namespaces: 2, deployments: 2, services: 2 });
+      images: 3, namespaces: 2, deployments: 3, services: 3 });
   } catch (e) {
     // 부트스트랩 실패는 워커 동작에 영향 없음
     try { EventBus.emit('cluster-bootstrap-error', { error: String(e?.message ?? e) }); } catch (_) {}
@@ -154,8 +174,9 @@ export default {
     } else {
       ctx.waitUntil(runScheduledHourly(env).catch(() => {}));
     }
-    // K8s Reconcile — Cron마다 원하는 상태(desired state) 조정
+    // K8s/SEO Reconcile — Cron마다 원하는 상태(desired state)와 SEO 피드 정합성 조정
     ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
+    ctx.waitUntil(runSeoWorkerTick(env, { baseUrl: await resolveSiteBaseAsync(env), siteTitle: await resolveSiteTitleAsync(env) }).catch(() => {}));
   },
 };
 
@@ -237,6 +258,19 @@ async function handleFetch(request, env, ctx) {
     return resp;
   }
 
+  // ── 슬러그 라우팅 ────────────────────────────────────────────────
+  let slugRoute = { type: 'passthrough' };
+  let originPathForKV = path;
+  try {
+    slugRoute = await resolveSlugRoute(path, env);
+    if (slugRoute.type === 'redirect') {
+      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
+    }
+    if (slugRoute.type === 'alias') {
+      originPathForKV = slugRoute.originPath;
+    }
+  } catch (_) {}
+
   // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
   // 쿠키 유무와 무관하게 캐시를 적용한다 (v7.1: 캐시 히트율 극대화).
   if (isCacheable(request, null)) {
@@ -260,19 +294,6 @@ async function handleFetch(request, env, ctx) {
     }
     ctx.waitUntil(regionalCacheRecord(env, argoCtx.region, false).catch(() => {}));
   }
-
-  // ── 슬러그 라우팅 ────────────────────────────────────────────────
-  let slugRoute = { type: 'passthrough' };
-  let originPathForKV = path;
-  try {
-    slugRoute = await resolveSlugRoute(path, env);
-    if (slugRoute.type === 'redirect') {
-      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
-    }
-    if (slugRoute.type === 'alias') {
-      originPathForKV = slugRoute.originPath;
-    }
-  } catch (_) {}
 
   // ── Load Balancer ────────────────────────────────────────────────
   if (!lbAcquire()) {
@@ -1057,8 +1078,11 @@ function injectMetaDescription(html, ctx) {
 }
 
 function injectCanonical(html, ctx, url) {
-  if (/<link[^>]+rel=["']canonical["']/i.test(html)) return html;
-  return html.replace(/(<\/head>)/i, `<link rel="canonical" href="${escapeAttr(ctx.postUrl || url.toString())}">\n$1`);
+  const canonical = `<link rel="canonical" href="${escapeAttr(ctx.postUrl || url.toString())}">`;
+  if (/<link[^>]+rel=["']canonical["'][^>]*>/i.test(html)) {
+    return html.replace(/<link[^>]+rel=["']canonical["'][^>]*>/i, canonical);
+  }
+  return html.replace(/(<\/head>)/i, `${canonical}\n$1`);
 }
 
 function injectSeoTags(html, ctx) {
@@ -1450,8 +1474,8 @@ tr:hover td{background:#334155}
   <div id="s-domain" style="display:none">
     <h2>🌍 도메인 설정 진단</h2>
     <div class="grid" id="domain-cards">
-      <div class="card"><div class="card-title">SITE_BASE_URL</div><div class="card-value" id="d-base" style="font-size:14px;word-break:break-all">-</div></div>
-      <div class="card"><div class="card-title">SITE_HOST</div><div class="card-value" id="d-host" style="font-size:14px">-</div></div>
+      <div class="card"><div class="card-title">자동 기준 URL</div><div class="card-value" id="d-base" style="font-size:14px;word-break:break-all">-</div></div>
+      <div class="card"><div class="card-title">자동 기준 호스트</div><div class="card-value" id="d-host" style="font-size:14px">-</div></div>
       <div class="card"><div class="card-title">실제 사용 도메인</div><div class="card-value" id="d-resolved" style="font-size:14px">-</div></div>
       <div class="card"><div class="card-title">example.com 여부</div><div class="card-value" id="d-example">-</div></div>
     </div>
@@ -1470,8 +1494,7 @@ tr:hover td{background:#334155}
         ✅ 라우트(ssl:routes) → state:site_host KV 순으로 탐지 (API 없이, 설정 제로).<br>
         ✅ 이후 사이트맵, RSS, 스키마 마크업 등 모든 URL이 실제 개인도메인으로 자동 생성됩니다.<br>
         ✅ 블로그 제목도 홈페이지 &lt;title&gt;에서 자동으로 추출됩니다.<br><br>
-        📌 수동 강제 설정이 필요할 때만 wrangler.toml에 입력:<br>
-        <code style="background:#0f172a;padding:4px 8px;border-radius:4px">SITE_BASE_URL = "https://your-domain.com"</code>
+        📌 수동 설정 파일은 사용하지 않습니다. 라우트 목록과 첫 요청에서 감지된 개인도메인만 자동화 기준으로 사용합니다.
       </div>
     </div>
     <div class="flex" style="margin-top:16px">
