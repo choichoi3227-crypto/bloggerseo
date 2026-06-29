@@ -8,9 +8,20 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "build:wasm": "cd wasm-src && npx asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime && node build-blob.js",
-    "panel": "open http://localhost:8787/panel"
+    "panel": "open http://localhost:8787/panel",
+    "test": "node --test",
+    "lint": "node scripts/lint.mjs"
   },
-  "keywords": ["cloudflare-workers","blogger","seo","schema-markup","cache","routing","durable-objects","redis"],
+  "keywords": [
+    "cloudflare-workers",
+    "blogger",
+    "seo",
+    "schema-markup",
+    "cache",
+    "routing",
+    "durable-objects",
+    "redis"
+  ],
   "author": "",
   "license": "ISC",
   "devDependencies": {

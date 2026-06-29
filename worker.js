@@ -63,6 +63,7 @@ import {
 } from './src/ssl.js';
 import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
 import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
+import { runSeoWorkerTick } from './src/seo-worker.js';
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
@@ -173,8 +174,9 @@ export default {
     } else {
       ctx.waitUntil(runScheduledHourly(env).catch(() => {}));
     }
-    // K8s Reconcile — Cron마다 원하는 상태(desired state) 조정
+    // K8s/SEO Reconcile — Cron마다 원하는 상태(desired state)와 SEO 피드 정합성 조정
     ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
+    ctx.waitUntil(runSeoWorkerTick(env, { baseUrl: await resolveSiteBaseAsync(env), siteTitle: await resolveSiteTitleAsync(env) }).catch(() => {}));
   },
 };
 
