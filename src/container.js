@@ -451,6 +451,38 @@ export const LinuxKernel = {
   },
 };
 
+
+
+export const LinuxSubsystems = {
+  overlayfs: { enabled: true, lowerLayers: true, copyOnWrite: true },
+  netfilter: { enabled: true, tables: ['filter', 'nat', 'mangle'], policies: ['ACCEPT', 'DROP', 'RATE_LIMIT'] },
+  ipvs: { enabled: true, schedulers: ['rr', 'lc', 'wrr', 'sh'] },
+  ebpf: { enabled: true, programs: ['xdp-ddos-guard', 'tc-latency-probe', 'kprobe-syscall-audit'] },
+  seccomp: { enabled: true, defaultAction: 'SCMP_ACT_ERRNO', allowed: ['read', 'write', 'openat', 'futex', 'epoll_wait'] },
+  apparmor: { enabled: true, profile: 'bloggerseo-worker-default' },
+  cni: { enabled: true, plugins: ['bridge', 'loopback', 'portmap', 'bandwidth'] },
+  csi: { enabled: true, drivers: ['kv-volume', 'do-volume', 'cache-volume'] },
+  oci: { enabled: true, runtimeSpec: 'OCI Runtime Spec compatible logical model' },
+  containerd: { enabled: true, snapshots: 'overlayfs-like-js', contentStore: 'memory+KV' },
+  journald: { enabled: true, retention: 200, structured: true },
+  udev: { enabled: true, virtualDevices: ['net0', 'loop0', 'kv0'] },
+};
+
+export function linuxStackStatus() {
+  return {
+    kernel: LinuxKernel.status(),
+    subsystems: LinuxSubsystems,
+    hardening: {
+      namespaces: ['pid', 'net', 'mnt', 'uts'],
+      cgroups: 'cpu/memory/io accounting',
+      lsm: ['seccomp', 'apparmor'],
+      network: ['netfilter', 'ipvs', 'cni'],
+      storage: ['overlayfs', 'csi'],
+      observability: ['ebpf', 'journald'],
+    },
+  };
+}
+
 export class SystemdUnit {
   constructor(name, runtime) {
     this.name = name;
@@ -543,7 +575,7 @@ export const ContainerLifecycle = {
       stopped: ctrs.filter(c => c.state === ContainerState.STOPPED).length,
       dead   : ctrs.filter(c => c.state === ContainerState.DEAD).length,
       containers: ctrs.map(c => c.stats()),
-      kernel: LinuxKernel.status(),
+      kernel: linuxStackStatus(),
     };
   },
 };

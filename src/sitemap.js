@@ -23,11 +23,11 @@ export async function generateSitemap(env, baseUrl) {
 
     for (const k of keys) {
       const data = await kvGetJson(env, k);
-      if (!data) continue;
+      if (!data?.titlePath) continue;
       entries.push({
-        loc     : baseUrl + (data.titlePath || k.replace('slug:origin:', '')),
+        loc     : baseUrl + data.titlePath,
         lastmod : data.checkedAt ? new Date(data.checkedAt).toISOString().split('T')[0] : '',
-        priority: data.titlePath ? '0.8' : '0.5',
+        priority: '0.8',
         changefreq: 'weekly',
       });
     }
@@ -73,12 +73,12 @@ export async function generateRss(env, baseUrl, siteTitle = 'BloggerSEO') {
 
     for (const k of keys) {
       const data = await kvGetJson(env, k);
-      if (!data) continue;
+      if (!data?.titlePath) continue;
       entries.push({
         title    : data.title || '',
-        link     : baseUrl + (data.titlePath || ''),
+        link     : baseUrl + data.titlePath,
         pubDate  : data.checkedAt ? new Date(data.checkedAt).toUTCString() : '',
-        guid     : baseUrl + (data.titlePath || k.replace('slug:origin:', '')),
+        guid     : baseUrl + data.titlePath,
       });
     }
 

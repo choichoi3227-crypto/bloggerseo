@@ -89,6 +89,13 @@ const DOH_URL    = 'https://1.1.1.1/dns-query';
       .healthCheck('/health')
       .build();
 
+    new ImageBuilder('bloggerseo/seo-worker', 'v1')
+      .env('ROLE', 'seo-worker')
+      .env('FEATURES', 'slug-audit,feed-hardening,index-ping,link-normalize')
+      .expose(9090)
+      .healthCheck('/health')
+      .build();
+
     // ── 네임스페이스 ────────────────────────────────────────────────
     Cluster.createNamespace('default', { maxContainers: 20, maxCpuMs: 10000, maxMemKb: 40960 });
     Cluster.createNamespace('seo',     { maxContainers: 10, maxCpuMs: 5000,  maxMemKb: 20480 });
@@ -106,7 +113,7 @@ const DOH_URL    = 'https://1.1.1.1/dns-query';
     Cluster.createDeployment({
       name     : 'seo-crawler',
       namespace: 'seo',
-      replicas : 1,
+      replicas : 3,
       image    : 'bloggerseo/crawler:v1',
       resources: { cpuMs: 100, memKb: 1024 },
       healthCheck: { path: '/health', intervalMs: 60000 },
@@ -116,10 +123,22 @@ const DOH_URL    = 'https://1.1.1.1/dns-query';
     Cluster.createService({ name: 'bloggerseo-svc', namespace: 'default',
       selector: { app: 'bloggerseo-worker' }, port: 443, protocol: 'HTTPS' });
     Cluster.createService({ name: 'crawler-svc', namespace: 'seo',
-      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP' });
+      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP', type: 'LoadBalancer' });
+
+    Cluster.createDeployment({
+      name     : 'seo-worker',
+      namespace: 'seo',
+      replicas : 6,
+      image    : 'bloggerseo/seo-worker:v1',
+      resources: { cpuMs: 80, memKb: 768 },
+      schedulerStrategy: 'least-loaded',
+      healthCheck: { path: '/health', intervalMs: 30000 },
+    });
+    Cluster.createService({ name: 'seo-worker-svc', namespace: 'seo',
+      selector: { app: 'seo-worker' }, port: 9090, protocol: 'HTTP', type: 'LoadBalancer' });
 
     EventBus.emit('cluster-bootstrap', { ts: Date.now(), status: 'ok',
-      images: 2, namespaces: 2, deployments: 2, services: 2 });
+      images: 3, namespaces: 2, deployments: 3, services: 3 });
   } catch (e) {
     // 부트스트랩 실패는 워커 동작에 영향 없음
     try { EventBus.emit('cluster-bootstrap-error', { error: String(e?.message ?? e) }); } catch (_) {}
@@ -1057,8 +1076,11 @@ function injectMetaDescription(html, ctx) {
 }
 
 function injectCanonical(html, ctx, url) {
-  if (/<link[^>]+rel=["']canonical["']/i.test(html)) return html;
-  return html.replace(/(<\/head>)/i, `<link rel="canonical" href="${escapeAttr(ctx.postUrl || url.toString())}">\n$1`);
+  const canonical = `<link rel="canonical" href="${escapeAttr(ctx.postUrl || url.toString())}">`;
+  if (/<link[^>]+rel=["']canonical["'][^>]*>/i.test(html)) {
+    return html.replace(/<link[^>]+rel=["']canonical["'][^>]*>/i, canonical);
+  }
+  return html.replace(/(<\/head>)/i, `${canonical}\n$1`);
 }
 
 function injectSeoTags(html, ctx) {
