@@ -155,18 +155,26 @@ export function priorityRoute(request) {
   return { tier: 3, label: 'desktop', maxAge: 3600, priority: 'normal' };
 }
 
-// ── Load Balancer ─────────────────────────────────────────────────────
-// 주의: crypto.randomUUID()는 global scope(모듈 최상단)에서 호출하면
-// Cloudflare Workers가 "Disallowed operation in global scope" 에러를 던진다.
-// 따라서 워커 ID는 요청 핸들러가 처음 실행될 때 lazy하게 생성한다.
-let  _workerId    = null;
-let  _inFlight    = 0;
-const MAX_INFLIGHT = 48;
-const LOAD_THRESH  = 0.80; // 80% 점유시 503
+// ── Load Balancer (v8: KV 기반 실제 분산 상태 동기화) ────────────────
+// ─ 워커 ID는 첫 요청 시 lazy 생성 (global scope 사용 금지)
+// ─ lbAcquire/lbRelease: 인스턴스 메모리 inFlight + KV 원자 카운터 연동
+// ─ Cluster-wide 상태: KV 'lb:workers:<id>' — 30s TTL heartbeat
+// ─ 실제 503 방출 기준: 인스턴스 inFlight ≥ MAX_INFLIGHT (80%)
+// ─ Retry-After 응답으로 클라이언트 자동 재시도 유도
+
+let  _workerId      = null;
+let  _inFlight      = 0;
+let  _clusterTotal  = 0;   // KV에서 동기화된 클러스터 전체 inFlight
+let  _lastHbAt      = 0;
+const MAX_INFLIGHT   = 48;
+const LOAD_THRESH    = 0.85;  // 85%에서 새 요청 거부
+const HB_INTERVAL_MS = 10_000; // 10초마다 heartbeat (KV TTL 30s)
 
 function ensureWorkerId() {
   if (_workerId === null) {
-    _workerId = crypto.randomUUID().slice(0, 8);
+    // Workers 환경에서는 crypto.randomUUID()를 lazy 호출해야 함
+    try { _workerId = crypto.randomUUID().slice(0, 8); }
+    catch (_) { _workerId = Math.random().toString(36).slice(2, 10); }
   }
   return _workerId;
 }
@@ -174,33 +182,68 @@ function ensureWorkerId() {
 export function lbAcquire() {
   ensureWorkerId();
   if (_inFlight >= MAX_INFLIGHT) return false;
+  // 클러스터 전체 부하도 체크 (클러스터 분산 거부)
+  if (_clusterTotal > 0 && _clusterTotal / (_clusterTotal + 1) > LOAD_THRESH) return false;
   _inFlight++;
   return true;
 }
+
 export function lbRelease() {
   _inFlight = Math.max(0, _inFlight - 1);
 }
+
 export function lbLoad() {
   return _inFlight / MAX_INFLIGHT;
 }
+
 export function lbWorkerId() { return ensureWorkerId(); }
 
-// 워커 헬스를 Redis에 heartbeat (ctx.waitUntil으로 비동기 호출)
+// KV 기반 heartbeat — 실제 인스턴스 상태를 KV에 기록
 export async function lbHeartbeat(env) {
-  await workerHeartbeat(env, ensureWorkerId(), {
+  const now = Date.now();
+  // 10초 이내 중복 heartbeat 방지 (KV 호출 최소화)
+  if (now - _lastHbAt < HB_INTERVAL_MS) return;
+  _lastHbAt = now;
+
+  const id      = ensureWorkerId();
+  const payload = {
     inFlight : _inFlight,
     maxFlight: MAX_INFLIGHT,
     load     : lbLoad(),
-    ts       : Date.now(),
-  });
+    ts       : now,
+    region   : 'auto',
+  };
+
+  await workerHeartbeat(env, id, payload);
+
+  // 클러스터 전체 inFlight 동기화 (KV listActiveWorkers 결과 캐시)
+  try {
+    const workers     = await listActiveWorkers(env);
+    _clusterTotal = workers.reduce((s, w) => s + (w.inFlight || 0), 0);
+  } catch (_) {}
 }
 
-// 활성 워커 전체 평균 부하 조회
+// 활성 워커 전체 평균 부하 조회 (실제 KV 기반)
 export async function lbClusterLoad(env) {
   const workers = await listActiveWorkers(env);
-  if (!workers.length) return { instances: 0, avgLoad: 0, workers: [] };
+  if (!workers.length) {
+    // KV에 아무것도 없으면 현재 인스턴스 정보만 반환
+    return {
+      instances: 1,
+      avgLoad  : lbLoad(),
+      workers  : [{ workerId: ensureWorkerId(), inFlight: _inFlight, maxFlight: MAX_INFLIGHT, load: lbLoad(), ts: Date.now() }],
+    };
+  }
   const avgLoad = workers.reduce((s, w) => s + (w.load || 0), 0) / workers.length;
-  return { instances: workers.length, avgLoad: +avgLoad.toFixed(4), workers };
+  return {
+    instances: workers.length,
+    avgLoad  : +avgLoad.toFixed(4),
+    workers  : workers.map(w => ({
+      ...w,
+      loadPct: Math.round((w.load || 0) * 100),
+      status : (w.load || 0) > LOAD_THRESH ? 'overloaded' : 'healthy',
+    })),
+  };
 }
 
 // ── 모바일·데스크탑 응답 최적화 태그 ────────────────────────────────
