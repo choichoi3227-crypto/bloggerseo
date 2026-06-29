@@ -2029,63 +2029,63 @@ async function loadLinux() {
   const psTb = document.getElementById('lx-ps-table');
   psTb.innerHTML = (d.ps || []).length
     ? (d.ps || []).map(p => \`<tr>
-        <td>${p.pid}</td><td><code>${p.name}</code></td>
-        <td><span class="badge ${p.state==='R'?'badge-green':p.state==='Z'?'badge-yellow':'badge-red'}">${p.state}</span></td>
-        <td>${p.cpuMs}ms</td><td>${p.cgroup||'/'}</td><td>${p.ppid||0}</td>
+        <td>\${p.pid}</td><td><code>\${p.name}</code></td>
+        <td><span class=\"badge \${p.state==='R'?'badge-green':p.state==='Z'?'badge-yellow':'badge-red'}\">\${p.state}</span></td>
+        <td>\${p.cpuMs}ms</td><td>\${p.cgroup||'/'}</td><td>\${p.ppid||0}</td>
       </tr>\`).join('')
     : '<tr><td colspan="6" style="color:#64748b;text-align:center">프로세스 없음</td></tr>';
 
   // Cgroup 트리
   const cgTb = document.getElementById('lx-cg-table');
   cgTb.innerHTML = (d.cgroups || []).map(cg => \`<tr>
-    <td><code>${cg.id}</code></td><td>${cg.parent||'root'}</td>
-    <td>${cg.cpu?.used||0}ms</td>
-    <td><span class="badge ${(cg.cpu?.pct||0)>80?'badge-red':(cg.cpu?.pct||0)>50?'badge-yellow':'badge-green'}">${cg.cpu?.pct||0}%</span></td>
-    <td>${cg.mem?.used||0} kB</td>
-    <td>${(cg.pids||[]).length}</td>
+    <td><code>\${cg.id}</code></td><td>\${cg.parent||'root'}</td>
+    <td>\${cg.cpu?.used||0}ms</td>
+    <td><span class=\"badge \${(cg.cpu?.pct||0)>80?'badge-red':(cg.cpu?.pct||0)>50?'badge-yellow':'badge-green'}\">\${cg.cpu?.pct||0}%</span></td>
+    <td>\${cg.mem?.used||0} kB</td>
+    <td>\${(cg.pids||[]).length}</td>
   </tr>\`).join('') || '<tr><td colspan="6" style="color:#64748b;text-align:center">Cgroup 없음</td></tr>';
 
   // Systemd 유닛
   const unitTb = document.getElementById('lx-unit-table');
   unitTb.innerHTML = (d.systemd || []).map(u => \`<tr>
-    <td><code>${u.name}</code></td><td style="font-size:12px">${u.description||''}</td>
-    <td><span class="badge ${u.state==='active'?'badge-green':u.state==='failed'?'badge-red':'badge-yellow'}">${u.state}</span></td>
-    <td>${u.restarts||0}</td><td>${u.pid||'-'}</td>
-  </tr>\`).join('') || '<tr><td colspan="5" style="color:#64748b;text-align:center">유닛 없음</td></tr>';
+    <td><code>\${u.name}</code></td><td style=\"font-size:12px\">\${u.description||''}</td>
+    <td><span class=\"badge \${u.state==='active'?'badge-green':u.state==='failed'?'badge-red':'badge-yellow'}\">\${u.state}</span></td>
+    <td>\${u.restarts||0}</td><td>\${u.pid||'-'}</td>
+  </tr>\`).join('') || '<tr><td colspan=\"5\" style=\"color:#64748b;text-align:center\">유닛 없음</td></tr>';
 
   // Cron 잡
   const cronTb = document.getElementById('lx-cron-table');
   cronTb.innerHTML = (d.cron || []).map(j => \`<tr>
-    <td><code>${j.id}</code></td><td>${j.name||''}</td>
-    <td><span class="tag">${j.expr}</span></td>
-    <td style="font-size:11px">${j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-'}</td>
-    <td>${j.runs||0}</td>
-    <td><span class="${j.errors>0?'badge badge-red':''}"> ${j.errors||0}</span></td>
-  </tr>\`).join('') || '<tr><td colspan="6" style="color:#64748b;text-align:center">Cron 잡 없음</td></tr>';
+    <td><code>\${j.id}</code></td><td>\${j.name||''}</td>
+    <td><span class=\"tag\">\${j.expr}</span></td>
+    <td style=\"font-size:11px\">\${j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-'}</td>
+    <td>\${j.runs||0}</td>
+    <td><span class=\"\${j.errors>0?'badge badge-red':''}\"> \${j.errors||0}</span></td>
+  </tr>\`).join('') || '<tr><td colspan=\"6\" style=\"color:#64748b;text-align:center\">Cron 잡 없음</td></tr>';
 
   // 워커 인스턴스
   const instTb = document.getElementById('lx-inst-table');
   instTb.innerHTML = (d.workers?.instances || []).map(i => \`<tr>
-    <td><code>${i.id}</code></td><td><span class="tag">${i.role}</span></td>
-    <td>${i.pid||'-'}</td>
-    <td><span class="badge ${i.state==='running'?'badge-green':i.state==='failed'?'badge-red':'badge-yellow'}">${i.state}</span></td>
-    <td>${i.stats?.requests||0}</td>
-    <td>${i.stats?.errors||0}</td>
-    <td>${i.cgroup||'-'}</td>
-  </tr>\`).join('') || '<tr><td colspan="7" style="color:#64748b;text-align:center">워커 인스턴스 없음 — 첫 요청 후 자동 생성</td></tr>';
+    <td><code>\${i.id}</code></td><td><span class=\"tag\">\${i.role}</span></td>
+    <td>\${i.pid||'-'}</td>
+    <td><span class=\"badge \${i.state==='running'?'badge-green':i.state==='failed'?'badge-red':'badge-yellow'}\">\${i.state}</span></td>
+    <td>\${i.stats?.requests||0}</td>
+    <td>\${i.stats?.errors||0}</td>
+    <td>\${i.cgroup||'-'}</td>
+  </tr>\`).join('') || '<tr><td colspan=\"7\" style=\"color:#64748b;text-align:center\">워커 인스턴스 없음 — 첫 요청 후 자동 생성</td></tr>';
 
   // 저널 로그
   const jEl = document.getElementById('lx-journal');
   jEl.innerHTML = (d.journal || []).slice(-50).reverse().map(e => {
     const col = e.priority==='error'?'#f87171':e.priority==='warn'?'#fb923c':'#94a3b8';
-    return \`<div>[<span style="color:#60a5fa">${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style="color:${col}">${e.priority?.toUpperCase()}</span> ${e.message}</div>\`;
+    return \`<div>[<span style=\"color:#60a5fa\">\${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style=\"color:\${col}\">\${e.priority?.toUpperCase()}</span> \${e.message}</div>\`;
   }).join('') || '<div style="color:#475569">로그 없음</div>';
 
   // 네트워크 네임스페이스
   const nsEl = document.getElementById('lx-netns');
   const netns = d.netns || [];
   nsEl.innerHTML = netns.length
-    ? netns.map(n => \`<span class="tag" style="margin-right:8px">${n}</span>\`).join('')
+    ? netns.map(n => \`<span class=\"tag\" style=\"margin-right:8px\">\${n}</span>\`).join('')
     : '<span style="color:#64748b">네트워크 네임스페이스 없음</span>';
 }
 
