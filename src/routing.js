@@ -256,7 +256,7 @@ export function buildDeviceHints(route) {
     hints.push('<meta name="theme-color" content="#ffffff">');
     hints.push('<link rel="preload" as="style" media="(max-width:768px)" imagesrcset="">');
   } else if (route.label === 'desktop') {
-    hints.push('<link rel="preload" as="script" href="https://www.gstatic.com/external_hosted/jquery2/jquery.min.js">');
+    // 데스크탑 전용 힌트 없음 — Blogger 자체 스크립트 로딩 방해 방지
   }
   return hints.join('\n');
 }

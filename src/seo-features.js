@@ -106,14 +106,11 @@ export function injectRobotsMeta(html, pageType) {
 
 // ── 4. Canonical URL 강화 (중복 URL 패턴 정규화) ─────────────────────────
 export function strengthenCanonical(html, url, titlePath = null) {
-  // ✅ v8: SEO 슬러그(titlePath) 기반 canonical — 없으면 정규화 URL
-  const canonical = buildCanonical(url, titlePath);
+  // 기존 canonical이 있으면 건드리지 않음 (Blogger 자체 canonical 보존)
   if (html.includes('rel="canonical"') || html.includes("rel='canonical'")) {
-    return html.replace(
-      /<link\s+rel=["']canonical["'][^>]*>/gi,
-      `<link rel="canonical" href="${escapeAttr(canonical)}">`
-    );
+    return html;
   }
+  const canonical = buildCanonical(url, titlePath);
   return html.replace(/(<\/head>)/i,
     `<link rel="canonical" href="${escapeAttr(canonical)}">\n$1`
   );
@@ -165,14 +162,21 @@ export function injectResourceHints(html) {
 }
 
 // ── 6. 이미지 alt 자동 보완 ──────────────────────────────────────────────
+const SKIP_ALT_PATTERNS = [
+  /\/img\.gif/i,         // Blogger 1px 투명 GIF
+  /blogger\.com\/tracker/i, // Blogger 추적 픽셀
+  /\/s1\//, /\/s\d+\/spacer/i,  // spacer 이미지
+  /feeds\.feedburner/i,
+];
 export function injectImageAlts(html, pageTitle = '') {
-  // alt가 없거나 빈 img 태그에 컨텍스트 기반 alt 추가
   return html.replace(/<img([^>]*?)>/gi, (match, attrs) => {
-    if (/\balt\s*=\s*["'][^"']*["']/i.test(attrs)) return match; // 이미 있음
+    if (/\balt\s*=\s*["'][^"']*["']/i.test(attrs)) return match;
     const srcMatch = attrs.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
-    const alt = srcMatch
-      ? buildAltFromSrc(srcMatch[1], pageTitle)
-      : (pageTitle || 'image');
+    if (!srcMatch) return match;
+    const src = srcMatch[1];
+    // 시스템/추적 이미지는 건드리지 않음
+    if (SKIP_ALT_PATTERNS.some(p => p.test(src))) return match;
+    const alt = buildAltFromSrc(src, pageTitle);
     return `<img${attrs} alt="${escapeAttr(alt)}">`;
   });
 }
@@ -194,15 +198,14 @@ export function normalizeLinks(html, host) {
     if (!hrefMatch) return match;
     const href = hrefMatch[1];
 
-    // 외부 링크: noopener + noreferrer (SEO는 nofollow 남용 금지)
+    // 외부 링크: rel만 추가, target은 절대 건드리지 않음 (Blogger 링크 동작 보존)
     if (href.startsWith('http') && !href.includes(host)) {
       if (!attrs.includes('rel=')) {
-        return `<a${attrs} rel="noopener noreferrer" target="_blank">`;
+        return `<a${attrs} rel="noopener noreferrer">`;
       }
       return match;
     }
 
-    // 내부 링크: rel이 없으면 follow (기본값이라 명시 불필요하지만 안전장치)
     return match;
   });
 }
@@ -326,13 +329,21 @@ export function injectLabelPageSeo(html, url) {
 }
 
 // ── 14. 이미지 Lazy Loading ──────────────────────────────────────────────
+const SKIP_LAZY_PATTERNS = [
+  /blogger\.com/i, /gstatic\.com/i, /google\.com/i,
+  /\/img\.gif/i, /spacer/i, /favicon/i,
+];
 export function injectLazyLoading(html) {
-  // 첫 번째 이미지는 LCP 최적화를 위해 eager로 유지, 나머지는 lazy
-  let firstDone = false;
+  let firstContentDone = false;
   return html.replace(/<img([^>]*?)>/gi, (match, attrs) => {
     if (attrs.includes('loading=')) return match;
-    if (!firstDone) {
-      firstDone = true;
+    const srcMatch = attrs.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
+    if (!srcMatch) return match;
+    const src = srcMatch[1];
+    // Blogger 시스템 이미지는 건드리지 않음
+    if (SKIP_LAZY_PATTERNS.some(p => p.test(src))) return match;
+    if (!firstContentDone) {
+      firstContentDone = true;
       return `<img${attrs} loading="eager">`;
     }
     return `<img${attrs} loading="lazy">`;
@@ -479,11 +490,14 @@ export async function pingIndexNow(url, apiKey, host) {
 
 // ── 23. Google Discover 최적화 ──────────────────────────────────────────
 export function optimizeForDiscover(html) {
-  // Google Discover: og:image는 최소 1200px 이상이어야 노출됨
-  // Blogger 이미지 URL에 /s{width}/ 패턴이 있으면 크기 업스케일
+  // og:image content 값에서 Blogger /s숫자/ 패턴만 /s1200/으로 업스케일
+  // bp.blogspot.com 도메인 이미지만 대상 (다른 CDN URL 보호)
   return html.replace(
-    /((?:og:image|twitter:image)[^>]*content=["'])https:\/\/[^"']*\/s\d+\//gi,
-    (match) => match.replace(/\/s\d+\//, '/s1200/')
+    /(<meta[^>]+(?:og:image|twitter:image)[^>]+content=["'])(https?:\/\/[^"']*\.bp\.blogspot\.com\/[^"']*\/s)(\d+)(\/[^"']*["'])/gi,
+    (match, pre, urlPre, size, urlPost) => {
+      if (parseInt(size) >= 1200) return match; // 이미 충분히 큼
+      return pre + urlPre + '1200' + urlPost;
+    }
   );
 }
 

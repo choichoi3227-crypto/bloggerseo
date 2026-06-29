@@ -337,11 +337,10 @@ async function extractFaqsWithAI(html, ctx, env) {
 // ── 스키마를 HTML에 주입 ──────────────────────────────────────────────
 export function injectSchemaMarkup(html, schemas) {
   if (!schemas || schemas.length === 0) return html;
-  // 기존 스키마 중복 방지
-  if (html.includes('"@context":"https://schema.org"') ||
-      html.includes('"@context": "https://schema.org"')) return html;
+  // BloggerSEO가 이미 주입한 경우만 스킵 (Blogger 기본 스키마와 구분)
+  if (html.includes('bloggerseo-schema')) return html;
 
-  const ld = `<script type="application/ld+json">${JSON.stringify(schemas, null, 0)}<\/script>`;
+  const ld = `<script type="application/ld+json" class="bloggerseo-schema">${JSON.stringify(schemas, null, 0)}<\/script>`;
   return html.replace(/(<\/head>)/i, ld + '\n$1');
 }
 
@@ -368,10 +367,7 @@ export function injectSearchEngineTags(html, ctx, env) {
     tags.push('<meta property="og:locale" content="ko_KR">');
   }
 
-  // 빙 IndexNow (힌트만 삽입, 실제 핑은 Cron에서)
-  if (!html.includes('x-robots-tag')) {
-    tags.push('<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1">');
-  }
+  // robots 메타는 injectRobotsMeta(seo-features.js)에서 처리 — 중복 삽입 안 함
 
   return tags.length ? html.replace(/(<\/head>)/i, tags.join('\n') + '\n$1') : html;
 }
