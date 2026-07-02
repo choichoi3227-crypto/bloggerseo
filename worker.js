@@ -18,7 +18,7 @@ import { wasmCore }           from './src/wasm-loader.js';
 import {
   cnameGet, cnameSet,
   checkRateLimit, recordMetric, getMetrics,
-  slugOriginGet, slugAliasGet, upsertSlug, purgeAllSlugs,
+  slugOriginGet, slugAliasGet, upsertSlug, touchSlug, purgeAllSlugs,
   isIpBlocked, blockIp, unblockIp, listBlockedIps,
   recordAnalytics, getAnalytics,
   doRedisAvailable, doRedisClusterStats, doRedisFlushAll,
@@ -26,7 +26,7 @@ import {
 import {
   cacheReserveGet, cacheReservePut, cacheReserveGetStaleFallback,
   cacheReservePurge, cacheReserveStats,
-  cacheReserveInvalidate, isCacheable,
+  cacheReserveInvalidate, cacheReserveDeleteUrl, isCacheable,
 } from './src/cache-reserve.js';
 import {
   argoSelectRoute, argoRecordLatency, argoBuildFetchOptions,
@@ -40,7 +40,8 @@ import { handleSitemapRequest, handleRssRequest, generateSitemap, generateRss } 
 import {
   fnv1a32Hex, extractMeta, extractTagContent, extractBodyText,
   buildMetaDescription, extractFirstImage, extractSiteName, extractLogoUrl,
-  extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform, retryAsync,
+  extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform,
+  retryAsync, retryOriginFetch, circuitStatus,
 } from './src/utils.js';
 
 // MyDurableObject: Cloudflare Durable Objects 바인딩에서 이 클래스를 찾으려면
@@ -247,6 +248,25 @@ async function handleFetch(request, env, ctx) {
     return resp;
   }
 
+  // ── 슬러그 라우팅 (캐시 조회보다 먼저 판단) ─────────────────────────
+  // ✅ 원본(Blogspot) 경로가 이미 캐시에 있으면 그 캐시가 그대로 200으로
+  // 서빙되어 버려서, 슬러그가 확정되어 있어도 리디렉션되지 않고 계속
+  // Blogspot 경로가 노출되는 문제가 있었다. slug 조회는 이제 로컬 캐시
+  // (TTL 5초)로 매우 빠르므로, 캐시 조회보다 먼저 수행해서 "원본 경로 +
+  // 슬러그 존재"인 경우 캐시 확인 없이 즉시 301로 확정한다.
+  let slugRoute = { type: 'passthrough' };
+  let originPathForKV = path;
+  try {
+    slugRoute = await resolveSlugRoute(path, env);
+    if (slugRoute.type === 'redirect') {
+      recordMetric(301, Date.now() - t0);
+      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
+    }
+    if (slugRoute.type === 'alias') {
+      originPathForKV = slugRoute.originPath;
+    }
+  } catch (_) {}
+
   // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
   // 쿠키 유무와 무관하게 캐시를 적용한다 (v7.1: 캐시 히트율 극대화).
   if (isCacheable(request, null)) {
@@ -271,19 +291,6 @@ async function handleFetch(request, env, ctx) {
     ctx.waitUntil(regionalCacheRecord(env, argoCtx.region, false).catch(() => {}));
   }
 
-  // ── 슬러그 라우팅 ────────────────────────────────────────────────
-  let slugRoute = { type: 'passthrough' };
-  let originPathForKV = path;
-  try {
-    slugRoute = await resolveSlugRoute(path, env);
-    if (slugRoute.type === 'redirect') {
-      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
-    }
-    if (slugRoute.type === 'alias') {
-      originPathForKV = slugRoute.originPath;
-    }
-  } catch (_) {}
-
   // ── Load Balancer ────────────────────────────────────────────────
   if (!lbAcquire()) {
     recordMetric(503, Date.now() - t0);
@@ -300,11 +307,14 @@ async function handleFetch(request, env, ctx) {
   let originResp;
   const fetchT0 = Date.now();
   try {
-    originResp = await retryAsync(() => bloggerFetch(fetchUrl, request.headers, argoCtx));
+    originResp = await retryOriginFetch(() => bloggerFetch(fetchUrl, request.headers, argoCtx));
   } catch (e) {
     lbRelease();
     // ── 장애 격리: Origin(Blogger) 자체가 응답을 못 줄 때, 만료된 캐시라도
     // 있으면 그걸 서빙해서 사이트를 살린다. 캐시도 없으면 502를 반환한다.
+    // 서킷이 열려 있어 재시도 없이 즉시 실패한 경우(e.circuitOpen)에도
+    // 동일하게 stale 폴백을 우선 시도한다 — 이게 "과부하 시 사용자에게는
+    // 최대한 정상처럼 보이게" 하는 핵심 장치다.
     if (isCacheable(request, null)) {
       const stale = await cacheReserveGetStaleFallback(env, request).catch(() => null);
       if (stale) {
@@ -352,7 +362,17 @@ async function handleFetch(request, env, ctx) {
     // ✅ v8: 슬러그 KV 업데이트를 transformHtml 전에 실행
     // → titlePath가 ctx에 채워져 canonical, seo-features에 즉시 반영됨
     if (pageCtx && isPostPath(originPathForKV)) {
-      await updateSlugKV(pageCtx, originPathForKV, env).catch(() => {});
+      const originUrl = new URL(originPathForKV, url).toString();
+      await updateSlugKV(pageCtx, originPathForKV, env, originUrl).catch(() => {});
+    }
+    // ✅ 슬러그가 이 시점에 "새로" 생성된 경우까지 포함해서, 현재 요청이
+    // 원본(Blogspot) 경로인데 확정된 titlePath와 다르면 즉시 301 리디렉션한다.
+    // 기존에는 슬러그가 처음 생성되는 이번 요청 자체는 원본 그대로 렌더링해
+    // 반환했기 때문에, 그 글에 대한 "첫 방문"(크롤러/오래된 링크/신규 발행
+    // 직후 접근 등)은 항상 Blogspot 슬러그로 노출되는 문제가 있었다.
+    if (pageCtx?.titlePath && isPostPath(originPathForKV) && path !== pageCtx.titlePath) {
+      recordMetric(301, Date.now() - t0);
+      return Response.redirect(new URL(pageCtx.titlePath, url).toString(), 301);
     }
     result  = await transformHtml(html, pageCtx, url, env, pRoute);
     if (!result || typeof result !== 'string') result = html;
@@ -376,12 +396,22 @@ async function handleFetch(request, env, ctx) {
   // ── 비동기 후처리 ───────────────────────────────────────────────
   // (슬러그 KV 업데이트는 이미 transformHtml 전에 완료됨)
 
+  // 페이지 타입별 TTL 적용 (포스트 1h, 페이지 4h, 홈 30분, 라벨 1h)
+  const pageType       = pageCtx?.type || detectPageType(url);
+  const pageTtl        = getPageTypeTtl(pageType);
+  const effectiveRoute = { ...pRoute, maxAge: pageTtl };
+  const cacheControl   = buildCacheControl(effectiveRoute, isBot);
+
   // Cache Reserve 저장 (성공 응답만, 봇 트래픽으로 캐시를 오염시키지 않기
   // 위해 쓰기는 사람 방문자 기준으로만 — 단, 읽기는 모두에게 적용됨)
+  // ✅ 이전에는 ttl 옵션을 넘기지 않아 모든 페이지가 기본 30분으로만
+  // 저장되었다. 페이지 타입별로 계산된 pageTtl(포스트 1h·페이지 4h 등)을
+  // 그대로 전달해서, 자주 안 바뀌는 콘텐츠는 더 오래 캐시되어 origin
+  // 요청 빈도와 응답 지연이 함께 줄어들도록 한다.
   if (!isBot && pageCtx) {
     const respForCache = new Response(result, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
     ctx.waitUntil(
-      cacheReservePut(env, request, respForCache, { region: argoCtx.region }).catch(() => {})
+      cacheReservePut(env, request, respForCache, { region: argoCtx.region, ttl: pageTtl }).catch(() => {})
     );
   }
 
@@ -391,12 +421,6 @@ async function handleFetch(request, env, ctx) {
   }).catch(() => {}));
 
   recordMetric(200, Date.now() - t0);
-
-  // 페이지 타입별 TTL 적용 (포스트 1h, 페이지 4h, 홈 30분, 라벨 1h)
-  const pageType       = pageCtx?.type || detectPageType(url);
-  const pageTtl        = getPageTypeTtl(pageType);
-  const effectiveRoute = { ...pRoute, maxAge: pageTtl };
-  const cacheControl   = buildCacheControl(effectiveRoute, isBot);
 
   // Server-Timing 헤더 (Core Web Vitals 분석 + 크롤러 품질 신호)
   const serverTiming = buildServerTimingHeader({
@@ -418,7 +442,10 @@ async function handleFetch(request, env, ctx) {
 // ── 백그라운드 재검증 (SWR) ─────────────────────────────────────────
 async function backgroundRevalidate(request, env, url, argoCtx, pRoute) {
   try {
-    const freshResp = await retryAsync(() => bloggerFetch(url, request.headers, argoCtx), 1);
+    // 서킷이 열려 있으면(origin이 이미 힘든 상태) 재검증용 추가 요청을
+    // 보내지 않고 조용히 스킵한다 — SWR은 "여유가 있을 때 갱신"하는
+    // 최적화이므로, origin이 죽어가는 상황에서는 자원을 아끼는 쪽이 맞다.
+    const freshResp = await retryOriginFetch(() => bloggerFetch(url, request.headers, argoCtx), 1);
     if (!freshResp.ok || !isHtml(freshResp)) return;
     const html    = await freshResp.text();
     const pageCtx = await extractPageContext(html, url);
@@ -525,7 +552,7 @@ async function resolveSlugRoute(rawPath, env) {
   return { type: 'passthrough' };
 }
 
-async function updateSlugKV(pageCtx, originPath, env) {
+async function updateSlugKV(pageCtx, originPath, env, originUrl) {
   if (!['post', 'page'].includes(pageCtx.type) || !pageCtx.title) return;
   if (!isPostPath(originPath)) return;
   const titleSlug = await wasmCore.generateSlug(pageCtx.title);
@@ -533,6 +560,12 @@ async function updateSlugKV(pageCtx, originPath, env) {
   // ✅ ctx.titlePath 에도 저장 (SEO canonical, 스키마 마크업에 사용됨)
   pageCtx.titlePath = '/' + titleSlug;
   await upsertSlug(env, originPath, pageCtx.title, titleSlug);
+  // ✅ 원본(Blogspot) 경로로 저장된 옛 캐시가 남아있으면, 슬러그가 확정된
+  // 뒤에도 그 캐시가 계속 200으로 서빙되어 리디렉션이 무시되는 문제가
+  // 있었다. 슬러그가 (재)확정될 때마다 원본 경로 캐시를 즉시 지운다.
+  if (originUrl) {
+    cacheReserveDeleteUrl(env, originUrl).catch(() => {});
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -790,6 +823,12 @@ async function runSlugAudit(env) {
       const originPath    = key.replace(/^slug:origin:/, '');
       if (newTitlePath !== data.titlePath) {
         await upsertSlug(env, originPath, data.title, newSlug);
+      } else {
+        // ✅ 슬러그 값 자체는 안 바뀌었어도, 이 감사 스캔에서 발견된
+        // 매핑은 여전히 유효/사용 중이라는 뜻이므로 TTL을 갱신(touch)한다.
+        // 이게 없으면 별칭(alias) URL로만 방문되는 인기 글의 매핑이
+        // 30일 상한에 걸려 소멸될 수 있다.
+        await touchSlug(env, originPath, data);
       }
     } catch (_) {}
   }
@@ -1052,6 +1091,7 @@ async function debugInfo(url, env) {
       processes: linuxProc.length,
       workers  : WorkerProcessManager.stats().running,
     },
+    originCircuit: circuitStatus(),
   };
   return new Response(JSON.stringify(info, null, 2), { status: 200, ...jsonHeaders() });
 }
