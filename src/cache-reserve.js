@@ -251,6 +251,21 @@ export async function cacheReservePurge(env, pattern = 'cache:*') {
   return { purged };
 }
 
+// ── 단건 URL 캐시 즉시 삭제 (전체 스캔 없이 키 1개만 지움) ───────────
+// 슬러그가 새로 생성/변경될 때, 원본(Blogspot) 경로로 캐시된 옛 응답이
+// 남아있으면 슬러그가 확정된 뒤에도 그 캐시가 계속 200으로 서빙되어
+// 리디렉션이 적용되지 않는 문제가 있었다. 이를 막기 위해 원본 경로
+// 캐시를 즉시(단건) 지운다.
+export async function cacheReserveDeleteUrl(env, url) {
+  try {
+    await Promise.allSettled([
+      kvDel(env, cacheKey(url)),
+      l0Delete(url),
+    ]);
+    return true;
+  } catch (_) { return false; }
+}
+
 // ── URL 특정 캐시 무효화 (글 수정 시 호출) ───────────────────────────
 export async function cacheReserveInvalidate(env, url) {
   const keys = await kvScan(env, 'cache:*', 500);

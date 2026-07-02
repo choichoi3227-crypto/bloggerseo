@@ -15,22 +15,19 @@
  */
 
 import { kvScan, kvGetJson, saveSitemap, saveRss, getSitemap, getRss, kvSet, kvGet } from './store.js';
+import { wasmCore } from './wasm-loader.js';
 
 const BLOGGER_GHS   = 'ghs.google.com';
 const ATOM_FEED_MAX = 500; // Blogger Atom 피드 최대 항목 수
 
-// ── 유틸: slugify (WASM 없이 기본 처리) ─────────────────────────────
-function basicSlugify(str) {
-  if (!str) return '';
-  return str
-    .trim()
-    .toLowerCase()
-    .replace(/[^\w\s가-힣ぁ-龯]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 80);
-}
+// ✅ [버그 수정] 이전에는 이 파일 전용의 별도 basicSlugify()를 써서,
+// 아직 방문된 적 없는 글의 슬러그를 사이트맵/RSS가 미리 만들었다.
+// 문제는 실제 페이지 렌더링(worker.js)은 wasmCore.generateSlug()를 쓰는데
+// 두 함수의 허용 문자셋·길이 제한이 서로 달라(예: 일본어/한자 허용 여부,
+// 80자 vs 인코딩 200바이트 기준 자르기) 같은 제목에서 서로 다른 슬러그가
+// 나올 수 있었다. 그러면 사이트맵에 실린 URL과, 실제 그 글을 처음 방문
+// 했을 때 워커가 확정하는 canonical URL이 달라져 리디렉션 체인·중복
+// 콘텐츠가 발생한다. 이제 동일한 wasmCore.generateSlug()로 통일한다.
 
 // ── Blogger Atom 피드 직접 파싱 (서버 우회) ─────────────────────────
 // Blogger /feeds/posts/default?max-results=N&alt=json 을 직접 파싱해
@@ -117,8 +114,8 @@ export async function generateSitemap(env, baseUrl) {
           if (existing?.titlePath) continue;
           if (!post.title) continue;
 
-          // 슬러그 즉시 생성
-          const slug = basicSlugify(post.title);
+          // 슬러그 즉시 생성 (worker.js와 동일한 생성기 사용)
+          const slug = await wasmCore.generateSlug(post.title);
           if (!slug || slug === 'post' || slug === 'untitled') continue;
           const titlePath = '/' + slug;
 
@@ -207,7 +204,7 @@ export async function generateRss(env, baseUrl, siteTitle = 'BloggerSEO') {
         const atomPosts = await fetchBloggerAtom(baseUrl, env, 50);
         for (const post of atomPosts) {
           if (!post.title) continue;
-          const slug = basicSlugify(post.title);
+          const slug = await wasmCore.generateSlug(post.title);
           if (!slug) continue;
           const titlePath = '/' + slug;
           if (seenTitlePaths.has(titlePath)) continue;

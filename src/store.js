@@ -171,12 +171,24 @@ async function redisScan(env, pattern, count = 100) {
 //   2. 영속 계층(DO Redis / KV / Upstash)을 모두 "동시에" 호출해서
 //      가장 먼저 도착한 유효 값을 채택 (순차 대기 제거)
 //   3. 영속 계층이 전부 비어있거나 실패하면 L4 메모리로 최후 폴백
-// ── 데이터 최대 보유 기간 제한 (최대 1시간) ───────────────────────────
-const MAX_DATA_TTL_SEC = 3600; // 1시간 — DO 요청 폭증 방지 + 데이터 신선도 보장
+// ── 데이터 최대 보유 기간 제한 (최대 1시간, 단 슬러그 매핑은 예외) ───────
+// [버그 수정] 이전에는 slug:origin:*/slug:alias:* 매핑도 다른 캐시성 데이터와
+// 동일하게 "무제한 요청 시 1시간으로 캡"이 적용됐다. 문제는 upsertSlug()가
+// 슬러그 값이 실제로 바뀌지 않으면 재저장(TTL 갱신)을 하지 않고, 별칭(alias)
+// 조회는 읽기 전용이라 TTL을 갱신할 방법이 없었다는 점이다. 그 결과 사람들이
+// 제목 슬러그 URL로만 계속 방문해도 그 매핑은 정확히 1시간 뒤 스토리지에서
+// 자동 소멸했고, 이후 같은 슬러그 URL 방문은 매핑을 찾지 못해 passthrough로
+// 떨어져 Blogger에 존재하지 않는 경로로 요청이 가서 사실상 404가 났다.
+// 슬러그 매핑은 글이 삭제/제목 변경되기 전까지 사실상 영구적이어야 하는
+// 데이터이므로, cache:* 등 진짜 일시적 데이터와 분리해 훨씬 긴 상한(30일)을
+// 적용하고, 시간당 감사(runSlugAudit)에서 주기적으로 갱신해 안전망을 둔다.
+const MAX_DATA_TTL_SEC = 3600;              // 1시간 — cache:/schema: 등 일시적 데이터
+const SLUG_MAX_TTL_SEC = 30 * 24 * 3600;    // 30일 — slug:* 매핑 (사실상 영구, 주기적으로 갱신됨)
 
-function clampTtl(ttlSec) {
-  if (!ttlSec || ttlSec <= 0) return MAX_DATA_TTL_SEC; // 무제한 → 1시간으로 캡
-  return Math.min(ttlSec, MAX_DATA_TTL_SEC);
+function clampTtlForKey(key, ttlSec) {
+  const cap = (typeof key === 'string' && key.startsWith('slug:')) ? SLUG_MAX_TTL_SEC : MAX_DATA_TTL_SEC;
+  if (!ttlSec || ttlSec <= 0) return cap;
+  return Math.min(ttlSec, cap);
 }
 
 // ── DO 호출 쓰로틀 (분당 요청 폭증 방지) ─────────────────────────────
@@ -254,8 +266,8 @@ export async function kvGet(env, key) {
 }
 
 export async function kvSet(env, key, value, ttlSec = 0) {
-  // 최대 1시간으로 캡핑 (DO 데이터 보유 기간 제한 요청사항)
-  const effectiveTtl = clampTtl(ttlSec);
+  // slug:* 키는 30일, 그 외(cache/schema 등)는 1시간으로 캡핑
+  const effectiveTtl = clampTtlForKey(key, ttlSec);
 
   // 메모리 계층은 항상 즉시 갱신
   l1set(key, value, Math.min(effectiveTtl * 1000, L1_TTL_MS));
@@ -372,20 +384,63 @@ export function getMetrics() {
   };
 }
 
+// ── 슬러그 조회 전용 초고속 캐시 (히트 + 네거티브 모두 캐싱) ─────────────
+// resolveSlugRoute()가 "모든 요청마다" slugOriginGet/slugAliasGet을 호출하는데,
+// 기존 구조에서는 slug:* 키가 DO(Durable Object)를 1순위로 조회해서 매 요청마다
+// 네트워크 왕복이 하나 더 붙어 전체 응답이 느려지는 원인이었다.
+// 여기서는 짧은 TTL(5초)로 "값이 있음"과 "매핑이 없음(네거티브)"을 모두
+// 인스턴스 메모리에 캐싱해서, 같은 인스턴스에서 반복되는 조회는 DO/KV
+// 왕복 없이 즉시 반환되게 한다. TTL이 짧아 신규 슬러그 반영 지연은 최대 5초.
+const _slugLookupCache = new Map(); // key → { val, exp }
+const SLUG_LOOKUP_TTL_MS = 5_000;
+const SLUG_NEGATIVE = Symbol('slug-miss');
+
+function slugCacheGet(key) {
+  const e = _slugLookupCache.get(key);
+  if (!e) return undefined;
+  if (Date.now() > e.exp) { _slugLookupCache.delete(key); return undefined; }
+  return e.val;
+}
+function slugCacheSet(key, val) {
+  _slugLookupCache.set(key, { val, exp: Date.now() + SLUG_LOOKUP_TTL_MS });
+  if (_slugLookupCache.size > 5000) {
+    const now = Date.now();
+    for (const [k, e] of _slugLookupCache) if (now > e.exp) _slugLookupCache.delete(k);
+  }
+}
+function slugCacheInvalidate(key) {
+  _slugLookupCache.delete(key);
+}
+
 // ── 슬러그 영속 스토리지 ───────────────────────────────────────────────
 export async function slugOriginGet(env, originPath) {
-  return kvGetJson(env, 'slug:origin:' + originPath);
+  const cacheKey = 'slug:origin:' + originPath;
+  const cached = slugCacheGet(cacheKey);
+  if (cached !== undefined) return cached === SLUG_NEGATIVE ? null : cached;
+
+  const val = await kvGetJson(env, cacheKey);
+  slugCacheSet(cacheKey, val === null ? SLUG_NEGATIVE : val);
+  return val;
 }
 export async function slugAliasGet(env, titlePath) {
-  return kvGet(env, 'slug:alias:' + titlePath);
+  const cacheKey = 'slug:alias:' + titlePath;
+  const cached = slugCacheGet(cacheKey);
+  if (cached !== undefined) return cached === SLUG_NEGATIVE ? null : cached;
+
+  const val = await kvGet(env, cacheKey);
+  slugCacheSet(cacheKey, val === null || val === undefined ? SLUG_NEGATIVE : val);
+  return val ?? null;
 }
 export async function slugOriginPut(env, originPath, data) {
+  slugCacheInvalidate('slug:origin:' + originPath);
   return kvSetJson(env, 'slug:origin:' + originPath, data);
 }
 export async function slugAliasPut(env, titlePath, originPath) {
+  slugCacheInvalidate('slug:alias:' + titlePath);
   return kvSet(env, 'slug:alias:' + titlePath, originPath);
 }
 export async function slugAliasDelete(env, titlePath) {
+  slugCacheInvalidate('slug:alias:' + titlePath);
   return kvDel(env, 'slug:alias:' + titlePath);
 }
 
@@ -403,6 +458,17 @@ export async function upsertSlug(env, originPath, title, titleSlug) {
     await slugAliasPut(env, titlePath, originPath);
     await slugOriginPut(env, originPath, { ...existing, title, titleSlug, titlePath, checkedAt: now });
   }
+}
+
+// ── 슬러그 매핑 TTL 갱신(touch) — 값이 안 바뀌어도 만료 시점을 늦춤 ────
+// slug:* 키의 저장 상한을 30일로 늘렸지만(clampTtlForKey), 트래픽이 뜸한
+// 블로그나 장기간 배포가 없는 경우를 대비한 이중 안전장치로, 시간당 감사
+// (runSlugAudit)가 스캔한 모든 슬러그 매핑을 값 변경 여부와 무관하게
+// 주기적으로 다시 써서 TTL을 계속 최신 상태로 유지한다.
+export async function touchSlug(env, originPath, existing) {
+  if (!existing?.titlePath) return;
+  await slugOriginPut(env, originPath, { ...existing, checkedAt: Date.now() });
+  await slugAliasPut(env, existing.titlePath, originPath);
 }
 
 export async function purgeAllSlugs(env) {

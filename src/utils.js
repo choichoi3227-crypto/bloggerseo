@@ -95,6 +95,8 @@ export function safeTransform(html, fn) {
 export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── 재시도 유틸 ──────────────────────────────────────────────────────
+// [v8] 서킷 브레이커와 연동: origin이 이미 열림(open) 상태면 재시도 없이
+// 즉시 실패시켜, 힘든 origin에 재시도 요청을 추가로 쏟아붓지 않는다.
 export async function retryAsync(fn, maxRetries = 2, baseDelayMs = 60) {
   let lastErr, lastResp;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -111,4 +113,73 @@ export async function retryAsync(fn, maxRetries = 2, baseDelayMs = 60) {
   }
   if (lastResp) return lastResp;
   throw lastErr;
+}
+
+// ── Origin 서킷 브레이커 (Blogger 과부하/장애 보호) ──────────────────
+// 문제: 기존에는 Blogger가 502/503/504를 반환하는 상황(=부하로 힘든 상태)
+// 에서도 요청 하나하나가 개별적으로 최대 2회씩 재시도를 했다. 이는 이미
+// 죽어가는 origin에 오히려 요청량을 3배로 늘려서 상황을 더 악화시키는
+// "재시도 폭풍(retry storm)" 패턴이다. 여기서는 최근 실패율을 인스턴스
+// 메모리에서 추적해서, 임계치를 넘으면 일정 시간(OPEN_MS) 동안 재시도를
+// 건너뛰고(빠른 실패) 곧바로 stale 캐시 폴백이나 502로 넘어가게 한다.
+// → Blogger 입장에서는 불필요한 재시도 트래픽이 줄어 회복이 빨라지고,
+//   사용자 입장에서는 무의미하게 대기하는 시간(재시도 지연 누적)이 사라져
+//   체감 속도도 함께 개선된다.
+const _circuit = { failures: 0, openedAt: 0 };
+const CIRCUIT_FAIL_THRESHOLD = 8;   // 최근 실패 8회 누적 시 open
+const CIRCUIT_OPEN_MS        = 5_000; // 5초간 재시도 억제 후 half-open으로 재시도 허용
+const CIRCUIT_DECAY_MS       = 30_000; // 실패 카운트가 30초 이상 안 늘면 리셋
+
+export function circuitIsOpen() {
+  if (_circuit.openedAt === 0) return false;
+  if (Date.now() - _circuit.openedAt > CIRCUIT_OPEN_MS) {
+    // half-open: 다음 한 번은 통과시켜서 origin 회복 여부를 탐침
+    _circuit.openedAt = 0;
+    _circuit.failures = Math.floor(CIRCUIT_FAIL_THRESHOLD / 2);
+    return false;
+  }
+  return true;
+}
+
+export function circuitRecordResult(ok) {
+  const now = Date.now();
+  if (ok) {
+    _circuit.failures = 0;
+    _circuit.openedAt = 0;
+    return;
+  }
+  if (_circuit._lastFailAt && now - _circuit._lastFailAt > CIRCUIT_DECAY_MS) {
+    _circuit.failures = 0; // 한동안 실패가 없었다면 카운트 리셋
+  }
+  _circuit._lastFailAt = now;
+  _circuit.failures++;
+  if (_circuit.failures >= CIRCUIT_FAIL_THRESHOLD && _circuit.openedAt === 0) {
+    _circuit.openedAt = now;
+  }
+}
+
+export function circuitStatus() {
+  return {
+    open: circuitIsOpen(),
+    failures: _circuit.failures,
+    openedAt: _circuit.openedAt || null,
+  };
+}
+
+// origin fetch 전용 래퍼: 서킷이 열려 있으면 재시도 없이 즉시 실패시켜
+// 호출부(worker.js)가 곧바로 stale 캐시 폴백/502로 넘어가게 한다.
+export async function retryOriginFetch(fn, maxRetries = 2, baseDelayMs = 60) {
+  if (circuitIsOpen()) {
+    const err = new Error('circuit-open: origin recently failing, skipping retries');
+    err.circuitOpen = true;
+    throw err;
+  }
+  try {
+    const resp = await retryAsync(fn, maxRetries, baseDelayMs);
+    circuitRecordResult(!(resp && resp.status >= 500));
+    return resp;
+  } catch (e) {
+    circuitRecordResult(false);
+    throw e;
+  }
 }
