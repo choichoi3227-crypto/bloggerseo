@@ -431,16 +431,25 @@ export async function slugAliasGet(env, titlePath) {
   slugCacheSet(cacheKey, val === null || val === undefined ? SLUG_NEGATIVE : val);
   return val ?? null;
 }
+// [v9] 리디렉션 과다 수정: 이전에는 쓰기 후 로컬 캐시를 "무효화"만 했다.
+// Cloudflare KV는 최종 일관성(eventual consistency) 스토리지라서 쓰기
+// 직후 같은 요청 파이프라인 안에서 바로 읽어도 새 값이 안 보일 수 있는데,
+// 그 순간 다른 요청이 먼저 조회해 버리면 negative(없음)로 캐싱되어 최대
+// 5초간 "방금 만든 슬러그가 존재하지 않는" 것처럼 보였다. 이게 슬러그
+// 확정 직후 리디렉션이 튀는(원본↔슬러그를 오가는) 현상의 핵심 원인이었다.
+// 이제는 무효화 대신 write-through로 새 값을 즉시 로컬 캐시에 채워서,
+// KV 전파가 끝나기 전에도 같은 Isolate에서는 항상 최신 값을 보게 한다.
 export async function slugOriginPut(env, originPath, data) {
-  slugCacheInvalidate('slug:origin:' + originPath);
+  slugCacheSet('slug:origin:' + originPath, data);
   return kvSetJson(env, 'slug:origin:' + originPath, data);
 }
 export async function slugAliasPut(env, titlePath, originPath) {
-  slugCacheInvalidate('slug:alias:' + titlePath);
+  slugCacheSet('slug:alias:' + titlePath, originPath);
   return kvSet(env, 'slug:alias:' + titlePath, originPath);
 }
 export async function slugAliasDelete(env, titlePath) {
-  slugCacheInvalidate('slug:alias:' + titlePath);
+  // 삭제는 진짜로 "없음" 상태이므로 negative로 캐싱해 즉시 반영한다.
+  slugCacheSet('slug:alias:' + titlePath, SLUG_NEGATIVE);
   return kvDel(env, 'slug:alias:' + titlePath);
 }
 
