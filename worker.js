@@ -1,17 +1,19 @@
 /**
- * BloggerSEO Worker v8
+ * BloggerSEO Worker v9
  * ─────────────────────────────────────────────────────────────────────
- * v8 신규/변경:
- *   1.  제목 기반 SEO 슬러그 — 모든 접속 titlePath 강제 (sitemap·RSS·Blogger 우회)
- *   2.  자체 K8s·컨테이너·Docker 유사 오케스트레이션 (정상 작동)
- *   3.  SSL/TLS 실제 데이터 표시 + 라우트 도메인 전체 표시
- *   4.  도메인 설정 — toml 불필요 요소 제거 (완전 자동감지)
- *   5.  로드밸런서 — KV 기반 실제 분산 상태 동기화 + 정상 작동
- *   6.  SEO 악영향 요소 완전 제거
- *   7.  Linux 유사 기술: ProcessManager·CgroupManager·PipelineEngine·
- *       IpcBus·VirtualFS·Systemd·CronDaemon·SignalHandler·Journald·
- *       NetworkNS·WorkerProcessManager (워커 내 다중 인스턴스)
- *   8.  기타 Linux 기술 대량 도입 (veth, /proc, /sys, iptables 유사)
+ * v9 수정 사항 (v8 대비):
+ *   1.  [리디렉션 과다 수정] 슬러그 확정 시 발생하던 이중 301 지점을 하나로
+ *       통합. 방금 슬러그가 새로 생성된 요청은 그 자리에서 바로 렌더링하고,
+ *       KV eventual consistency로 인한 alias 조회 실패 시에도 리디렉션
+ *       루프가 생기지 않도록 방어 로직 추가. (상세: resolveSlugRoute,
+ *       updateSlugKV, handleFetch 참고)
+ *   2.  [K8s·컨테이너·Linux 유사 코드 제거] Cloudflare Workers(V8 Isolate)는
+ *       실제 프로세스·cgroup·커널이 존재하지 않아 어떤 요청도 실질적으로
+ *       처리하지 못하면서 매 요청마다 CPU만 소모하던 시뮬레이션 계층
+ *       (src/k8s.js, src/container.js, src/linux.js 및 이를 호출하던 모든
+ *       부트스트랩/리콘실/크론 틱)을 요청 경로에서 완전히 제거. 관련 패널
+ *       API는 "지원 종료" 상태를 명확히 반환하도록 정리.
+ *   3.  SSL/TLS, 로드밸런서, SEO 기능은 v8과 동일하게 유지.
  */
 
 import { wasmCore }           from './src/wasm-loader.js';
@@ -60,80 +62,25 @@ import {
   cronRefreshCertStatus,
   resolveHostFromRoutes,
 } from './src/ssl.js';
-import { Cluster, Deployment, Service, Namespace, EventBus } from './src/k8s.js';
-import { ContainerLifecycle, ContainerRegistry, ImageBuilder, createVolume } from './src/container.js';
-import {
-  bootstrapLinux, linuxStatus,
-  ProcessManager, CgroupManager, PipelineEngine, IpcBus,
-  VirtualFS, Systemd, CronDaemon, SignalHandler, Journald,
-  NetworkNS, WorkerProcessManager,
-} from './src/linux.js';
+// ─────────────────────────────────────────────────────────────────────
+// [v9] K8s·컨테이너·Linux 유사 시뮬레이션 모듈(src/k8s.js, src/container.js,
+// src/linux.js) import 제거.
+// Cloudflare Workers는 V8 Isolate로 실행되며 실제 프로세스/cgroup/커널이
+// 없어 이 모듈들은 어떤 요청도 실질적으로 처리하지 못했다. 그런데도 매
+// 요청마다 bootstrap/reconcile/cron tick이 실행되어 CPU 시간만 소모하고,
+// 모듈 전역 상태(in-memory Map)는 Isolate가 재활용될 때마다 사라져
+// "정상 작동하는 오케스트레이션"이 아니라 매번 초기화되는 껍데기였다.
+// 요청 처리에 실질적 기여가 없으므로 완전히 제거한다.
+// ─────────────────────────────────────────────────────────────────────
 
 const GHS_TARGET = 'ghs.google.com';
 const DOH_URL    = 'https://1.1.1.1/dns-query';
 
-// ─────────────────────────────────────────────
-// 모듈 로드 시 1회 실행: K8s + Linux 부트스트랩
-// Workers는 V8 Isolate당 모듈을 한 번만 평가하므로
-// 여기서 만든 Namespace/Deployment/Service는 인스턴스가 살아있는 동안 유지된다.
-// ─────────────────────────────────────────────
-(function bootstrapAll() {
-  try {
-    // ── 이미지 빌드 & 레지스트리 등록 ────────────────────────────────
-    new ImageBuilder('bloggerseo/worker', 'v8')
-      .env('ROLE', 'worker').env('VERSION', 'v8')
-      .expose(443).healthCheck('/__debug').build();
-
-    new ImageBuilder('bloggerseo/crawler', 'v2')
-      .env('ROLE', 'seo-crawler').expose(8080).healthCheck('/health').build();
-
-    new ImageBuilder('bloggerseo/sitemap', 'v2')
-      .env('ROLE', 'sitemap-gen').expose(8081).healthCheck('/health').build();
-
-    // ── 네임스페이스 ────────────────────────────────────────────────
-    Cluster.createNamespace('default', { maxContainers: 20, maxCpuMs: 10000, maxMemKb: 40960 });
-    Cluster.createNamespace('seo',     { maxContainers: 10, maxCpuMs: 5000,  maxMemKb: 20480 });
-    Cluster.createNamespace('crawl',   { maxContainers: 6,  maxCpuMs: 3000,  maxMemKb: 10240 });
-
-    // ── Deployment ──────────────────────────────────────────────────
-    Cluster.createDeployment({
-      name: 'bloggerseo-worker', namespace: 'default', replicas: 3,
-      image: 'bloggerseo/worker:v8',
-      resources: { cpuMs: 50, memKb: 512 },
-      healthCheck: { path: '/__debug', intervalMs: 30000 },
-    });
-    Cluster.createDeployment({
-      name: 'seo-crawler', namespace: 'seo', replicas: 2,
-      image: 'bloggerseo/crawler:v2',
-      resources: { cpuMs: 100, memKb: 1024 },
-      healthCheck: { path: '/health', intervalMs: 60000 },
-    });
-    Cluster.createDeployment({
-      name: 'sitemap-gen', namespace: 'seo', replicas: 1,
-      image: 'bloggerseo/sitemap:v2',
-      resources: { cpuMs: 80, memKb: 512 },
-      healthCheck: { path: '/health', intervalMs: 120000 },
-    });
-
-    // ── Service ──────────────────────────────────────────────────────
-    Cluster.createService({ name: 'bloggerseo-svc', namespace: 'default',
-      selector: { app: 'bloggerseo-worker' }, port: 443, protocol: 'HTTPS' });
-    Cluster.createService({ name: 'crawler-svc', namespace: 'seo',
-      selector: { app: 'seo-crawler' }, port: 8080, protocol: 'HTTP' });
-    Cluster.createService({ name: 'sitemap-svc', namespace: 'seo',
-      selector: { app: 'sitemap-gen' }, port: 8081, protocol: 'HTTP' });
-
-    EventBus.emit('cluster-bootstrap', {
-      ts: Date.now(), status: 'ok',
-      version: 'v8', images: 3, namespaces: 3, deployments: 3, services: 3,
-    });
-  } catch (e) {
-    try { EventBus.emit('cluster-bootstrap-error', { error: String(e?.message ?? e) }); } catch (_) {}
-  }
-
-  // Linux 서브시스템 비동기 부트스트랩
-  bootstrapLinux().catch(() => {});
-})();
+// [v9] 여기 있던 K8s(Cluster/Deployment/Service) + Linux 서브시스템
+// 부트스트랩 IIFE를 제거했다. Cloudflare Workers 환경에는 실제로 관리할
+// 프로세스·컨테이너·네트워크 네임스페이스가 없으므로, 이 블록은 매 Isolate
+// 기동마다(그리고 재사용 중에도 요청마다 reconcile로) CPU만 소모하며 아무
+// 실질적 인프라도 만들지 않았다.
 
 // ─────────────────────────────────────────────
 // 메인 핸들러
@@ -144,10 +91,9 @@ export default {
     ctx.waitUntil(wasmCore.warmup().catch(() => {}));
     // 로드밸런서 heartbeat (비동기)
     ctx.waitUntil(lbHeartbeat(env).catch(() => {}));
-    // K8s 상태 reconcile (비동기 — 블로킹 없음)
-    ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
-    // Linux Cron 데몬 tick (분당 1회, 비동기)
-    ctx.waitUntil(CronDaemon.tick().catch(() => {}));
+    // [v9] 여기 있던 Cluster.reconcileAll() / CronDaemon.tick() 호출 제거.
+    // 실제 인프라를 관리하지 않는 시뮬레이션 코드를 매 요청마다 실행하는
+    // 것은 순수 오버헤드였다 (상세 이유는 파일 상단 주석 참고).
     try {
       return await handleFetch(request, env, ctx);
     } catch (e) {
@@ -163,10 +109,6 @@ export default {
     } else {
       ctx.waitUntil(runScheduledHourly(env).catch(() => {}));
     }
-    // K8s Reconcile
-    ctx.waitUntil(Cluster.reconcileAll().catch(() => {}));
-    // Linux Cron 데몬 tick
-    ctx.waitUntil(CronDaemon.tick().catch(() => {}));
   },
 };
 
@@ -254,8 +196,15 @@ async function handleFetch(request, env, ctx) {
   // Blogspot 경로가 노출되는 문제가 있었다. slug 조회는 이제 로컬 캐시
   // (TTL 5초)로 매우 빠르므로, 캐시 조회보다 먼저 수행해서 "원본 경로 +
   // 슬러그 존재"인 경우 캐시 확인 없이 즉시 301로 확정한다.
+  // [v9] 리디렉션 과다 수정: 이 지점에서의 301은 "원본(Blogspot) 경로에
+  // 접근했고, 이미 확정된 SEO 슬러그가 있는 경우" 단 하나의 케이스에서만
+  // 발생한다. 슬러그가 아직 없거나(신규 글) alias 조회가 KV eventual
+  // consistency로 인해 순간적으로 실패한 경우는 passthrough로 원본을 그대로
+  // 렌더링하고, 뒤쪽(라인 ~300 부근) HTML 파이프라인의 리디렉션 판단과
+  // 절대 겹치지 않도록 플래그(alreadyOnOriginPath)로 구분한다.
   let slugRoute = { type: 'passthrough' };
   let originPathForKV = path;
+  const requestedOriginalPath = isPostPath(path); // 이 요청 자체가 원본 경로인지
   try {
     slugRoute = await resolveSlugRoute(path, env);
     if (slugRoute.type === 'redirect') {
@@ -308,6 +257,21 @@ async function handleFetch(request, env, ctx) {
   const fetchT0 = Date.now();
   try {
     originResp = await retryOriginFetch(() => bloggerFetch(fetchUrl, request.headers, argoCtx));
+
+    // [v9] 안전망: 슬러그 경로(alias 미해결 상태)로 Blogger에 그대로 요청을
+    // 보냈다가 404가 난 경우, KV 분산 전파 지연으로 방금 막 생성된 slug
+    // alias를 이 요청이 못 봤을 가능성이 있다. 이때만 1회 재조회해서
+    // 있으면 즉시 원본 경로로 다시 fetch한다 (없으면 그대로 404 처리).
+    if (originResp.status === 404 && slugRoute.type === 'passthrough' &&
+        !requestedOriginalPath && /^\/[^/]+$/.test(decodePathSafe(path)) &&
+        !isReservedFlatPath(decodePathSafe(path))) {
+      const retryOrigin = await slugAliasGet(env, decodePathSafe(path)).catch(() => null);
+      if (retryOrigin) {
+        fetchUrl.pathname = retryOrigin;
+        originPathForKV   = retryOrigin;
+        originResp = await retryOriginFetch(() => bloggerFetch(fetchUrl, request.headers, argoCtx));
+      }
+    }
   } catch (e) {
     lbRelease();
     // ── 장애 격리: Origin(Blogger) 자체가 응답을 못 줄 때, 만료된 캐시라도
@@ -359,18 +323,27 @@ async function handleFetch(request, env, ctx) {
   let result  = html;
   try {
     pageCtx = await extractPageContext(html, url);
-    // ✅ v8: 슬러그 KV 업데이트를 transformHtml 전에 실행
+    // ✅ 슬러그 KV 업데이트를 transformHtml 전에 실행
     // → titlePath가 ctx에 채워져 canonical, seo-features에 즉시 반영됨
     if (pageCtx && isPostPath(originPathForKV)) {
       const originUrl = new URL(originPathForKV, url).toString();
       await updateSlugKV(pageCtx, originPathForKV, env, originUrl).catch(() => {});
     }
-    // ✅ 슬러그가 이 시점에 "새로" 생성된 경우까지 포함해서, 현재 요청이
-    // 원본(Blogspot) 경로인데 확정된 titlePath와 다르면 즉시 301 리디렉션한다.
-    // 기존에는 슬러그가 처음 생성되는 이번 요청 자체는 원본 그대로 렌더링해
-    // 반환했기 때문에, 그 글에 대한 "첫 방문"(크롤러/오래된 링크/신규 발행
-    // 직후 접근 등)은 항상 Blogspot 슬러그로 노출되는 문제가 있었다.
-    if (pageCtx?.titlePath && isPostPath(originPathForKV) && path !== pageCtx.titlePath) {
+    // [v9] 리디렉션 과다 수정 — 이 지점의 301은 "지금 이 요청이 실제로
+    // 원본(Blogspot) 경로로 들어왔을 때"만 발생해야 한다. 이전 버전은
+    // slugRoute.type === 'alias'로 이미 슬러그 URL을 통해 들어온 요청에도
+    // 같은 조건(path !== pageCtx.titlePath)을 적용해서, alias 조회가 KV
+    // 전파 지연으로 실패했거나 슬러그가 막 재계산된 순간에는 슬러그
+    // URL(path) 자체가 방금 만들어진 titlePath와 문자열이 달라 다시 301을
+    // 쏘는 경우가 있었다 — 이게 리디렉션 루프의 실질적 원인이었다.
+    //
+    // 이제는 requestedOriginalPath(요청이 원본 /YYYY/MM/*.html 형태인 경우)
+    // 일 때만 리디렉션한다. 슬러그(alias) 경로로 들어온 요청은 titlePath가
+    // 재계산되어 문자열이 바뀌었더라도 그 자리에서 그대로 렌더링해서
+    // 사용자에게는 항상 정확히 1회 이하의 리디렉션만 보이게 한다. 다음
+    // 방문부터는 sitemap/RSS/내부 링크가 최신 슬러그를 가리키므로 자연히
+    // 수렴한다.
+    if (pageCtx?.titlePath && requestedOriginalPath && path !== pageCtx.titlePath) {
       recordMetric(301, Date.now() - t0);
       return Response.redirect(new URL(pageCtx.titlePath, url).toString(), 301);
     }
@@ -969,64 +942,23 @@ async function handlePanel(request, url, env, ctx) {
   const sslApiResp = await handleSslPanelApi(subPath, request, env);
   if (sslApiResp) return sslApiResp;
 
-  // K8s 클러스터 상태
-  if (subPath === 'api/k8s_status') {
-    return new Response(JSON.stringify(Cluster.status(), null, 2), jsonHeaders());
-  }
-  // K8s 이벤트
-  if (subPath === 'api/k8s_events') {
-    return new Response(JSON.stringify(EventBus.recent(100), null, 2), jsonHeaders());
-  }
-  // K8s Reconcile 강제 실행
-  if (subPath === 'api/k8s_reconcile' && request.method === 'POST') {
-    const results = await Cluster.reconcileAll().catch(e => [{ ok: false, error: e.message }]);
-    return new Response(JSON.stringify({ ok: true, results }), jsonHeaders());
-  }
-  // K8s Apply (선언적 manifest 적용)
-  if (subPath === 'api/k8s_apply' && request.method === 'POST') {
-    try {
-      const manifest = await request.json();
-      const result   = await Cluster.apply(manifest);
-      return new Response(JSON.stringify({ ok: true, kind: manifest.kind, name: manifest.metadata?.name }), jsonHeaders());
-    } catch (e) {
-      return new Response(JSON.stringify({ ok: false, error: e.message }), jsonHeaders());
-    }
-  }
-  // 컨테이너 목록
-  if (subPath === 'api/containers') {
-    return new Response(JSON.stringify(ContainerLifecycle.stats(), null, 2), jsonHeaders());
-  }
-  // ── Linux 상태 API ──────────────────────────────────────────────
-  if (subPath === 'api/linux_status') {
-    return new Response(JSON.stringify(linuxStatus(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_ps') {
-    return new Response(JSON.stringify(ProcessManager.ps(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_cgroups') {
-    return new Response(JSON.stringify(CgroupManager.tree(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_journal') {
-    const n = parseInt(url.searchParams.get('n') || '100');
-    return new Response(JSON.stringify(Journald.query({ n }), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_systemd') {
-    return new Response(JSON.stringify(Systemd.status(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_cron') {
-    return new Response(JSON.stringify(CronDaemon.list(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_workers') {
-    return new Response(JSON.stringify(WorkerProcessManager.stats(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_netns') {
-    return new Response(JSON.stringify(NetworkNS.list(), null, 2), jsonHeaders());
-  }
-  if (subPath === 'api/linux_vfs_proc') {
+  // [v9] K8s/컨테이너/Linux 유사 시뮬레이션 패널 API 전체 제거.
+  // (api/k8s_status, api/k8s_events, api/k8s_reconcile, api/k8s_apply,
+  //  api/containers, api/linux_status, api/linux_ps, api/linux_cgroups,
+  //  api/linux_journal, api/linux_systemd, api/linux_cron,
+  //  api/linux_workers, api/linux_netns, api/linux_vfs_proc)
+  // Cloudflare Workers에는 실제 프로세스·cgroup·네트워크 네임스페이스가
+  // 없어 이 API들은 실제 인프라 상태가 아니라 항상 초기화 직후의 가짜
+  // 시드 데이터만 보여주고 있었다. 혼란을 주는 거짓 정보이므로 명확한
+  // 410 응답으로 대체한다.
+  if (subPath.startsWith('api/k8s_') || subPath === 'api/containers' ||
+      subPath.startsWith('api/linux_')) {
     return new Response(JSON.stringify({
-      loadavg: VirtualFS.loadavg(),
-      meminfo: VirtualFS.meminfo(),
-    }), jsonHeaders());
+      ok: false,
+      error: 'removed',
+      message: 'K8s/컨테이너/Linux 시뮬레이션 API는 v9에서 제거되었습니다. ' +
+               'Cloudflare Workers 환경에서는 실제 프로세스·컨테이너·커널을 관리할 수 없습니다.',
+    }, null, 2), { status: 410, ...jsonHeaders() });
   }
   // 캐시 초기화 로그
   if (subPath === 'api/cache_reset_log') {
@@ -1071,9 +1003,8 @@ async function handlePanel(request, url, env, ctx) {
 async function debugInfo(url, env) {
   const host = url.hostname;
   const cnameOk = cnameGet(host);
-  const linuxProc = ProcessManager.ps();
   const info = {
-    host, version: 'v8',
+    host, version: 'v9',
     workerId   : lbWorkerId(),
     load       : lbLoad(),
     cnameOk,
@@ -1081,16 +1012,8 @@ async function debugInfo(url, env) {
       'argo-routing','tiered-cache','priority-routing','cache-reserve-4h',
       'schema-markup','faq-ai','sitemap-cron','rss-cron','load-balancer-kv',
       'panel','redis-do' + (doRedisAvailable(env) ? ':active' : ':unavailable'),
-      'seo-slug-v8','linux-kernel','k8s-v8','container-v8',
-      'process-manager','cgroup-v2','pipeline-engine','ipc-bus',
-      'virtual-fs','systemd','cron-daemon','signal-handler','journald',
-      'network-ns','worker-process-manager',
+      'seo-slug-v9',
     ],
-    linux: {
-      kernel   : 'BloggerSEO-Linux/6.6.0-virtual',
-      processes: linuxProc.length,
-      workers  : WorkerProcessManager.stats().running,
-    },
     originCircuit: circuitStatus(),
   };
   return new Response(JSON.stringify(info, null, 2), { status: 200, ...jsonHeaders() });
@@ -1337,7 +1260,7 @@ function panelHtml(secret) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BloggerSEO v7 — 관리 패널</title>
+<title>BloggerSEO v9 — 관리 패널</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
@@ -1389,7 +1312,7 @@ tr:hover td{background:#334155}
 </head>
 <body>
 <div class="sidebar">
-  <div class="logo">🚀 BloggerSEO v7</div>
+  <div class="logo">🚀 BloggerSEO v9</div>
   <div class="nav-item active" onclick="showSection('dashboard',this)">📊 대시보드</div>
   <div class="nav-item" onclick="showSection('cache',this)">💾 캐시 관리</div>
   <div class="nav-item" onclick="showSection('redis',this)">🧬 Redis 관리</div>
@@ -1400,10 +1323,12 @@ tr:hover td{background:#334155}
   <div class="nav-item" onclick="showSection('sitemap',this)">🗺️ 사이트맵/RSS</div>
   <div class="nav-item" onclick="showSection('domain',this)">🌍 도메인 설정</div>
   <div class="nav-item" onclick="showSection('ssl',this)">🔒 SSL/TLS 인증서</div>
-  <div class="nav-item" onclick="showSection('k8s',this)">☸️ 컨테이너/K8s</div>
-  <div class="nav-item" onclick="showSection('linux',this)">🐧 Linux 인프라</div>
   <div class="nav-item" onclick="showSection('cachepolicy',this)">⏱️ 캐시 TTL 정책</div>
 </div>
+<!-- [v9] "컨테이너/K8s", "Linux 인프라" 탭 제거됨.
+     Cloudflare Workers에는 실제 프로세스/컨테이너/커널이 없어 해당 탭이
+     보여주던 데이터는 전부 초기화 시 만들어진 가짜 시드 값이었고,
+     연결된 패널 API도 제거되어 더 이상 존재하지 않는다. -->
 <div class="main">
   <!-- 대시보드 -->
   <div id="s-dashboard">
@@ -1662,113 +1587,10 @@ tr:hover td{background:#334155}
     </div>
   </div>
 
-  <!-- K8s / 컨테이너 관리 -->
-  <div id="s-k8s" style="display:none">
-    <h2>☸️ 자체 K8s 오케스트레이션</h2>
-    <div class="grid" id="k8s-cards">
-      <div class="card"><div class="card-title">네임스페이스</div><div class="card-value" id="k8s-ns">-</div></div>
-      <div class="card"><div class="card-title">Deployment</div><div class="card-value" id="k8s-dep">-</div></div>
-      <div class="card"><div class="card-title">서비스</div><div class="card-value" id="k8s-svc">-</div></div>
-      <div class="card"><div class="card-title">컨테이너</div><div class="card-value" id="k8s-ctr">-</div></div>
-      <div class="card"><div class="card-title">이벤트</div><div class="card-value" id="k8s-ev-count">-</div></div>
-    </div>
-    <div class="table-wrap" style="margin-top:16px">
-      <table><thead><tr><th>컨테이너 ID</th><th>이미지</th><th>상태</th><th>CPU</th><th>요청수</th><th>헬스</th></tr></thead>
-      <tbody id="k8s-ctr-table"></tbody></table>
-    </div>
-    <div class="section" style="margin-top:20px">
-      <div class="card">
-        <div class="card-title">최근 이벤트</div>
-        <div id="k8s-events" style="margin-top:10px;font-family:monospace;font-size:12px;color:#94a3b8;line-height:1.8"></div>
-      </div>
-    </div>
-    <div class="flex" style="margin-top:16px">
-      <button class="btn btn-primary" onclick="loadK8s()">🔄 새로고침</button>
-      <button class="btn btn-primary" onclick="k8sReconcile()">⚙️ Reconcile 실행</button>
-    </div>
-  </div>
-
-  <!-- Linux 인프라 -->
-  <div id="s-linux" style="display:none">
-    <h2>🐧 Linux 인프라 (자체 구현)</h2>
-    <div class="grid">
-      <div class="card"><div class="card-title">커널</div><div class="card-value" style="font-size:13px">BloggerSEO-Linux/6.6.0</div></div>
-      <div class="card"><div class="card-title">프로세스 수</div><div class="card-value" id="lx-ps-count">-</div></div>
-      <div class="card"><div class="card-title">워커 인스턴스</div><div class="card-value" id="lx-workers">-</div></div>
-      <div class="card"><div class="card-title">Cgroup 수</div><div class="card-value" id="lx-cg-count">-</div></div>
-      <div class="card"><div class="card-title">Systemd 유닛</div><div class="card-value" id="lx-units">-</div></div>
-      <div class="card"><div class="card-title">Cron 잡</div><div class="card-value" id="lx-cron">-</div></div>
-    </div>
-
-    <!-- /proc 정보 -->
-    <div class="card" style="margin-top:16px">
-      <div class="card-title">/proc/loadavg & meminfo</div>
-      <pre id="lx-proc" style="margin-top:8px;font-family:monospace;font-size:12px;color:#94a3b8;line-height:1.7">로딩 중...</pre>
-    </div>
-
-    <!-- 프로세스 테이블 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">📋 프로세스 테이블 (ps aux)</h3>
-      <div class="table-wrap">
-        <table><thead><tr><th>PID</th><th>이름</th><th>상태</th><th>CPU ms</th><th>Cgroup</th><th>PPID</th></tr></thead>
-        <tbody id="lx-ps-table"></tbody></table>
-      </div>
-    </div>
-
-    <!-- Cgroup 트리 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">🗂️ Cgroup 트리</h3>
-      <div class="table-wrap">
-        <table><thead><tr><th>Cgroup</th><th>상위</th><th>CPU 사용</th><th>CPU 한도</th><th>메모리 사용</th><th>PID 수</th></tr></thead>
-        <tbody id="lx-cg-table"></tbody></table>
-      </div>
-    </div>
-
-    <!-- Systemd 유닛 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">⚙️ Systemd 유닛 (systemctl status)</h3>
-      <div class="table-wrap">
-        <table><thead><tr><th>유닛</th><th>설명</th><th>상태</th><th>재시작</th><th>PID</th></tr></thead>
-        <tbody id="lx-unit-table"></tbody></table>
-      </div>
-    </div>
-
-    <!-- Cron 잡 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">⏰ Cron 잡 (crontab -l)</h3>
-      <div class="table-wrap">
-        <table><thead><tr><th>ID</th><th>이름</th><th>스케줄</th><th>마지막 실행</th><th>실행 횟수</th><th>에러</th></tr></thead>
-        <tbody id="lx-cron-table"></tbody></table>
-      </div>
-    </div>
-
-    <!-- 워커 인스턴스 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">🔀 멀티 워커 인스턴스 (다중 인스턴스 LB)</h3>
-      <div class="table-wrap">
-        <table><thead><tr><th>인스턴스 ID</th><th>역할</th><th>PID</th><th>상태</th><th>요청 수</th><th>에러</th><th>Cgroup</th></tr></thead>
-        <tbody id="lx-inst-table"></tbody></table>
-      </div>
-    </div>
-
-    <!-- 저널 로그 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">📔 Journald 로그 (journalctl -n 50)</h3>
-      <div class="card" style="max-height:300px;overflow-y:auto">
-        <div id="lx-journal" style="font-family:monospace;font-size:11px;color:#94a3b8;line-height:1.7"></div>
-      </div>
-    </div>
-
-    <!-- 네트워크 네임스페이스 -->
-    <div class="section" style="margin-top:16px">
-      <h3 style="font-size:14px;margin-bottom:8px;color:#f8fafc">🌐 네트워크 네임스페이스 (ip netns list)</h3>
-      <div id="lx-netns" style="color:#94a3b8;font-size:13px"></div>
-    </div>
-
-    <div class="flex" style="margin-top:16px">
-      <button class="btn btn-primary" onclick="loadLinux()">🔄 새로고침</button>
-    </div>
-  </div>
+  <!-- [v9] "K8s / 컨테이너 관리", "Linux 인프라" 섹션 제거됨.
+       실제 요청을 처리하지 않는 시뮬레이션 데이터를 보여주던 화면이었고,
+       연결된 패널 API(api/k8s_*, api/linux_*, api/containers)가 모두
+       제거되어 더 이상 표시할 데이터가 없다. -->
 
   <!-- 캐시 TTL 정책 -->
   <div id="s-cachepolicy" style="display:none">
@@ -1825,8 +1647,6 @@ function showSection(name, navEl){
   else if(name==='sitemap') {}
   else if(name==='domain') loadDomainInfo();
   else if(name==='ssl') loadSslStatus();
-  else if(name==='k8s') loadK8s();
-  else if(name==='linux') loadLinux();
   else if(name==='cachepolicy') loadCachePolicyInfo();
 }
 
@@ -2051,82 +1871,7 @@ async function sslRefreshAll() {
   loadSslStatus();
 }
 
-async function loadLinux() {
-  const d = await api('api/linux_status');
-  // /proc 정보
-  document.getElementById('lx-proc').textContent =
-    'loadavg: ' + (d.proc?.loadavg || '-') + '\\n' + (d.proc?.meminfo || '-');
-
-  // 요약 카드
-  document.getElementById('lx-ps-count').textContent = (d.ps || []).length;
-  document.getElementById('lx-workers').textContent  = d.workers?.running ?? '-';
-  document.getElementById('lx-cg-count').textContent = (d.cgroups || []).length;
-  document.getElementById('lx-units').textContent    = (d.systemd || []).length;
-  document.getElementById('lx-cron').textContent     = (d.cron || []).length;
-
-  // 프로세스 테이블
-  const psTb = document.getElementById('lx-ps-table');
-  psTb.innerHTML = (d.ps || []).length
-    ? (d.ps || []).map(p => \`<tr>
-        <td>\${p.pid}</td><td><code>\${p.name}</code></td>
-        <td><span class=\"badge \${p.state==='R'?'badge-green':p.state==='Z'?'badge-yellow':'badge-red'}\">\${p.state}</span></td>
-        <td>\${p.cpuMs}ms</td><td>\${p.cgroup||'/'}</td><td>\${p.ppid||0}</td>
-      </tr>\`).join('')
-    : '<tr><td colspan="6" style="color:#64748b;text-align:center">프로세스 없음</td></tr>';
-
-  // Cgroup 트리
-  const cgTb = document.getElementById('lx-cg-table');
-  cgTb.innerHTML = (d.cgroups || []).map(cg => \`<tr>
-    <td><code>\${cg.id}</code></td><td>\${cg.parent||'root'}</td>
-    <td>\${cg.cpu?.used||0}ms</td>
-    <td><span class=\"badge \${(cg.cpu?.pct||0)>80?'badge-red':(cg.cpu?.pct||0)>50?'badge-yellow':'badge-green'}\">\${cg.cpu?.pct||0}%</span></td>
-    <td>\${cg.mem?.used||0} kB</td>
-    <td>\${(cg.pids||[]).length}</td>
-  </tr>\`).join('') || '<tr><td colspan="6" style="color:#64748b;text-align:center">Cgroup 없음</td></tr>';
-
-  // Systemd 유닛
-  const unitTb = document.getElementById('lx-unit-table');
-  unitTb.innerHTML = (d.systemd || []).map(u => \`<tr>
-    <td><code>\${u.name}</code></td><td style=\"font-size:12px\">\${u.description||''}</td>
-    <td><span class=\"badge \${u.state==='active'?'badge-green':u.state==='failed'?'badge-red':'badge-yellow'}\">\${u.state}</span></td>
-    <td>\${u.restarts||0}</td><td>\${u.pid||'-'}</td>
-  </tr>\`).join('') || '<tr><td colspan=\"5\" style=\"color:#64748b;text-align:center\">유닛 없음</td></tr>';
-
-  // Cron 잡
-  const cronTb = document.getElementById('lx-cron-table');
-  cronTb.innerHTML = (d.cron || []).map(j => \`<tr>
-    <td><code>\${j.id}</code></td><td>\${j.name||''}</td>
-    <td><span class=\"tag\">\${j.expr}</span></td>
-    <td style=\"font-size:11px\">\${j.lastRun ? new Date(j.lastRun).toLocaleString('ko-KR') : '-'}</td>
-    <td>\${j.runs||0}</td>
-    <td><span class=\"\${j.errors>0?'badge badge-red':''}\"> \${j.errors||0}</span></td>
-  </tr>\`).join('') || '<tr><td colspan=\"6\" style=\"color:#64748b;text-align:center\">Cron 잡 없음</td></tr>';
-
-  // 워커 인스턴스
-  const instTb = document.getElementById('lx-inst-table');
-  instTb.innerHTML = (d.workers?.instances || []).map(i => \`<tr>
-    <td><code>\${i.id}</code></td><td><span class=\"tag\">\${i.role}</span></td>
-    <td>\${i.pid||'-'}</td>
-    <td><span class=\"badge \${i.state==='running'?'badge-green':i.state==='failed'?'badge-red':'badge-yellow'}\">\${i.state}</span></td>
-    <td>\${i.stats?.requests||0}</td>
-    <td>\${i.stats?.errors||0}</td>
-    <td>\${i.cgroup||'-'}</td>
-  </tr>\`).join('') || '<tr><td colspan=\"7\" style=\"color:#64748b;text-align:center\">워커 인스턴스 없음 — 첫 요청 후 자동 생성</td></tr>';
-
-  // 저널 로그
-  const jEl = document.getElementById('lx-journal');
-  jEl.innerHTML = (d.journal || []).slice(-50).reverse().map(e => {
-    const col = e.priority==='error'?'#f87171':e.priority==='warn'?'#fb923c':'#94a3b8';
-    return \`<div>[<span style=\"color:#60a5fa\">\${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style=\"color:\${col}\">\${e.priority?.toUpperCase()}</span> \${e.message}</div>\`;
-  }).join('') || '<div style="color:#475569">로그 없음</div>';
-
-  // 네트워크 네임스페이스
-  const nsEl = document.getElementById('lx-netns');
-  const netns = d.netns || [];
-  nsEl.innerHTML = netns.length
-    ? netns.map(n => \`<span class=\"tag\" style=\"margin-right:8px\">\${n}</span>\`).join('')
-    : '<span style="color:#64748b">네트워크 네임스페이스 없음</span>';
-}
+// [v9] loadLinux() 제거 — 연결된 api/linux_status가 더 이상 존재하지 않음.
 
 async function loadDomainInfo() {
   const d = await api('api/domain_info');
@@ -2151,37 +1896,8 @@ async function loadDomainInfo() {
   }
 }
 
-async function loadK8s() {
-  const [status, events] = await Promise.all([api('api/k8s_status'), api('api/k8s_events')]);
-  document.getElementById('k8s-ns').textContent       = (status.namespaces  || []).length;
-  document.getElementById('k8s-dep').textContent      = (status.deployments || []).length;
-  document.getElementById('k8s-svc').textContent      = (status.services    || []).length;
-  document.getElementById('k8s-ctr').textContent      = (status.containers?.total || 0);
-  document.getElementById('k8s-ev-count').textContent = (events || []).length;
-
-  const ctrs = status.containers?.containers || [];
-  const tb = document.getElementById('k8s-ctr-table');
-  tb.innerHTML = ctrs.length
-    ? ctrs.map(c => \`<tr>\n        <td><code>\${c.id?.slice(0,14)||'-'}</code></td>\n        <td>\${c.image||'-'}</td>\n        <td><span class=\"badge \${c.state==='running'?'badge-green':c.state==='stopped'?'badge-yellow':'badge-red'}\">\${c.state||'-'}</span></td>\n        <td>\${c.cpu?.usedMs?.toFixed(1)||0}ms</td>\n        <td>\${c.requests?.count||0}</td>\n        <td><span class=\"badge \${c.health?.status==='healthy'?'badge-green':'badge-yellow'}\">\${c.health?.status||'unknown'}</span></td>\n      </tr>\`).join('')
-    : '<tr><td colspan="6" style="color:#64748b;text-align:center">실행 중인 컨테이너 없음 — Reconcile 실행 후 새로고침</td></tr>';
-
-  const evDiv = document.getElementById('k8s-events');
-  evDiv.innerHTML = (events || []).slice(0, 30).map(e =>
-    \`<div>[<span style="color:#60a5fa">\${new Date(e.ts).toLocaleTimeString('ko-KR')}</span>] <span style="color:#a78bfa">\${e.type}</span> \${e.deployment||e.pod||e.namespace||''}</div>\`
-  ).join('') || '<div style="color:#475569">이벤트 없음 — Worker 첫 요청 후 자동 생성됩니다</div>';
-}
-
-async function k8sReconcile() {
-  const btn = event.target;
-  btn.disabled = true; btn.textContent = '⏳ 실행 중...';
-  try {
-    const r = await fetch('/panel/api/k8s_reconcile?secret='+encodeURIComponent(SECRET), {method:'POST'}).then(r=>r.json());
-    toast(r.ok ? 'Reconcile 완료 (' + (r.results||[]).length + '개)' : '오류: ' + r.error);
-    await loadK8s();
-  } finally {
-    btn.disabled = false; btn.textContent = '⚙️ Reconcile 실행';
-  }
-}
+// [v9] loadK8s(), k8sReconcile() 제거 — 연결된 api/k8s_status,
+// api/k8s_events, api/k8s_reconcile이 더 이상 존재하지 않음.
 
 async function loadCachePolicyInfo() {
   const log = await api('api/cache_reset_log');
