@@ -292,10 +292,10 @@ async function handleFetch(request, env, ctx) {
   lbRelease();
   argoRecordLatency(argoCtx.region, Date.now() - fetchT0);
 
-  // 3xx 그대로
+  // 3xx 그대로 (단, Location의 스킴/호스트는 항상 커스텀 도메인+https로 보정)
   if (originResp.status >= 300 && originResp.status < 400) {
     recordMetric(originResp.status, Date.now() - t0);
-    return stripInternalHeaders(originResp);
+    return stripInternalHeaders(originResp, url);
   }
   if (originResp.status >= 500) {
     // ── 장애 격리: Origin이 5xx를 반환해도 stale 캐시가 있으면 그걸 서빙
@@ -311,7 +311,7 @@ async function handleFetch(request, env, ctx) {
   }
   if (!isHtml(originResp) || !originResp.ok) {
     recordMetric(originResp.status, Date.now() - t0);
-    return stripInternalHeaders(originResp);
+    return stripInternalHeaders(originResp, url);
   }
 
   // ── HTML 변환 파이프라인 ────────────────────────────────────────
@@ -877,7 +877,7 @@ async function bloggerFetch(url, reqHeaders, argoCtx) {
 async function proxyPass(url, request) {
   try {
     const resp = await retryAsync(() => bloggerFetch(url, request.headers, null), 1);
-    return stripInternalHeaders(resp, isPassthrough(url.pathname, url));
+    return stripInternalHeaders(resp, url, isPassthrough(url.pathname, url));
   } catch (e) {
     return errResp(502, 'Proxy failed: ' + String(e?.message ?? e));
   }
@@ -1171,11 +1171,37 @@ function shouldBypassCache(request, url, path) {
 // ─────────────────────────────────────────────
 // 응답 유틸
 // ─────────────────────────────────────────────
-function stripInternalHeaders(resp, isStaticAsset) {
+function stripInternalHeaders(resp, requestUrl, isStaticAsset) {
   try {
     const h = new Headers(resp.headers);
     ['cf-cache-status','cf-ray','nel','report-to','server'].forEach(k => h.delete(k));
     h.set('x-powered-by', 'BloggerSEO-v8');
+
+    // ✅ [리디렉션 루프 수정 v10] Blogger(ghs.google.com) 원본이 3xx 응답의
+    // Location 헤더에 자기 자신 기준의 스킴/호스트(대개 http:// 이거나
+    // 내부적으로 인식한 blogspot 호스트)를 그대로 담아 보내는 경우가 있다.
+    // 이걸 손대지 않고 그대로 브라우저에 전달하면:
+    //   1) Location이 http://커스텀도메인/... 으로 내려감
+    //   2) 브라우저가 http://로 재요청 → enforceHttpsRedirect가 다시
+    //      https://로 301
+    //   3) Worker가 Blogger에서 다시 콘텐츠를 가져오면 Blogger가 또 같은
+    //      http:// Location을 반환
+    //   4) 2)↔3) 무한 반복 → 브라우저에 "리디렉션 횟수가 너무 많습니다"
+    // (ERR_TOO_MANY_REDIRECTS) 로 노출된다.
+    // 항상 "지금 요청받은 커스텀 도메인 + https"로 스킴/호스트를 강제
+    // 치환해서 이 루프를 원천 차단한다. 경로/쿼리/해시는 Blogger가 보낸
+    // 값을 그대로 유지한다 (Blogger 내부 정규화 로직은 신뢰).
+    const loc = h.get('location');
+    if (loc && requestUrl) {
+      try {
+        const locUrl = new URL(loc, requestUrl);
+        locUrl.protocol = 'https:';
+        locUrl.hostname = requestUrl.hostname;
+        locUrl.port     = '';
+        h.set('location', locUrl.toString());
+      } catch (_) {}
+    }
+
     if (isStaticAsset && resp.ok) {
       const cc = h.get('cache-control') || '';
       if (!cc || /no-store|no-cache|max-age=0/i.test(cc)) {
