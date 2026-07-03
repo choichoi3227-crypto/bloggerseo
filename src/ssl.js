@@ -98,6 +98,17 @@ async function saveRoutes(env, routes) {
   await kvSetJson(env, KV_ROUTES_KEY, routes, 0); // TTL 없음 — 영속
 }
 
+/**
+ * 등록된 모든 라우트(도메인) 목록을 반환한다.
+ * [신규] 사이트맵/RSS를 "등록된 모든 사이트 각각"에 대해 독립적으로
+ * 생성하려면 resolveHostFromRoutes()처럼 딱 하나만 골라내는 함수로는
+ * 부족하다. worker.js의 크론/패널 일괄 생성 로직이 전체 목록을 순회할
+ * 수 있도록 loadRoutes()를 외부에 공개한다.
+ */
+export async function listRoutes(env) {
+  return loadRoutes(env);
+}
+
 /** 패널에서 수동으로 도메인 추가 */
 export async function addRoute(env, host) {
   host = host.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
