@@ -1,6 +1,14 @@
 /**
- * BloggerSEO v8 — 사이트맵 + RSS 생성기
+ * BloggerSEO v10 — 사이트맵 + RSS 생성기 (사이트별 격리)
  * ─────────────────────────────────────────────────────────────────────
+ * v10 변경:
+ *   ✅ [버그 수정] 이 Worker 하나가 여러 개인 도메인(Blogspot 사이트)을
+ *      동시에 서빙하는데, 사이트맵/RSS 생성이 host 구분 없이 전체
+ *      slug:origin:* 키를 다 긁어와 단일 sitemap:index/rss:feed 키에
+ *      몰아넣고 있었다. 이제 baseUrl의 호스트를 기준으로 그 사이트의
+ *      슬러그만 스캔하고, 결과도 사이트별 키(sitemap:index:{host},
+ *      rss:feed:{host})에 저장해 사이트 간 완전히 독립적으로 동작한다.
+ *
  * v8 변경:
  *   ✅ 사이트맵/RSS: titlePath (SEO 슬러그) 없는 항목 완전 제외
  *      → 모든 URL이 항상 SEO 슬러그 기반으로 출력됨
@@ -10,12 +18,20 @@
  *      아직 슬러그 없는 포스트도 실시간으로 슬러그 생성 후 포함
  *
  * Cron triggers:
- *   - 매 30분 → RSS 생성
- *   - 매 정시 → 사이트맵 생성 + 슬러그 감사
+ *   - 매 30분 → RSS 생성 (등록된 모든 사이트 각각)
+ *   - 매 정시 → 사이트맵 생성 + 슬러그 감사 (등록된 모든 사이트 각각)
  */
 
-import { kvScan, kvGetJson, saveSitemap, saveRss, getSitemap, getRss, kvSet, kvGet } from './store.js';
+import { kvScan, kvGetJson, saveSitemap, saveRss, getSitemap, getRss, kvSet, kvGet, normalizeSiteKey } from './store.js';
 import { wasmCore } from './wasm-loader.js';
+
+// baseUrl(예: https://myblog.com)에서 이 사이트를 식별하는 host 키를 뽑는다.
+// slug:origin:{site}:..., sitemap:index:{site} 등 모든 사이트별 키가
+// 이 함수 하나로 일관되게 계산된다.
+function siteKeyFromBase(baseUrl) {
+  try { return normalizeSiteKey(new URL(baseUrl).hostname); }
+  catch (_) { return normalizeSiteKey(baseUrl); }
+}
 
 const BLOGGER_GHS   = 'ghs.google.com';
 const ATOM_FEED_MAX = 500; // Blogger Atom 피드 최대 항목 수
@@ -74,11 +90,13 @@ async function fetchBloggerAtom(baseUrl, env, maxResults = 100) {
   return posts;
 }
 
-// ── 사이트맵 생성 ────────────────────────────────────────────────────
+// ── 사이트맵 생성 (baseUrl의 호스트에 속한 슬러그만 사용) ──────────────
 export async function generateSitemap(env, baseUrl) {
   try {
-    // 1. KV에서 슬러그 목록 수집
-    const keys    = await kvScan(env, 'slug:origin:*', 2000);
+    const site = siteKeyFromBase(baseUrl);
+
+    // 1. KV에서 "이 사이트" 슬러그 목록만 수집 (host prefix로 격리)
+    const keys    = await kvScan(env, 'slug:origin:' + site + ':*', 2000);
     const entries = [];
     const seenTitlePaths = new Set();
 
@@ -109,7 +127,7 @@ export async function generateSitemap(env, baseUrl) {
         const atomPosts = await fetchBloggerAtom(baseUrl, env, 200);
         for (const post of atomPosts) {
           // 이미 슬러그 있으면 스킵
-          const originKey = 'slug:origin:' + post.originPath;
+          const originKey = 'slug:origin:' + site + ':' + post.originPath;
           const existing  = await kvGetJson(env, originKey).catch(() => null);
           if (existing?.titlePath) continue;
           if (!post.title) continue;
@@ -122,12 +140,12 @@ export async function generateSitemap(env, baseUrl) {
           if (seenTitlePaths.has(titlePath)) continue;
           seenTitlePaths.add(titlePath);
 
-          // KV 저장 (background)
+          // KV 저장 (background) — 반드시 이 사이트(site) 네임스페이스 안에 저장
           kvSet(env, originKey, JSON.stringify({
             originPath: post.originPath, titlePath, title: post.title,
             checkedAt: Date.now(),
           }), 86400).catch(() => {});
-          kvSet(env, 'slug:alias:' + titlePath, post.originPath, 86400).catch(() => {});
+          kvSet(env, 'slug:alias:' + site + ':' + titlePath, post.originPath, 86400).catch(() => {});
 
           const lastmod = post.updated ? new Date(post.updated).toISOString().split('T')[0]
                         : new Date().toISOString().split('T')[0];
@@ -145,7 +163,7 @@ export async function generateSitemap(env, baseUrl) {
     });
 
     const xml = buildSitemapXml(entries);
-    await saveSitemap(env, xml);
+    await saveSitemap(env, xml, site);
     return { count: entries.length, xml };
   } catch (e) {
     return { count: 0, error: String(e?.message || e) };
@@ -172,7 +190,8 @@ ${items}
 // ── RSS 생성 ──────────────────────────────────────────────────────────
 export async function generateRss(env, baseUrl, siteTitle = 'BloggerSEO') {
   try {
-    const keys    = await kvScan(env, 'slug:origin:*', 200);
+    const site = siteKeyFromBase(baseUrl);
+    const keys = await kvScan(env, 'slug:origin:' + site + ':*', 200);
     const entries = [];
     const seenTitlePaths = new Set();
 
@@ -219,7 +238,7 @@ export async function generateRss(env, baseUrl, siteTitle = 'BloggerSEO') {
     entries.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
 
     const xml = buildRssXml(entries.slice(0, 50), baseUrl, siteTitle);
-    await saveRss(env, xml);
+    await saveRss(env, xml, site);
     return { count: entries.length, xml };
   } catch (e) {
     return { count: 0, error: String(e?.message || e) };
@@ -249,10 +268,15 @@ ${items}
 </rss>`;
 }
 
-// ── 사이트맵/RSS 엔드포인트 핸들러 ─────────────────────────────────
+// ── 사이트맵/RSS 엔드포인트 핸들러 (요청 host 기준으로 사이트별 격리) ──
+// [버그 수정] getSitemap(env)/getRss(env)를 인자 없이 호출하면 어떤
+// 사이트가 요청했든 동일한 전역 캐시를 반환했다. 이제 실제 요청 host
+// (hostOverride)로 계산한 base의 사이트 키를 넘겨 그 사이트 전용 캐시만
+// 조회·저장한다.
 export async function handleSitemapRequest(env, url, hostOverride) {
   const base   = resolveBaseForRequest(env, url, hostOverride);
-  const cached = await getSitemap(env);
+  const site   = siteKeyFromBase(base);
+  const cached = await getSitemap(env, site);
   if (cached) {
     return new Response(cached, {
       headers: {
@@ -276,7 +300,8 @@ export async function handleSitemapRequest(env, url, hostOverride) {
 
 export async function handleRssRequest(env, url, hostOverride) {
   const base   = resolveBaseForRequest(env, url, hostOverride);
-  const cached = await getRss(env);
+  const site   = siteKeyFromBase(base);
+  const cached = await getRss(env, site);
   if (cached) {
     return new Response(cached, {
       headers: {
@@ -285,7 +310,10 @@ export async function handleRssRequest(env, url, hostOverride) {
       },
     });
   }
-  const { xml } = await generateRss(env, base);
+  // 사이트별로 저장된 제목이 있으면 사용 (없으면 generateRss 기본값 'BloggerSEO')
+  let siteTitle;
+  try { siteTitle = await kvGet(env, 'state:site_title:' + site); } catch (_) { siteTitle = null; }
+  const { xml } = await generateRss(env, base, siteTitle || undefined);
   return new Response(xml || emptyRss(base), {
     headers: {
       'content-type': 'application/rss+xml; charset=utf-8',
