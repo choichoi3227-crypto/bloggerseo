@@ -19,15 +19,23 @@
  *   진짜 영속성은 DO Redis / SLUG_KV / Upstash 중 살아있는 계층이 보장합니다.
  *
  *   키 스킴:
- *       slug:origin:{path}      → JSON (슬러그 원본 경로)
- *       slug:alias:{path}       → string (슬러그 별칭)
- *       cache:{hash}            → JSON (Cache Reserve 항목)
- *       schema:{hash}           → JSON (스키마 마크업 캐시)
- *       state:block:{ip}        → 1 (차단 IP)
- *       state:region:{region}   → JSON (지역별 캐시 통계)
- *       state:worker:{id}       → JSON (워커 인스턴스 상태)
- *       sitemap:index           → XML
- *       rss:feed                → XML
+ *       slug:origin:{host}:{path} → JSON (슬러그 원본 경로, 사이트별 격리)
+ *       slug:alias:{host}:{path}  → string (슬러그 별칭, 사이트별 격리)
+ *       cache:{hash}              → JSON (Cache Reserve 항목)
+ *       schema:{hash}             → JSON (스키마 마크업 캐시)
+ *       state:block:{ip}          → 1 (차단 IP)
+ *       state:region:{region}     → JSON (지역별 캐시 통계)
+ *       state:worker:{id}         → JSON (워커 인스턴스 상태)
+ *       sitemap:index:{host}      → XML (사이트별 격리)
+ *       rss:feed:{host}           → XML (사이트별 격리)
+ *
+ *   [버그 수정] 이전에는 slug:origin:/slug:alias:/sitemap:index/rss:feed가
+ *   전부 호스트 구분 없는 단일 전역 키였다. 이 Worker 하나가 여러 개인
+ *   도메인(Blogspot 사이트)을 동시에 서빙하는 구조이기 때문에, 사이트 A의
+ *   슬러그가 사이트 B의 사이트맵/RSS에 섞여 들어가고, 사이트맵/RSS 캐시도
+ *   전역 키 하나만 있어 어느 사이트가 요청하든 같은(가장 최근에 생성된)
+ *   결과를 받게 되는 문제가 있었다. 이제 모든 관련 키에 host를 포함시켜
+ *   사이트별로 완전히 독립적으로 저장·조회되도록 한다.
  */
 
 import {
@@ -412,9 +420,28 @@ function slugCacheInvalidate(key) {
   _slugLookupCache.delete(key);
 }
 
-// ── 슬러그 영속 스토리지 ───────────────────────────────────────────────
-export async function slugOriginGet(env, originPath) {
-  const cacheKey = 'slug:origin:' + originPath;
+// ── 사이트(host) 키 정규화 ─────────────────────────────────────────────
+// 슬러그/사이트맵/RSS 키에 host를 섞어 넣기 전에 항상 이 함수를 거쳐서
+// 대소문자·프로토콜·트레일링 슬래시 차이로 같은 사이트가 다른 키로
+// 갈라지는 일이 없게 한다. host가 없으면 'default'로 묶어 완전히 깨지는
+// 것보다는 최소한 하나의 격리된 버킷으로라도 동작하게 한다.
+export function normalizeSiteKey(host) {
+  if (!host) return 'default';
+  return String(host)
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .trim() || 'default';
+}
+
+// ── 슬러그 영속 스토리지 (사이트별 격리) ───────────────────────────────
+// [버그 수정] originPath/titlePath만으로 키를 만들면 서로 다른 사이트의
+// 글이 같은 키로 충돌하고, 사이트맵/RSS 생성기가 "이 사이트의 글"만
+// 골라낼 방법이 없었다. 이제 host를 키에 포함해 사이트별로 완전히
+// 분리 저장한다.
+export async function slugOriginGet(env, host, originPath) {
+  const site = normalizeSiteKey(host);
+  const cacheKey = 'slug:origin:' + site + ':' + originPath;
   const cached = slugCacheGet(cacheKey);
   if (cached !== undefined) return cached === SLUG_NEGATIVE ? null : cached;
 
@@ -422,8 +449,9 @@ export async function slugOriginGet(env, originPath) {
   slugCacheSet(cacheKey, val === null ? SLUG_NEGATIVE : val);
   return val;
 }
-export async function slugAliasGet(env, titlePath) {
-  const cacheKey = 'slug:alias:' + titlePath;
+export async function slugAliasGet(env, host, titlePath) {
+  const site = normalizeSiteKey(host);
+  const cacheKey = 'slug:alias:' + site + ':' + titlePath;
   const cached = slugCacheGet(cacheKey);
   if (cached !== undefined) return cached === SLUG_NEGATIVE ? null : cached;
 
@@ -439,33 +467,36 @@ export async function slugAliasGet(env, titlePath) {
 // 확정 직후 리디렉션이 튀는(원본↔슬러그를 오가는) 현상의 핵심 원인이었다.
 // 이제는 무효화 대신 write-through로 새 값을 즉시 로컬 캐시에 채워서,
 // KV 전파가 끝나기 전에도 같은 Isolate에서는 항상 최신 값을 보게 한다.
-export async function slugOriginPut(env, originPath, data) {
-  slugCacheSet('slug:origin:' + originPath, data);
-  return kvSetJson(env, 'slug:origin:' + originPath, data);
+export async function slugOriginPut(env, host, originPath, data) {
+  const site = normalizeSiteKey(host);
+  slugCacheSet('slug:origin:' + site + ':' + originPath, data);
+  return kvSetJson(env, 'slug:origin:' + site + ':' + originPath, data);
 }
-export async function slugAliasPut(env, titlePath, originPath) {
-  slugCacheSet('slug:alias:' + titlePath, originPath);
-  return kvSet(env, 'slug:alias:' + titlePath, originPath);
+export async function slugAliasPut(env, host, titlePath, originPath) {
+  const site = normalizeSiteKey(host);
+  slugCacheSet('slug:alias:' + site + ':' + titlePath, originPath);
+  return kvSet(env, 'slug:alias:' + site + ':' + titlePath, originPath);
 }
-export async function slugAliasDelete(env, titlePath) {
+export async function slugAliasDelete(env, host, titlePath) {
+  const site = normalizeSiteKey(host);
   // 삭제는 진짜로 "없음" 상태이므로 negative로 캐싱해 즉시 반영한다.
-  slugCacheSet('slug:alias:' + titlePath, SLUG_NEGATIVE);
-  return kvDel(env, 'slug:alias:' + titlePath);
+  slugCacheSet('slug:alias:' + site + ':' + titlePath, SLUG_NEGATIVE);
+  return kvDel(env, 'slug:alias:' + site + ':' + titlePath);
 }
 
-export async function upsertSlug(env, originPath, title, titleSlug) {
+export async function upsertSlug(env, host, originPath, title, titleSlug) {
   if (!title || !titleSlug) return;
   const titlePath = '/' + titleSlug;
-  const existing  = await slugOriginGet(env, originPath);
+  const existing  = await slugOriginGet(env, host, originPath);
   const now       = Date.now();
 
   if (!existing) {
-    await slugOriginPut(env, originPath, { title, titleSlug, titlePath, createdAt: now, checkedAt: now });
-    await slugAliasPut(env, titlePath, originPath);
+    await slugOriginPut(env, host, originPath, { title, titleSlug, titlePath, createdAt: now, checkedAt: now });
+    await slugAliasPut(env, host, titlePath, originPath);
   } else if (existing.titlePath !== titlePath) {
-    await slugAliasDelete(env, existing.titlePath);
-    await slugAliasPut(env, titlePath, originPath);
-    await slugOriginPut(env, originPath, { ...existing, title, titleSlug, titlePath, checkedAt: now });
+    await slugAliasDelete(env, host, existing.titlePath);
+    await slugAliasPut(env, host, titlePath, originPath);
+    await slugOriginPut(env, host, originPath, { ...existing, title, titleSlug, titlePath, checkedAt: now });
   }
 }
 
@@ -474,10 +505,10 @@ export async function upsertSlug(env, originPath, title, titleSlug) {
 // 블로그나 장기간 배포가 없는 경우를 대비한 이중 안전장치로, 시간당 감사
 // (runSlugAudit)가 스캔한 모든 슬러그 매핑을 값 변경 여부와 무관하게
 // 주기적으로 다시 써서 TTL을 계속 최신 상태로 유지한다.
-export async function touchSlug(env, originPath, existing) {
+export async function touchSlug(env, host, originPath, existing) {
   if (!existing?.titlePath) return;
-  await slugOriginPut(env, originPath, { ...existing, checkedAt: Date.now() });
-  await slugAliasPut(env, existing.titlePath, originPath);
+  await slugOriginPut(env, host, originPath, { ...existing, checkedAt: Date.now() });
+  await slugAliasPut(env, host, existing.titlePath, originPath);
 }
 
 export async function purgeAllSlugs(env) {
@@ -526,18 +557,26 @@ export async function listActiveWorkers(env) {
   return results;
 }
 
-// ── 사이트맵 / RSS 저장 ────────────────────────────────────────────────
-export async function saveSitemap(env, xml) {
-  return kvSet(env, 'sitemap:index', xml, 7200); // 2시간 TTL
+// ── 사이트맵 / RSS 저장 (사이트별 격리) ─────────────────────────────────
+// [버그 수정] 이전에는 'sitemap:index' / 'rss:feed' 라는 단일 전역 키에
+// 모든 사이트의 결과를 덮어썼다. 그 결과 어느 사이트가 /sitemap.xml을
+// 요청하든 "가장 최근에 생성된" (사실상 무작위) 사이트의 캐시를 그대로
+// 받아버렸다. host를 키에 포함해 사이트별로 독립적으로 캐싱한다.
+export async function saveSitemap(env, xml, host) {
+  const site = normalizeSiteKey(host);
+  return kvSet(env, 'sitemap:index:' + site, xml, 7200); // 2시간 TTL
 }
-export async function getSitemap(env) {
-  return kvGet(env, 'sitemap:index');
+export async function getSitemap(env, host) {
+  const site = normalizeSiteKey(host);
+  return kvGet(env, 'sitemap:index:' + site);
 }
-export async function saveRss(env, xml) {
-  return kvSet(env, 'rss:feed', xml, 3600); // 1시간 TTL
+export async function saveRss(env, xml, host) {
+  const site = normalizeSiteKey(host);
+  return kvSet(env, 'rss:feed:' + site, xml, 3600); // 1시간 TTL
 }
-export async function getRss(env) {
-  return kvGet(env, 'rss:feed');
+export async function getRss(env, host) {
+  const site = normalizeSiteKey(host);
+  return kvGet(env, 'rss:feed:' + site);
 }
 
 // ── 스키마 마크업 캐시 ─────────────────────────────────────────────────
