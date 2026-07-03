@@ -61,6 +61,7 @@ import {
   handleSslPanelApi,
   cronRefreshCertStatus,
   resolveHostFromRoutes,
+  listRoutes,
 } from './src/ssl.js';
 // ─────────────────────────────────────────────────────────────────────
 // [v9] K8s·컨테이너·Linux 유사 시뮬레이션 모듈(src/k8s.js, src/container.js,
@@ -206,7 +207,7 @@ async function handleFetch(request, env, ctx) {
   let originPathForKV = path;
   const requestedOriginalPath = isPostPath(path); // 이 요청 자체가 원본 경로인지
   try {
-    slugRoute = await resolveSlugRoute(path, env);
+    slugRoute = await resolveSlugRoute(path, env, host);
     if (slugRoute.type === 'redirect') {
       recordMetric(301, Date.now() - t0);
       return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
@@ -265,7 +266,7 @@ async function handleFetch(request, env, ctx) {
     if (originResp.status === 404 && slugRoute.type === 'passthrough' &&
         !requestedOriginalPath && /^\/[^/]+$/.test(decodePathSafe(path)) &&
         !isReservedFlatPath(decodePathSafe(path))) {
-      const retryOrigin = await slugAliasGet(env, decodePathSafe(path)).catch(() => null);
+      const retryOrigin = await slugAliasGet(env, host, decodePathSafe(path)).catch(() => null);
       if (retryOrigin) {
         fetchUrl.pathname = retryOrigin;
         originPathForKV   = retryOrigin;
@@ -327,7 +328,7 @@ async function handleFetch(request, env, ctx) {
     // → titlePath가 ctx에 채워져 canonical, seo-features에 즉시 반영됨
     if (pageCtx && isPostPath(originPathForKV)) {
       const originUrl = new URL(originPathForKV, url).toString();
-      await updateSlugKV(pageCtx, originPathForKV, env, originUrl).catch(() => {});
+      await updateSlugKV(pageCtx, originPathForKV, env, originUrl, host).catch(() => {});
     }
     // [v9] 리디렉션 과다 수정 — 이 지점의 301은 "지금 이 요청이 실제로
     // 원본(Blogspot) 경로로 들어왔을 때"만 발생해야 한다. 이전 버전은
@@ -445,9 +446,13 @@ async function transformHtml(html, ctx, url, env, pRoute) {
   // ── 추가 SEO 기능 20+ (목차/읽기시간 제외) ──────────────────────
   // env 대신 autoEnv를 넘겨 자동감지 host/title이 함수 내부에서 사용되도록
   try {
-    // ①환경변수 ②라우트(자동탐지) ③메모리캐시 순으로 resolvedBase 결정
-    // resolveSiteBase()는 메모리 캐시를 통해 라우트 기반 감지값도 반환함
-    const resolvedBase = resolveSiteBase(env);
+    // [버그 수정] 이전에는 resolveSiteBase(env)가 참조하는 전역 메모리
+    // 캐시(_detectedHost)를 썼는데, 이 Worker는 여러 개인도메인을
+    // 동시에 서빙하므로 그 값이 "다른 사이트"에서 감지된 host일 수
+    // 있었다. 그러면 canonical/og:url 등 SEO 태그가 엉뚱한 도메인으로
+    // 찍히는 문제가 생긴다. 지금 처리 중인 요청의 실제 host(url.origin)를
+    // 최우선으로 사용해 항상 이 요청과 같은 사이트로 고정한다.
+    const resolvedBase = url.origin || resolveSiteBase(env);
     const autoEnv = (!env.SITE_BASE_URL || env.SITE_BASE_URL === '' || env.SITE_BASE_URL === 'https://example.com')
       ? { ...env, SITE_BASE_URL: resolvedBase || undefined }
       : env;
@@ -497,7 +502,7 @@ function decodePathSafe(path) {
   catch (_) { return path; } // 잘못된 인코딩이면 원본 그대로 (안전장치)
 }
 
-async function resolveSlugRoute(rawPath, env) {
+async function resolveSlugRoute(rawPath, env, host) {
   const path = decodePathSafe(rawPath);
 
   // 다중 세그먼트 경로 — 포스트(/YYYY/MM/*)만 허용
@@ -506,7 +511,7 @@ async function resolveSlugRoute(rawPath, env) {
   }
 
   if (isPostPath(path)) {
-    const rec = await slugOriginGet(env, path);
+    const rec = await slugOriginGet(env, host, path);
     // ✅ titlePath가 있고 현재 경로와 다르면 항상 SEO 슬러그로 리디렉션
     if (rec?.titlePath && rec.titlePath !== path) {
       return { type: 'redirect', titlePath: rec.titlePath };
@@ -516,7 +521,7 @@ async function resolveSlugRoute(rawPath, env) {
 
   // 평탄 경로 (/some-slug) — alias 조회
   if (/^\/[^/]+$/.test(path) && !isReservedFlatPath(path)) {
-    const originPath = await slugAliasGet(env, path);
+    const originPath = await slugAliasGet(env, host, path);
     if (originPath && originPath !== path) {
       return { type: 'alias', originPath };
     }
@@ -525,14 +530,14 @@ async function resolveSlugRoute(rawPath, env) {
   return { type: 'passthrough' };
 }
 
-async function updateSlugKV(pageCtx, originPath, env, originUrl) {
+async function updateSlugKV(pageCtx, originPath, env, originUrl, host) {
   if (!['post', 'page'].includes(pageCtx.type) || !pageCtx.title) return;
   if (!isPostPath(originPath)) return;
   const titleSlug = await wasmCore.generateSlug(pageCtx.title);
   if (!titleSlug || titleSlug === 'post' || titleSlug === 'untitled') return;
   // ✅ ctx.titlePath 에도 저장 (SEO canonical, 스키마 마크업에 사용됨)
   pageCtx.titlePath = '/' + titleSlug;
-  await upsertSlug(env, originPath, pageCtx.title, titleSlug);
+  await upsertSlug(env, host, originPath, pageCtx.title, titleSlug);
   // ✅ 원본(Blogspot) 경로로 저장된 옛 캐시가 남아있으면, 슬러그가 확정된
   // 뒤에도 그 캐시가 계속 200으로 서빙되어 리디렉션이 무시되는 문제가
   // 있었다. 슬러그가 (재)확정될 때마다 원본 경로 캐시를 즉시 지운다.
@@ -582,10 +587,10 @@ async function runScheduledHourly(env) {
   await runSlugAudit(env).catch(() => {});
   // 만료된 캐시 항목 정리
   await cacheReservePurge(env).catch(() => {});
-  // 검색엔진 핑 (사이트맵 갱신 알림)
-  const base = resolveSiteBase(env);
-  if (base) {
-    await pingSearchEngines(base + '/sitemap.xml').catch(() => {});
+  // 검색엔진 핑 (사이트맵 갱신 알림) — 등록된 모든 사이트 각각에 대해 핑
+  const pingHosts = await collectSiteHosts(env).catch(() => []);
+  for (const h of pingHosts) {
+    await pingSearchEngines('https://' + h + '/sitemap.xml').catch(() => {});
   }
   // ── SSL/TLS 인증서 상태 캐시 갱신 (API 불필요, TLS 핸드셰이크로 직접 확인) ──
   await cronRefreshCertStatus(env).catch(() => {});
@@ -603,17 +608,50 @@ async function recordCacheReset(env) {
 }
 
 async function runSitemapGeneration(env) {
-  // 비동기 버전으로 KV 자동감지 host 조회 (환경변수 미설정 시 자동 사용)
-  const base = await resolveSiteBaseAsync(env);
-  if (!base) return; // host 미확인 시 생성 스킵 (잘못된 example.com URL 방지)
-  await generateSitemap(env, base);
+  // [버그 수정] 이전에는 자동감지된 "단 하나의" 호스트로만 사이트맵을
+  // 만들어 여러 개인도메인을 서빙하는데도 사실상 한 사이트 것만 계속
+  // 덮어썼다. 이제 등록된 모든 사이트 각각에 대해 독립적으로 생성한다.
+  const hosts = await collectSiteHosts(env);
+  if (!hosts.length) return; // 등록된 사이트가 없으면 스킵 (example.com 방지)
+  for (const h of hosts) {
+    await generateSitemap(env, 'https://' + h).catch(() => {});
+  }
 }
 
 async function runRssGeneration(env) {
-  const base  = await resolveSiteBaseAsync(env);
-  if (!base) return;
-  const title = await resolveSiteTitleAsync(env);
-  await generateRss(env, base, title);
+  const hosts = await collectSiteHosts(env);
+  if (!hosts.length) return;
+  for (const h of hosts) {
+    const title = await resolveSiteTitleAsync(env, h);
+    await generateRss(env, 'https://' + h, title).catch(() => {});
+  }
+}
+
+// 이 Worker가 서빙 중인 "모든" 개인도메인 목록을 반환한다.
+// 우선순위:
+//   1. 환경변수(SITE_BASE_URL/SITE_HOST)로 단일 도메인이 명시 설정된 경우 → 그것만
+//   2. ssl:routes에 자동/수동 등록된 모든 도메인 (여러 사이트를 이 Worker
+//      하나가 서빙하는 실제 구성을 그대로 반영)
+//   3. 위 둘 다 비어있으면 레거시 단일 감지값(state:site_host)으로 폴백
+async function collectSiteHosts(env) {
+  if (env.SITE_BASE_URL && env.SITE_BASE_URL !== 'https://example.com' && env.SITE_BASE_URL !== '') {
+    try { return [new URL(env.SITE_BASE_URL).hostname]; } catch (_) {}
+  }
+  if (env.SITE_HOST && env.SITE_HOST !== '') {
+    return [env.SITE_HOST.replace(/^https?:\/\//, '').replace(/\/$/, '')];
+  }
+
+  try {
+    const routes = await listRoutes(env);
+    const hosts  = (routes || [])
+      .map(r => r.host)
+      .filter(h => h && !isBlogspotDomain(h) && !isInternalHost(h));
+    if (hosts.length) return Array.from(new Set(hosts));
+  } catch (_) {}
+
+  // 라우트 목록이 아직 없으면(첫 배포 직후 등) 레거시 단일 감지값으로 폴백
+  const base = await resolveSiteBaseAsync(env);
+  try { return base ? [new URL(base).hostname] : []; } catch (_) { return []; }
 }
 
 // ─────────────────────────────────────────────
@@ -672,7 +710,7 @@ async function autoDetectAndSaveSiteInfo(request, env, host, url) {
       _detectedHost   = routeHost;
       _detectedHostTs = Date.now();
       // 라우트엔 사이트 제목이 없으므로 별도 추출
-      await saveTitleIfNeeded(env, url).catch(() => {});
+      await saveTitleIfNeeded(env, url, host).catch(() => {});
       return;
     }
   } catch (_) {}
@@ -691,14 +729,17 @@ async function autoDetectAndSaveSiteInfo(request, env, host, url) {
     _detectedHostTs = Date.now();
   };
 
-  await Promise.all([saveHost(), saveTitleIfNeeded(env, url).catch(() => {})]);
+  await Promise.all([saveHost(), saveTitleIfNeeded(env, url, host).catch(() => {})]);
 }
 
 // 사이트 제목 자동 추출 헬퍼 (24h 캐시, 홈 요청 시에만)
-async function saveTitleIfNeeded(env, url) {
+// [버그 수정] 이전에는 'state:site_title' 전역 키 하나에만 저장해 여러
+// 사이트의 제목이 서로 덮어썼다. 이제 host별로도 함께 저장한다.
+async function saveTitleIfNeeded(env, url, host) {
   if (env.SITE_TITLE && env.SITE_TITLE !== '') return;
   const { kvGet, kvSet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null, kvSet: async () => {} }));
-  const existingTitle = await kvGet(env, 'state:site_title');
+  const perSiteKey = host ? 'state:site_title:' + host : null;
+  const existingTitle = perSiteKey ? await kvGet(env, perSiteKey) : await kvGet(env, 'state:site_title');
   if (existingTitle) return;
   if (url.pathname !== '/' && url.pathname !== '') return;
   try {
@@ -712,7 +753,10 @@ async function saveTitleIfNeeded(env, url) {
     if (m && m[1]) {
       const title = m[1].trim()
         .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#?\w+;/g,'');
-      if (title) await kvSet(env, 'state:site_title', title, 86400);
+      if (title) {
+        if (perSiteKey) await kvSet(env, perSiteKey, title, 86400);
+        await kvSet(env, 'state:site_title', title, 86400); // 하위 호환용 전역 키도 갱신
+      }
     }
   } catch (_) {}
 }
@@ -756,10 +800,19 @@ async function resolveSiteBaseAsync(env) {
 }
 
 // 사이트 제목 자동 결정 (환경변수 없으면 KV 자동감지값 사용)
-async function resolveSiteTitleAsync(env) {
+// [버그 수정] state:site_title도 site_host와 마찬가지로 host 구분 없는
+// 단일 전역 키였다. 여러 사이트를 서빙할 때 모든 사이트의 RSS <title>이
+// 마지막으로 감지된 한 사이트의 제목으로 동일하게 나오는 문제가 있었다.
+// host가 주어지면 사이트별 키(state:site_title:{host})를 우선 사용하고,
+// 없으면 과거 버전과의 호환을 위해 전역 키로 폴백한다.
+async function resolveSiteTitleAsync(env, host) {
   if (env.SITE_TITLE && env.SITE_TITLE !== '') return env.SITE_TITLE;
   try {
     const { kvGet } = await import('./src/store.js').catch(() => ({ kvGet: async () => null }));
+    if (host) {
+      const savedPerSite = await kvGet(env, 'state:site_title:' + host);
+      if (savedPerSite) return savedPerSite;
+    }
     const saved = await kvGet(env, 'state:site_title');
     if (saved) return saved;
   } catch (_) {}
@@ -790,18 +843,23 @@ async function runSlugAudit(env) {
     try {
       const data = await kvGetJson(env, key);
       if (!data?.title) continue;
+      // 키 형식: slug:origin:{site}:{originPath} — 사이트별로 격리되어 있으므로
+      // 감사(재확정)도 반드시 같은 사이트 네임스페이스에 다시 써야 한다.
+      const m = key.match(/^slug:origin:([^:]+):(.+)$/);
+      if (!m) continue;
+      const site       = m[1];
+      const originPath = m[2];
       const newSlug = await wasmCore.generateSlug(data.title);
       if (!newSlug || newSlug === 'post') continue;
       const newTitlePath  = '/' + newSlug;
-      const originPath    = key.replace(/^slug:origin:/, '');
       if (newTitlePath !== data.titlePath) {
-        await upsertSlug(env, originPath, data.title, newSlug);
+        await upsertSlug(env, site, originPath, data.title, newSlug);
       } else {
         // ✅ 슬러그 값 자체는 안 바뀌었어도, 이 감사 스캔에서 발견된
         // 매핑은 여전히 유효/사용 중이라는 뜻이므로 TTL을 갱신(touch)한다.
         // 이게 없으면 별칭(alias) URL로만 방문되는 인기 글의 매핑이
         // 30일 상한에 걸려 소멸될 수 있다.
-        await touchSlug(env, originPath, data);
+        await touchSlug(env, site, originPath, data);
       }
     } catch (_) {}
   }
@@ -926,16 +984,27 @@ async function handlePanel(request, url, env, ctx) {
     return new Response(JSON.stringify({ unblocked: ip }), jsonHeaders());
   }
   if (subPath === 'api/generate_sitemap') {
-    // 자동감지 도메인 사용 (환경변수 없어도 KV에서 자동으로 가져옴)
-    const base   = (await resolveSiteBaseAsync(env)) || url.origin;
-    const result = await generateSitemap(env, base);
-    return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
+    // [버그 수정] 등록된 모든 사이트 각각에 대해 독립적으로 재생성한다
+    // (이전에는 자동감지된 도메인 하나만 생성해 다른 사이트는 갱신되지 않았다).
+    const hosts   = await collectSiteHosts(env);
+    const results = [];
+    for (const h of hosts) {
+      const base = 'https://' + h;
+      const r = await generateSitemap(env, base);
+      results.push({ host: h, count: r.count, error: r.error || null });
+    }
+    return new Response(JSON.stringify({ sites: results }), jsonHeaders());
   }
   if (subPath === 'api/generate_rss') {
-    const base   = (await resolveSiteBaseAsync(env)) || url.origin;
-    const title  = await resolveSiteTitleAsync(env);
-    const result = await generateRss(env, base, title);
-    return new Response(JSON.stringify({ count: result.count, base }), jsonHeaders());
+    const hosts   = await collectSiteHosts(env);
+    const results = [];
+    for (const h of hosts) {
+      const base  = 'https://' + h;
+      const title = await resolveSiteTitleAsync(env, h);
+      const r = await generateRss(env, base, title);
+      results.push({ host: h, count: r.count, error: r.error || null });
+    }
+    return new Response(JSON.stringify({ sites: results }), jsonHeaders());
   }
 
   // SSL/TLS 관리 API
