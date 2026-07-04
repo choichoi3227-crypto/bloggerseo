@@ -390,7 +390,7 @@ async function handleFetch(request, env, ctx) {
   // 저장되었다. 페이지 타입별로 계산된 pageTtl(포스트 1h·페이지 4h 등)을
   // 그대로 전달해서, 자주 안 바뀌는 콘텐츠는 더 오래 캐시되어 origin
   // 요청 빈도와 응답 지연이 함께 줄어들도록 한다.
-  if (!isBot && pageCtx) {
+  if (!isBot && pageCtx && !(await shouldHideAds(request, env).catch(() => false))) {
     const respForCache = new Response(result, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
     ctx.waitUntil(
       cacheReservePut(env, request, respForCache, { region: argoCtx.region, ttl: pageTtl }).catch(() => {})

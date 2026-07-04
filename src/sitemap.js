@@ -284,7 +284,7 @@ export async function handleSitemapRequest(env, url, hostOverride) {
         'cache-control' : 'public, max-age=3600, stale-while-revalidate=1800',
         'x-sitemap-src' : 'cache',
         'x-sitemap-base': base,
-        'x-robots-tag'  : 'noindex',  // sitemap.xml 자체는 noindex
+        'x-robots-tag'  : 'index, follow',
       },
     });
   }
@@ -293,7 +293,7 @@ export async function handleSitemapRequest(env, url, hostOverride) {
     headers: {
       'content-type': 'application/xml; charset=utf-8',
       'cache-control': 'public, max-age=3600, stale-while-revalidate=1800',
-      'x-robots-tag': 'noindex',
+      'x-robots-tag': 'index, follow',
     },
   });
 }
@@ -307,6 +307,7 @@ export async function handleRssRequest(env, url, hostOverride) {
       headers: {
         'content-type' : 'application/rss+xml; charset=utf-8',
         'cache-control': 'public, max-age=1800, stale-while-revalidate=900',
+        'x-robots-tag' : 'index, follow',
       },
     });
   }
@@ -318,6 +319,7 @@ export async function handleRssRequest(env, url, hostOverride) {
     headers: {
       'content-type': 'application/rss+xml; charset=utf-8',
       'cache-control': 'public, max-age=1800, stale-while-revalidate=900',
+      'x-robots-tag' : 'index, follow',
     },
   });
 }
