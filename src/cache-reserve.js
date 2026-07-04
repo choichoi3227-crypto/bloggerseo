@@ -28,22 +28,42 @@
  *   캐시라도 일단 그걸 서빙한다. Blogger나 Cloudflare 일부 장애 시에도
  *   사이트가 죽지 않고 "오래된 페이지라도 보여주는" 형태로 생존한다.
  *
- * - 기본 만료: 12시간 (43200초) — 블로그 글은 발행 후 자주 안 바뀌므로
- *   기존 4시간보다 늘려서 원본 도달률을 더 낮춤. SWR 윈도우 안에서는
- *   계속 최신화되므로 실제로는 콘텐츠가 오래 묵지 않는다.
- * - SWR 윈도우: 6시간 (만료 6시간 전부터 백그라운드 재검증 시작)
- * - 키: cache:{fnv1a(normalizedUrl)} — 쿠키/encoding 영향 없음
+ * [버그 수정] 아래 만료/SWR 값은 실제 코드(worker.js의 PAGE_TYPE_TTL,
+ * cache-reserve.js의 RESERVE_TTL_SEC/SWR_WINDOW_SEC)와 오랫동안 어긋나
+ * 있었다 — 주석은 "12시간/6시간"이라 적혀 있었지만 실제로는 페이지
+ * 타입별로 30분~4시간이 적용되고 있었다. 이런 문서-코드 불일치가
+ * "캐시가 왜 이렇게 오래가지/왜 이렇게 짧게 가지"를 파악하기 어렵게
+ * 만들었으므로, 실제 동작을 기준으로 다시 정리했다.
+ *
+ * - 페이지 타입별 만료(worker.js PAGE_TYPE_TTL 기준):
+ *     홈 30분 · 포스트 1시간 · 정적 페이지 4시간 · 라벨 1시간 · 검색 5분
+ * - SWR 윈도우: 30분 (만료 30분 전부터 백그라운드 재검증 시작)
+ * - stale-on-error 유예: 1시간 (만료 후에도 이 기간까지는 origin 장애 시
+ *   stale 응답으로 서빙)
+ * - 키: cache:{fnv1a(normalizedUrl::variant)} — 쿠키/encoding 영향 없음,
+ *   단 모바일/데스크톱/태블릿 및 이미지 포맷(avif/webp/std) variant는 분리
  */
 
 import { kvGet, kvSet, kvGetJson, kvSetJson, kvDel, kvScan } from './store.js';
 
-// TTL 정책 (요청사항: 30분마다 강제 초기화이므로 캐시 자체는 짧게 유지)
-// 포스트: 1h, 페이지: 4h, 홈: 30m — cache-reserve 레벨에서는 보수적으로 1h 사용
-// L2 persist TTL은 최대 1시간 (DO 최대 보유 기간 제한과 일치)
-const RESERVE_TTL_SEC  = 1800;   // 1시간 (요청사항: 최대 1시간)
+// TTL 정책
+// [버그 수정] 이전 주석은 "1시간/2시간"이라 적혀 있었지만 실제 상수 값은
+// 1800초(30분)로, 주석과 실제 동작이 어긋나 있었다. 값 자체를 기준으로
+// 주석을 다시 맞췄다 — 실제 페이지별 TTL(포스트 1h·페이지 4h·홈 30m 등)은
+// worker.js가 cacheReservePut(..., { ttl: pageTtl })로 넘기는 값이 우선
+// 적용되며, 아래 RESERVE_TTL_SEC은 ttl이 명시되지 않았을 때만 쓰이는
+// 기본값이다.
+const RESERVE_TTL_SEC  = 1800;   // 기본값 30분 (worker.js가 ttl을 넘기면 그 값이 우선)
 const SWR_WINDOW_SEC   = 1800;   // 30분 (만료 30분 전부터 백그라운드 재검증)
 const MAX_BODY_BYTES    = 2_000_000; // 2MB까지 캐시 허용 (이미지 임베드 글 대응)
-const STALE_GRACE_SEC   = 1800;  // 2시간 — origin 장애 시 이 기간까지 stale 서빙
+// [버그 수정] origin 장애 대비 stale 유예 기간. 이전에는 30분으로 짧아서,
+// page 타입처럼 TTL이 4시간인 콘텐츠가 만료 직후 장애가 나면 유예 기간
+// (30분)이 TTL 자체보다 훨씬 짧아 stale 서빙 효과가 거의 없었다. 또한
+// cacheReserveDeleteUrl의 무효화 버그(아래 참고)까지 겹쳐 있었을 때는
+// "무효화도 안 되고, 장애 시엔 오히려 금방 버려지는" 이중 문제였다.
+// 지금은 무효화 버그를 고쳤으므로, 유예 기간은 넉넉히 1시간으로 늘려
+// 짧은 origin 장애에도 안정적으로 stale 응답을 제공하게 했다.
+const STALE_GRACE_SEC   = 3600;  // 1시간 — origin 장애 시 이 기간까지 stale 서빙
 
 // ── FNV-1a 32bit (캐시 키 해시) ──────────────────────────────────────
 function fnv1a32(str) {
@@ -281,17 +301,31 @@ export async function cacheReservePurge(env, pattern = 'cache:*') {
   return { purged };
 }
 
-// ── 단건 URL 캐시 즉시 삭제 (전체 스캔 없이 키 1개만 지움) ───────────
+// ── 단건 URL 캐시 즉시 삭제 (전체 스캔 없이 키만 지움) ───────────────
 // 슬러그가 새로 생성/변경될 때, 원본(Blogspot) 경로로 캐시된 옛 응답이
 // 남아있으면 슬러그가 확정된 뒤에도 그 캐시가 계속 200으로 서빙되어
 // 리디렉션이 적용되지 않는 문제가 있었다. 이를 막기 위해 원본 경로
 // 캐시를 즉시(단건) 지운다.
+//
+// [버그 수정] 이전 코드는 정의되어 있지 않은 cacheKey(url) 함수를 호출해서
+// 이 함수가 호출될 때마다 항상 예외를 던지고 있었다(즉시 catch로 삼켜져서
+// 겉으로는 실패가 드러나지 않았다). 그 결과 슬러그가 재확정되어도 원본
+// 경로의 L2(KV/Redis) 캐시가 절대 지워지지 않았고, 이게 "한 번 깨진
+// 렌더링이 캐시 만료 시간(최대 4시간)까지 계속 서빙되는" 체감상 "캐시가
+// 너무 강력하다"는 문제의 핵심 원인 중 하나였다.
+// → 캐시 키는 디바이스/이미지 포맷 variant별로 나뉘어 저장되므로, 이 URL에
+//   해당하는 모든 variant 키를 순회하며 지운다 (l0Delete와 동일한 방식).
 export async function cacheReserveDeleteUrl(env, url) {
   try {
-    await Promise.allSettled([
-      kvDel(env, cacheKey(url)),
-      l0Delete(url),
-    ]);
+    const normalized = normalizeUrl(url);
+    const deletions = [l0Delete(url)];
+    for (const device of ['desktop', 'mobile', 'tablet']) {
+      for (const fmt of ['std', 'webp', 'avif']) {
+        const key = 'cache:' + fnv1a32(`${normalized}::${device}:${fmt}`);
+        deletions.push(kvDel(env, key));
+      }
+    }
+    await Promise.allSettled(deletions);
     return true;
   } catch (_) { return false; }
 }

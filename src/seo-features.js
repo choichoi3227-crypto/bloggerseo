@@ -551,7 +551,15 @@ export function applyAllSeoFeatures(html, ctx, url, env) {
   o = injectOgImageSize(o);
   o = strengthenTwitterCard(o, hasImage);
   o = injectLabelPageSeo(o, url);
-  o = injectLazyLoading(o);
+  // [버그 수정] lazyload는 image-optimizer.js의 optimizeImageMarkup()에서
+  // 파이프라인 앞단(worker.js transformHtml)에 이미 처리된다. 여기서
+  // injectLazyLoading()을 한 번 더 돌리면 두 구현이 "첫 이미지를 어떻게
+  // 판단하는지"를 서로 다르게 적용해 결과가 어긋날 수 있었다 (실제로
+  // optimizeImageMarkup이 먼저 실행되며 첫 이미지까지 lazy 처리해버려
+  // 히어로 이미지가 늦게 뜨는 화면 깨짐 현상의 원인이 되었다). 같은 일을
+  // 두 곳에서 하지 않도록 여기서는 호출을 제거하고 optimizeImageMarkup
+  // 한 곳에서만 담당하게 했다. (injectLazyLoading 함수 자체는 다른 곳에서
+  // 재사용될 수 있어 export는 유지)
   o = injectFontOptimization(o);
   o = optimizeAdsense(o);
   o = injectFeedLinks(o, baseUrl, siteTitle);
