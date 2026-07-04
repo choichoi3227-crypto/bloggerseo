@@ -45,6 +45,9 @@ import {
   extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform,
   retryAsync, retryOriginFetch, circuitStatus,
 } from './src/utils.js';
+import { enforceVpnBlock, hasCloudflareBotMfa, handleAdsClick, injectAdSenseClickGuard, shouldHideAds, hideAds, securitySettings } from './src/security.js';
+import { isOptimizableImagePath, imageCfOptions, optimizeImageMarkup } from './src/image-optimizer.js';
+import { googleIntegrationStatus, runGoogleSync } from './src/google-integrations.js';
 
 // MyDurableObject: Cloudflare Durable Objects 바인딩에서 이 클래스를 찾으려면
 // main 파일(worker.js)에서 named export로 노출되어 있어야 한다.
@@ -133,6 +136,10 @@ async function handleFetch(request, env, ctx) {
   // ── 라우트 자동 감지 + SSL 도메인 등록 (비동기, 블로킹 없음) ──────
   ctx.waitUntil(autoRegisterRoute(env, host).catch(() => {}));
 
+  // ── VPN/Proxy 자동 차단 ──────────────────────────────────────────
+  const vpnBlock = await enforceVpnBlock(request, env);
+  if (vpnBlock) return vpnBlock;
+
   // ── IP 차단 체크 ──────────────────────────────────────────────────
   const clientIp = request.headers.get('cf-connecting-ip') ||
                    request.headers.get('x-forwarded-for') || '';
@@ -152,6 +159,7 @@ async function handleFetch(request, env, ctx) {
   if (path === '/__purge_all')   return purgeAll(env);
   if (path === '/__lb_status')   return lbStatus(env);
   if (path === '/__cache_stats') return cacheStats(env);
+  if (path === '/__ads_click' && request.method === 'POST') return handleAdsClick(request, env);
 
   // ── 사이트맵 / RSS 직접 서빙 (실제 요청 host=개인도메인 사용) ───
   if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return handleSitemapRequest(env, url, host);
@@ -179,7 +187,7 @@ async function handleFetch(request, env, ctx) {
 
   // ── 정적 자산 / Passthrough ──────────────────────────────────────
   if (isPassthrough(path, url)) {
-    const resp = await proxyPass(url, request);
+    const resp = await proxyPass(url, request, isOptimizableImagePath(path) ? imageCfOptions(request, env) : null);
     recordMetric(resp.status, Date.now() - t0);
     return resp;
   }
@@ -348,7 +356,7 @@ async function handleFetch(request, env, ctx) {
       recordMetric(301, Date.now() - t0);
       return Response.redirect(new URL(pageCtx.titlePath, url).toString(), 301);
     }
-    result  = await transformHtml(html, pageCtx, url, env, pRoute);
+    result  = await transformHtml(html, pageCtx, url, env, pRoute, request);
     if (!result || typeof result !== 'string') result = html;
   } catch (_) { result = html; pageCtx = null; }
 
@@ -382,7 +390,7 @@ async function handleFetch(request, env, ctx) {
   // 저장되었다. 페이지 타입별로 계산된 pageTtl(포스트 1h·페이지 4h 등)을
   // 그대로 전달해서, 자주 안 바뀌는 콘텐츠는 더 오래 캐시되어 origin
   // 요청 빈도와 응답 지연이 함께 줄어들도록 한다.
-  if (!isBot && pageCtx) {
+  if (!isBot && pageCtx && !(await shouldHideAds(request, env).catch(() => false))) {
     const respForCache = new Response(result, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
     ctx.waitUntil(
       cacheReservePut(env, request, respForCache, { region: argoCtx.region, ttl: pageTtl }).catch(() => {})
@@ -423,7 +431,7 @@ async function backgroundRevalidate(request, env, url, argoCtx, pRoute) {
     if (!freshResp.ok || !isHtml(freshResp)) return;
     const html    = await freshResp.text();
     const pageCtx = await extractPageContext(html, url);
-    const result  = await transformHtml(html, pageCtx, url, env, pRoute);
+    const result  = await transformHtml(html, pageCtx, url, env, pRoute, request);
     const respForCache = new Response(result, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
     await cacheReservePut(env, request, respForCache, { region: argoCtx.region });
   } catch (_) {}
@@ -432,7 +440,7 @@ async function backgroundRevalidate(request, env, url, argoCtx, pRoute) {
 // ─────────────────────────────────────────────
 // HTML 변환 파이프라인 (SEO 주입 포함)
 // ─────────────────────────────────────────────
-async function transformHtml(html, ctx, url, env, pRoute) {
+async function transformHtml(html, ctx, url, env, pRoute, request = null) {
   let o = html;
   o = safeTransform(o, stripMobileParam);
   o = safeTransform(o, enforceHttps);
@@ -441,6 +449,7 @@ async function transformHtml(html, ctx, url, env, pRoute) {
   o = safeTransform(o, h => injectSeoTags(h, ctx));
   o = safeTransform(o, h => injectSearchEngineTags(h, ctx, env));
   o = safeTransform(o, injectPerformanceOptimizations);
+  o = safeTransform(o, optimizeImageMarkup);
   o = safeTransform(o, h => injectDeviceOptimizations(h, pRoute));
 
   // ── 추가 SEO 기능 20+ (목차/읽기시간 제외) ──────────────────────
@@ -465,6 +474,11 @@ async function transformHtml(html, ctx, url, env, pRoute) {
     o = injectSchemaMarkup(o, schemas);
   } catch (_) {}
 
+  if (request && await shouldHideAds(request, env).catch(() => false)) {
+    o = safeTransform(o, hideAds);
+  } else {
+    o = safeTransform(o, injectAdSenseClickGuard);
+  }
   return o;
 }
 
@@ -594,6 +608,7 @@ async function runScheduledHourly(env) {
   }
   // ── SSL/TLS 인증서 상태 캐시 갱신 (API 불필요, TLS 핸드셰이크로 직접 확인) ──
   await cronRefreshCertStatus(env).catch(() => {});
+  await runGoogleSync(env).catch(() => {});
 }
 
 // 캐시 초기화 타임스탬프 기록 (관리 패널 표시용)
@@ -906,7 +921,7 @@ async function dnsCname(host) {
 // ─────────────────────────────────────────────
 // Origin Fetch (Argo 경로 통합)
 // ─────────────────────────────────────────────
-async function bloggerFetch(url, reqHeaders, argoCtx) {
+async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
   const params = new URLSearchParams(url.search);
   params.delete('m');
   const qs        = params.toString() ? '?' + params.toString() : '';
@@ -928,13 +943,13 @@ async function bloggerFetch(url, reqHeaders, argoCtx) {
     method  : 'GET',
     headers,
     redirect: 'manual',
-    cf      : { ...cfOpts, cacheTtl: 0, cacheEverything: false },
+    cf      : cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false },
   });
 }
 
-async function proxyPass(url, request) {
+async function proxyPass(url, request, cfOverride = null) {
   try {
-    const resp = await retryAsync(() => bloggerFetch(url, request.headers, null), 1);
+    const resp = await retryAsync(() => bloggerFetch(url, request.headers, null, cfOverride), 1);
     return stripInternalHeaders(resp, url, isPassthrough(url.pathname, url));
   } catch (e) {
     return errResp(502, 'Proxy failed: ' + String(e?.message ?? e));
@@ -948,7 +963,7 @@ async function handlePanel(request, url, env, ctx) {
   // 인증 체크
   const auth   = request.headers.get('x-panel-secret') || url.searchParams.get('secret') || '';
   const secret = env.PANEL_SECRET || 'change-me-in-dashboard';
-  if (auth !== secret) {
+  if (auth !== secret || !hasCloudflareBotMfa(request, env)) {
     return new Response(panelLoginHtml(), {
       status : 401,
       headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
@@ -965,6 +980,9 @@ async function handlePanel(request, url, env, ctx) {
   if (subPath === 'api/analytics')       return new Response(JSON.stringify(await getAnalytics(env, 200)), jsonHeaders());
   if (subPath === 'api/blocked_ips')     return new Response(JSON.stringify(await listBlockedIps(env)), jsonHeaders());
   if (subPath === 'api/redis_stats')     return new Response(JSON.stringify(await doRedisClusterStats(env)), jsonHeaders());
+  if (subPath === 'api/google_status')   return new Response(JSON.stringify(googleIntegrationStatus(env)), jsonHeaders());
+  if (subPath === 'api/google_sync' && request.method === 'POST') return new Response(JSON.stringify(await runGoogleSync(env)), jsonHeaders());
+  if (subPath === 'api/security_settings') return new Response(JSON.stringify(await securitySettings(env)), jsonHeaders());
   if (subPath === 'api/redis_flush' && request.method === 'POST') {
     const result = await doRedisFlushAll(env);
     return new Response(JSON.stringify(result), jsonHeaders());

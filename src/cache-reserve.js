@@ -70,8 +70,24 @@ function normalizeUrl(rawUrl) {
   }
 }
 
-function cacheKey(url) {
-  return 'cache:' + fnv1a32(normalizeUrl(url));
+function cacheVariant(request) {
+  const ua = request.headers.get('user-agent') || '';
+  const accept = request.headers.get('accept') || '';
+  const secMobile = request.headers.get('sec-ch-ua-mobile') || '';
+  const isMobile = /\b(Mobile|Android|iPhone|iPod|BlackBerry|IEMobile)\b/i.test(ua) || secMobile === '?1';
+  const isTablet = /\b(iPad|Tablet)\b/i.test(ua);
+  const imageFmt = accept.includes('image/avif') ? 'avif' : accept.includes('image/webp') ? 'webp' : 'std';
+  return `${isTablet ? 'tablet' : isMobile ? 'mobile' : 'desktop'}:${imageFmt}`;
+}
+
+function cacheKeyForRequest(request) {
+  return 'cache:' + fnv1a32(`${normalizeUrl(request.url)}::${cacheVariant(request)}`);
+}
+
+function normalizedVariantUrl(request) {
+  const u = new URL(normalizeUrl(request.url));
+  u.searchParams.set('__bseo_variant', cacheVariant(request));
+  return u.toString();
 }
 
 // ── 캐시 가능 여부 판별 ───────────────────────────────────────────────
@@ -90,23 +106,24 @@ export function isCacheable(request, response) {
 // 엣지 캐시다. DO/KV/Upstash 호출 없이 같은 엣지 노드 메모리에서 응답되어
 // 가장 빠르다. Request 객체를 키로 쓰므로, 정규화된 URL로 가짜 Request를
 // 만들어 캐시 키를 통일한다.
-function l0CacheRequest(url) {
-  // GET 요청 + 정규화된 URL로 캐시 키를 고정 (쿠키/encoding 영향 없음)
-  return new Request(normalizeUrl(url), { method: 'GET' });
+function l0CacheRequest(request) {
+  // GET 요청 + 정규화된 URL + 디바이스/이미지 포맷 variant로 캐시 키를 고정한다.
+  // 쿠키는 제외하되 모바일/데스크톱 HTML이 섞이지 않게 분리한다.
+  return new Request(normalizedVariantUrl(request), { method: 'GET' });
 }
 
-async function l0Get(url) {
+async function l0Get(request) {
   if (typeof caches === 'undefined' || !caches.default) return null;
   try {
-    const hit = await caches.default.match(l0CacheRequest(url));
+    const hit = await caches.default.match(l0CacheRequest(request));
     return hit || null;
   } catch (_) { return null; }
 }
 
-async function l0Put(url, response, ttlSec) {
+async function l0Put(request, response, ttlSec) {
   if (typeof caches === 'undefined' || !caches.default) return;
   try {
-    const cacheReq = l0CacheRequest(url);
+    const cacheReq = l0CacheRequest(request);
     const cacheRes = new Response(response.body, response);
     cacheRes.headers.set('cache-control', `public, max-age=${ttlSec}`);
     await caches.default.put(cacheReq, cacheRes);
@@ -115,7 +132,17 @@ async function l0Put(url, response, ttlSec) {
 
 async function l0Delete(url) {
   if (typeof caches === 'undefined' || !caches.default) return;
-  try { await caches.default.delete(l0CacheRequest(url)); } catch (_) {}
+  try {
+    const base = new Request(normalizeUrl(url), { method: 'GET' });
+    await caches.default.delete(base);
+    for (const device of ['desktop', 'mobile', 'tablet']) {
+      for (const fmt of ['std', 'webp', 'avif']) {
+        const u = new URL(normalizeUrl(url));
+        u.searchParams.set('__bseo_variant', `${device}:${fmt}`);
+        await caches.default.delete(new Request(u.toString(), { method: 'GET' }));
+      }
+    }
+  } catch (_) {}
 }
 
 // ── 캐시에서 읽기 ────────────────────────────────────────────────────
@@ -124,11 +151,12 @@ export async function cacheReserveGet(env, request) {
   const url = request.url;
 
   // L0: Cloudflare Cache API — 히트하면 DO/KV 호출 없이 즉시 반환
-  const l0hit = await l0Get(url);
+  const l0hit = await l0Get(request);
   if (l0hit) {
     const headers = new Headers(l0hit.headers);
     headers.set('x-cache', 'HIT');
     headers.set('x-cache-tier', 'L0');
+    headers.set('x-cache-variant', cacheVariant(request));
     return {
       response: new Response(l0hit.body, { status: l0hit.status, headers }),
       isStale: false, isSwr: false, tier: 'L0',
@@ -136,7 +164,7 @@ export async function cacheReserveGet(env, request) {
   }
 
   // L2: 영속 스토리지
-  const key   = cacheKey(url);
+  const key   = cacheKeyForRequest(request);
   const entry = await kvGetJson(env, key);
   if (!entry) return null;
 
@@ -155,6 +183,7 @@ export async function cacheReserveGet(env, request) {
   const headers = new Headers(entry.headers || {});
   headers.set('x-cache', 'HIT');
   headers.set('x-cache-tier', 'L2');
+  headers.set('x-cache-variant', entry.variant || cacheVariant(request));
   headers.set('x-cache-age', String(age));
   headers.set('x-cache-ttl', String(entry.ttl - age));
   if (isSwr) headers.set('x-cache-swr', '1');
@@ -163,14 +192,14 @@ export async function cacheReserveGet(env, request) {
 
   // L0를 채워둔다 (다음 요청부터는 L2도 건너뛰고 L0에서 즉시 응답)
   // 응답을 막지 않도록 별도로 기다리지 않는다 — 호출부에서 ctx.waitUntil로 감싼다.
-  return { response, isStale: false, isSwr, entry, tier: 'L2', warmL0: () => l0Put(url, response.clone(), entry.ttl - age) };
+  return { response, isStale: false, isSwr, entry, tier: 'L2', warmL0: () => l0Put(request, response.clone(), entry.ttl - age) };
 }
 
 // origin fetch가 실패했을 때(5xx, 네트워크 에러) 호출 — 만료된 캐시라도
 // STALE_GRACE_SEC 이내라면 그걸 서빙해서 사이트 생존을 보장한다.
 export async function cacheReserveGetStaleFallback(env, request) {
   const url = request.url;
-  const key = cacheKey(url);
+  const key = cacheKeyForRequest(request);
   const entry = await kvGetJson(env, key);
   if (!entry) return null;
 
@@ -180,6 +209,7 @@ export async function cacheReserveGetStaleFallback(env, request) {
   const headers = new Headers(entry.headers || {});
   headers.set('x-cache', 'STALE-ON-ERROR');
   headers.set('x-cache-age', String(age));
+  headers.set('x-cache-variant', entry.variant || cacheVariant(request));
   return new Response(entry.body, { status: entry.status || 200, headers });
 }
 
@@ -189,7 +219,7 @@ export async function cacheReservePut(env, request, response, options = {}) {
 
   const ttl   = options.ttl || RESERVE_TTL_SEC;
   const url   = request.url;
-  const key   = cacheKey(url);
+  const key   = cacheKeyForRequest(request);
   const region = options.region || 'GLOBAL';
 
   const body = await response.text().catch(() => null);
@@ -204,14 +234,14 @@ export async function cacheReservePut(env, request, response, options = {}) {
 
   const entry = {
     body, headers, status: response.status,
-    url, ts: Date.now(), ttl, region,
+    url, ts: Date.now(), ttl, region, variant: cacheVariant(request),
   };
 
   // L0(Cache API)에도 동시에 채워서, 같은 엣지 노드로 들어오는 다음 요청은
   // L2(DO/KV) 호출 없이 즉시 응답되게 한다.
   await Promise.allSettled([
     kvSetJson(env, key, entry, ttl + STALE_GRACE_SEC), // 영속 계층: stale grace까지 보존
-    l0Put(url, new Response(body, { status: entry.status, headers: new Headers(headers) }), ttl),
+    l0Put(request, new Response(body, { status: entry.status, headers: new Headers(headers) }), ttl),
   ]);
   return true;
 }
