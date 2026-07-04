@@ -18,8 +18,35 @@ export function hasCloudflareBotMfa(request, env) {
   const verified = request.headers.get('cf-verified-bot') === 'true';
   return verified || score >= (Number(env.PANEL_MIN_BOT_SCORE) || 30);
 }
+
+// [버그 수정] Bingbot이 사이트맵/피드 조회 시 403(VPN/Proxy 오탐으로 인한
+// 자동 IP 차단)을 받는 문제가 보고됨. 원인은 아래 isVpnOrProxy()의
+// 데이터센터 판별 정규식에 microsoft/azure/google cloud/amazon 등이
+// 포함되어 있었던 것 — 그런데 Bingbot, Googlebot 등 주요 검색엔진
+// 크롤러는 실제로 Microsoft Azure/Google Cloud/Amazon 소속 IP 대역에서
+// 크롤링한다. 그 결과 검색엔진 공식 크롤러가 "데이터센터発 트래픽"으로
+// 오판되어 VPN/Proxy로 차단되고, 심지어 blockIp()로 7일간 IP까지
+// 차단되어 이후 재크롤링도 계속 실패하는 문제로 이어졌다.
+//
+// → 알려진 검색엔진 크롤러는 VPN/Proxy 차단 판정에서 제외한다.
+//   1차: Cloudflare가 자체 검증한 request.cf.botManagement.verifiedBot
+//        (Bot Management 활성화 플랜에서 제공, IP 스푸핑에 안전)
+//   2차: verifiedBot 신호가 없는 플랜/요청에서는 User-Agent 패턴으로
+//        보조 판별한다. UA는 스푸핑 가능하지만, 이 경로로 통과해도
+//        하는 일은 "VPN 차단을 안 거는 것"뿐이고 사이트맵/RSS/일반
+//        페이지 열람 이상의 권한을 주지 않으므로 리스크가 낮다.
+const KNOWN_CRAWLER_UA = /googlebot|bingbot|naverbot|yeti|daumoa|slurp|baiduspider|duckduckbot|applebot|facebookexternalhit|twitterbot|linkedinbot|discordbot|telegrambot|indexnow/i;
+
+export function isKnownSearchEngineCrawler(request) {
+  const cf = request.cf || {};
+  if (cf.botManagement && cf.botManagement.verifiedBot === true) return true;
+  const ua = request.headers.get('user-agent') || '';
+  return KNOWN_CRAWLER_UA.test(ua);
+}
+
 export function isVpnOrProxy(request, env) {
   if (String(env.VPN_AUTO_BLOCK_ENABLED || 'true') !== 'true') return false;
+  if (isKnownSearchEngineCrawler(request)) return false; // 검색엔진 크롤러는 VPN 판정 제외
   const cf = request.cf || {};
   const threat = Number(cf.threatScore || 0);
   const asOrg = String(cf.asOrganization || '').toLowerCase();
