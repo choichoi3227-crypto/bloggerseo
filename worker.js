@@ -45,7 +45,7 @@ import {
   extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform,
   retryAsync, retryOriginFetch, circuitStatus,
 } from './src/utils.js';
-import { enforceVpnBlock, hasCloudflareBotMfa, handleAdsClick, injectAdSenseClickGuard, shouldHideAds, hideAds, securitySettings } from './src/security.js';
+import { enforceVpnBlock, hasCloudflareBotMfa, handleAdsClick, injectAdSenseClickGuard, shouldHideAds, hideAds, securitySettings, isKnownSearchEngineCrawler } from './src/security.js';
 import { isOptimizableImagePath, imageCfOptions, optimizeImageMarkup } from './src/image-optimizer.js';
 import { googleIntegrationStatus, runGoogleSync } from './src/google-integrations.js';
 
@@ -141,11 +141,22 @@ async function handleFetch(request, env, ctx) {
   if (vpnBlock) return vpnBlock;
 
   // ── IP 차단 체크 ──────────────────────────────────────────────────
+  // [버그 수정] Bingbot 등 검색엔진 크롤러가 (과거 VPN 오탐 로직으로 인해)
+  // 이미 state:block:* 에 등록되어 있는 경우, 코드를 고쳐도 기존에 저장된
+  // 차단 레코드 때문에 계속 403을 받는 문제가 있었다. 알려진 검색엔진
+  // 크롤러는 이 차단 체크를 우회시키고, 혹시 과거에 잘못 차단되어 있었다면
+  // 그 자리에서 즉시 해제해 재크롤링이 막히지 않게 한다.
   const clientIp = request.headers.get('cf-connecting-ip') ||
                    request.headers.get('x-forwarded-for') || '';
-  if (clientIp && await isIpBlocked(env, clientIp)) {
-    recordMetric(403, Date.now() - t0);
-    return errResp(403, 'Forbidden');
+  if (clientIp) {
+    if (isKnownSearchEngineCrawler(request)) {
+      ctx.waitUntil(isIpBlocked(env, clientIp).then(blocked => {
+        if (blocked) return unblockIp(env, clientIp);
+      }).catch(() => {}));
+    } else if (await isIpBlocked(env, clientIp)) {
+      recordMetric(403, Date.now() - t0);
+      return errResp(403, 'Forbidden');
+    }
   }
 
   // ── 관리 패널 ────────────────────────────────────────────────────
