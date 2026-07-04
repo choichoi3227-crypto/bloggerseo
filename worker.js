@@ -1138,11 +1138,18 @@ async function purgeAll(env) {
 // ─────────────────────────────────────────────
 // HTML 변환 함수들
 // ─────────────────────────────────────────────
+// [버그 수정] 정규식에 \\? , \\d 처럼 백슬래시가 두 개씩 들어가 있었다.
+// 정규식 리터럴(/.../ )안에서 "\\"는 "리터럴 백슬래시 문자 1개"를 뜻하므로
+// 실제로는 "?"(물음표)나 "\d"(숫자)를 매칭하는 게 아니라 "문자열에 포함된
+// 백슬래시(\)"를 찾고 있었다 — 즉 정상적인 HTML에는 거의 나타나지 않는
+// 패턴이라 이 함수가 사실상 항상 아무 것도 치환하지 못하는 죽은 코드였다.
+// 결과적으로 Blogger의 모바일 파라미터(?m=1 등)가 렌더링된 링크에 그대로
+// 남아있었다. 백슬래시를 하나씩만 써서 "?"와 "\d"를 올바르게 매칭한다.
 function stripMobileParam(html) {
   return html
-    .replace(/((?:href|src|action)=["'][^"']*)\\?m=\\d+&/gi, '$1?')
-    .replace(/((?:href|src|action)=["'][^"']*)&m=\\d+/gi, '$1')
-    .replace(/((?:href|src|action)=["'][^"']*)\\?m=\\d+/gi, '$1');
+    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+&/gi, '$1?')
+    .replace(/((?:href|src|action)=["'][^"']*)&m=\d+/gi, '$1')
+    .replace(/((?:href|src|action)=["'][^"']*)\?m=\d+/gi, '$1');
 }
 
 function enforceHttps(html) {
@@ -1296,7 +1303,28 @@ function stripInternalHeaders(resp, requestUrl, isStaticAsset) {
         locUrl.protocol = 'https:';
         locUrl.hostname = requestUrl.hostname;
         locUrl.port     = '';
-        h.set('location', locUrl.toString());
+        const fixedLocation = locUrl.toString();
+
+        // ✅ [ERR_TOO_MANY_REDIRECTS 수정 v11] v10 수정은 스킴/호스트만
+        // 보정했을 뿐, "보정한 뒤에도 목적지가 지금 요청받은 URL과 완전히
+        // 동일한" 경우는 걸러내지 못했다. 커스텀 도메인이 Blogger 쪽에
+        // 아직 완전히 인식되지 않았을 때(CNAME 전파 지연·도메인 미확인 등)
+        // Blogger가 같은 경로로 3xx를 계속 돌려주는 경우가 실제로 있고,
+        // v10 보정 로직은 스킴/호스트를 항상 지금 요청받은 도메인으로
+        // 강제하므로 결과적으로 "자기 자신"과 완전히 같은 URL이 만들어져
+        // 버린다. 그대로 브라우저에 전달하면 브라우저 ↔ Worker가 같은
+        // URL을 영원히 주고받아 정확히 ERR_TOO_MANY_REDIRECTS가 뜬다.
+        // 목적지가 요청 URL과 같으면 리디렉션을 절대 전달하지 않고, 루프
+        // 대신 원인을 알 수 있는 508(Loop Detected)로 즉시 실패한다.
+        if (fixedLocation === requestUrl.toString()) {
+          return errResp(508,
+            'Redirect loop detected: origin redirected back to the exact same URL. ' +
+            'This usually means Blogger has not fully recognized this custom domain yet ' +
+            '(check Blogger → Settings → Publishing → custom domain, and the CNAME record). ' +
+            'Original location header from origin: ' + loc
+          );
+        }
+        h.set('location', fixedLocation);
       } catch (_) {}
     }
 
