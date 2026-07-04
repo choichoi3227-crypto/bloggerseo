@@ -132,6 +132,14 @@ function buildCanonical(url, titlePath = null) {
 }
 
 // ── 5. Resource Hints (Preload/Prefetch) ─────────────────────────────────
+// Blogger 네브바 아이콘, 트래커 픽셀, favicon 등 "콘텐츠가 아닌" 이미지.
+// optimizeImageMarkup()(src/image-optimizer.js)의 SKIP_EAGER_OVERRIDE,
+// 아래 14번 섹션의 SKIP_LAZY_PATTERNS와 같은 기준으로 맞춘다.
+const SKIP_PRELOAD_PATTERNS = [
+  /blogger\.com/i, /gstatic\.com/i, /google\.com/i,
+  /\/img\.gif/i, /spacer/i, /favicon/i,
+];
+
 export function injectResourceHints(html) {
   if (html.includes('rel="preload"')) return html;
 
@@ -151,10 +159,29 @@ export function injectResourceHints(html) {
     hints.push('<link rel="preconnect" href="https://pagead2.googlesyndication.com" crossorigin>');
     hints.push('<link rel="dns-prefetch" href="//googleads.g.doubleclick.net">');
   }
-  // 첫 번째 이미지 LCP 최적화
-  const firstImg = html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
-  if (firstImg && !firstImg[1].startsWith('data:')) {
-    hints.push(`<link rel="preload" as="image" href="${escapeAttr(firstImg[1])}">`);
+  // ✅ [화면 깨짐 수정] 이전에는 문서에서 "가장 먼저 나오는 <img> 태그"를
+  // 무조건 LCP 후보로 보고 preload 했다. 그런데 Blogger 테마는 보통 본문
+  // 이미지보다 앞쪽(헤더/네브바)에 로고나 아이콘, 추적 픽셀 같은 시스템
+  // 이미지를 먼저 두는 경우가 많다. 이 경우 실제 화면을 채우는 히어로
+  // 이미지는 전혀 preload되지 않고, 오히려 필요 없는 이미지가 높은
+  // 우선순위로 대역폭을 먼저 가져가 버려서 정작 중요한 이미지의 로딩이
+  // 늦어지고 화면이 빈 채로 오래 남는 문제를 악화시켰다. optimizeImageMarkup
+  // 이 실제 "첫 콘텐츠 이미지"를 고르는 것과 동일한 기준(시스템 이미지
+  // 스킵)으로 preload 대상을 찾는다.
+  const imgTagRe = /<img\b[^>]*>/gi;
+  let imgMatch;
+  let firstContentImgSrc = null;
+  while ((imgMatch = imgTagRe.exec(html))) {
+    const srcMatch = imgMatch[0].match(/\bsrc\s*=\s*["']([^"']+)["']/i);
+    if (!srcMatch) continue;
+    const src = srcMatch[1];
+    if (src.startsWith('data:')) continue;
+    if (SKIP_PRELOAD_PATTERNS.some(p => p.test(src))) continue;
+    firstContentImgSrc = src;
+    break;
+  }
+  if (firstContentImgSrc) {
+    hints.push(`<link rel="preload" as="image" href="${escapeAttr(firstContentImgSrc)}">`);
   }
 
   if (!hints.length) return html;

@@ -27,13 +27,22 @@ export function optimizeImageMarkup(html) {
     const isFirstContentImage = !firstContentImageDone && !isSystemImage;
     if (isFirstContentImage) firstContentImageDone = true;
 
-    if (!/loading=/i.test(a)) {
-      a += isFirstContentImage ? ' loading="eager"' : ' loading="lazy"';
+    if (isFirstContentImage) {
+      // ✅ [화면 깨짐 재수정] 위 주석의 v1 수정은 "loading=/fetchpriority=가
+      // 이미 있으면 건드리지 않는다"는 전제를 깔고 있었는데, 최근 Blogger
+      // 기본 테마는 <img>에 loading="lazy"를 이미 박아서 내려준다. 그러면
+      // 이 히어로 이미지가 여전히 lazy로 남아 처음 화면 진입 시 빈 박스로
+      // 있다가 늦게 채워지는 문제가 그대로 재발했다. 첫 콘텐츠 이미지는
+      // 원본에 어떤 값이 있었든 항상 eager/high로 강제 덮어쓴다.
+      a = a
+        .replace(/\s+loading\s*=\s*["'][^"']*["']/i, '')
+        .replace(/\s+fetchpriority\s*=\s*["'][^"']*["']/i, '');
+      a += ' loading="eager" fetchpriority="high"';
+    } else {
+      if (!/loading=/i.test(a)) a += ' loading="lazy"';
+      if (!/fetchpriority=/i.test(a)) a += ' fetchpriority="low"';
     }
     if (!/decoding=/i.test(a)) a += ' decoding="async"';
-    if (!/fetchpriority=/i.test(a)) {
-      a += isFirstContentImage ? ' fetchpriority="high"' : ' fetchpriority="low"';
-    }
     return `<img${a}>`;
   });
 }
