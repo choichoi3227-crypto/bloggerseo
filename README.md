@@ -261,3 +261,13 @@ wrangler deploy
 > 참고: Cloudflare 자체 KV/D1도 무료 티어를 제공하지만 Redis 호환 명령어(LPUSH, SCAN
 > 등)를 지원하지 않으므로 이 비교에서는 제외했습니다. 이 레포는 정확히 그 빈틈을
 > DO 기반 자체 Redis 구현으로 메우는 방식입니다.
+
+## v10 자동 연동·성능·보안 기능
+
+- **구글 자원 연동**: Search Console, AdSense, Trends 상태/동기화 엔드포인트를 서비스 계정 모드로 준비했습니다. 클라이언트 ID/클라이언트 시크릿을 패널에서 입력하지 않고 `GOOGLE_SERVICE_ACCOUNT_JSON` secret만 사용합니다.
+- **이미지 자동 최적화**: 이미지 요청은 Cloudflare Image Resizing(`format=avif/webp`, `quality`, metadata 제거)과 30일 CDN 캐시를 적용합니다. HTML `<img>`에는 lazy/async/fetchpriority 힌트를 자동 주입합니다. `npm run optimize:images`가 ImageMagick으로 원본을 선최적화하고 WebP를 생성하며, Worker는 런타임 엣지 변환 폴백을 담당합니다.
+- **CDN/Cache Rate 개선**: 정적 이미지/자산은 `cacheEverything` 및 긴 TTL을 사용하고, HTML은 기존 L0 Cache API + L2 저장소 캐시를 유지합니다.
+- **애드센스 부정 클릭 보호**: AdSense 광고를 자동 감지해 클릭 비콘을 삽입하고, 동일 IP+기기에서 설정 시간 내 최대 클릭 수를 넘으면 설정 일수 동안 광고 영역을 숨깁니다.
+- **VPN/프록시 자동 차단**: Cloudflare request metadata(`threatScore`, `asOrganization`)로 VPN/프록시/데이터센터 의심 트래픽을 자동 차단합니다.
+- **응답 속도 개선**: 이미지 CDN 캐시, 정적 자산 edge cache, lazy image hints, 기존 stale cache fallback을 함께 사용합니다.
+- **관리 패널 다중 보안 인증**: 1차 `PANEL_SECRET`, 2차 Cloudflare Bot Fight/Bot Score 기준(`PANEL_CF_BOT_MFA`, `PANEL_MIN_BOT_SCORE`)을 적용합니다.

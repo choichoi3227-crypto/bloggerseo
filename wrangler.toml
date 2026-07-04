@@ -66,6 +66,18 @@ GOOGLE_SITE_VERIFY     = ""           # 구글 서치콘솔 인증키
 AI_FAQ_ENABLED         = "true"       # Workers AI로 FAQ 자동 추출 (env.AI 바인딩 필요)
 INDEXNOW_KEY           = ""           # IndexNow API 키 (Bing/Yandex 빠른 색인 — wrangler secret 추천)
 
+# ─── 신규 보안/성능 자동화 ─────────────────────────────────────────────
+IMAGE_QUALITY          = "82"          # Cloudflare Image Resizing 품질(ImageMagick 배포 전 엣지 변환 폴백)
+IMAGE_CACHE_TTL_SEC    = "2592000"     # 이미지 CDN 캐시 30일
+ADS_CLICK_WINDOW_HOURS = "1"           # 애드센스 부정 클릭 판단 윈도우(시간)
+ADS_MAX_CLICKS         = "3"           # 윈도우 내 허용 클릭 수
+ADS_BLOCK_DAYS         = "7"           # 초과 시 광고 숨김 기간(일)
+VPN_AUTO_BLOCK_ENABLED = "true"        # VPN/프록시 자동 감지 + IP 차단
+VPN_THREAT_SCORE       = "25"          # Cloudflare threatScore 기준
+VPN_BLOCK_DAYS         = "7"
+PANEL_CF_BOT_MFA       = "true"        # 패널 2차 인증: Cloudflare Bot Fight/봇 점수
+PANEL_MIN_BOT_SCORE    = "30"
+
 # Cloudflare API (관리 패널의 "워커/라우트 연동" 기능용 — 토큰은 secret으로 등록)
 CF_ZONE_ID             = ""           # Zone ID (비밀 아님, 여기 직접 입력 가능)
 CF_ACCOUNT_ID          = ""           # Account ID (비밀 아님, 여기 직접 입력 가능)
