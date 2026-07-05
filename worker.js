@@ -175,6 +175,36 @@ async function handleFetch(request, env, ctx) {
   if (/^\/sitemap(-[^/]+)?\.xml$/i.test(path)) return handleSitemapRequest(env, url, host);
   if (path === '/rss.xml' || path === '/atom.xml') return handleRssRequest(env, url, host);
 
+  // ── IndexNow 키 인증 파일 자동 서빙 ──────────────────────────────
+  // IndexNow API는 https://{host}/{key}.txt 에 키 값 그대로가 텍스트로
+  // 응답되어야만 소유권 인증이 성립한다(공식 스펙 요구사항). 이 Worker는
+  // Blogger를 프록시할 뿐 그 경로에 실제 파일을 올릴 방법이 없으므로,
+  // 지금까지는 Cloudflare Worker 설정에 INDEXNOW_KEY를 넣어도 인증 파일이
+  // 없어 IndexNow 핑이 사실상 항상 실패했다. env.INDEXNOW_KEY가 설정되어
+  // 있으면 해당 경로 요청을 Worker가 직접 그 키 값으로 응답해 자동으로
+  // 파일 형식 요구사항을 충족시킨다(사용자가 INDEXNOW_KEY만 넣으면 끝).
+  if (env.INDEXNOW_KEY && path === `/${env.INDEXNOW_KEY}.txt`) {
+    return new Response(env.INDEXNOW_KEY, {
+      status : 200,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=86400' },
+    });
+  }
+
+  // ── robots.txt 자동 생성 ─────────────────────────────────────────
+  // Blogger 기본 robots.txt는 커스텀 도메인이 아니라 Blogger 자체가 생성한
+  // sitemap 경로(대개 blogspot.com 기준)를 가리켜, 이 Worker가 만드는
+  // 실제 사이트맵(/sitemap.xml, SEO 슬러그 기반)과 어긋난다. Lighthouse/
+  // PageSpeed Insights의 SEO 감사 항목 중 "robots.txt가 유효한가"에
+  // 걸리고, 검색엔진에도 잘못된 사이트맵을 알리게 되므로 이 도메인
+  // 기준으로 올바른 사이트맵을 가리키는 robots.txt를 직접 생성해 서빙한다.
+  if (path === '/robots.txt') {
+    const body = `User-agent: *\nAllow: /\n\nSitemap: ${url.origin}/sitemap.xml\n`;
+    return new Response(body, {
+      status : 200,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=3600' },
+    });
+  }
+
   // ── Priority Routing (티어 결정) ─────────────────────────────────
   const pRoute  = priorityRoute(request);
   const isBot   = pRoute.tier === 1;
