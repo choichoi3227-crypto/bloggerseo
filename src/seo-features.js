@@ -8,7 +8,6 @@
  *  3.  Robots meta 최적화            — 크롤러별 색인/팔로우 제어
  *  4.  Canonical URL 강화            — www/non-www, http/https 중복 제거
  *  5.  Preload/Prefetch 힌트         — Core Web Vitals (LCP) 개선
- *  6.  이미지 alt 자동 보완          — 이미지 검색 최적화 + 접근성
  *  7.  내부 링크 rel 자동 추가       — follow/nofollow 적절한 제어
  *  8.  구조화 데이터 Sitelinks       — SearchAction (사이트 내 검색)
  *  9.  Open Graph image 크기 태그    — SNS 공유 최적화
@@ -16,7 +15,6 @@
  * 11.  구글 Indexing API 핑          — 빠른 색인 요청 (POST 발행 후)
  * 12.  Naver/Daum 핑                — 국내 검색엔진 빠른 수집 요청
  * 13.  Blogger Label 페이지 SEO      — 카테고리 페이지 최적화
- * 14.  Lazy loading 이미지           — loading="lazy" 자동 추가 (CWV)
  * 15.  웹폰트 preconnect             — 폰트 로딩 성능 최적화
  * 16.  광고 렌더링 차단 방지          — AdSense async defer 주입
  * 17.  Core Web Vitals 힌트 헤더     — Server Timing 헤더 추가
@@ -132,14 +130,6 @@ function buildCanonical(url, titlePath = null) {
 }
 
 // ── 5. Resource Hints (Preload/Prefetch) ─────────────────────────────────
-// Blogger 네브바 아이콘, 트래커 픽셀, favicon 등 "콘텐츠가 아닌" 이미지.
-// optimizeImageMarkup()(src/image-optimizer.js)의 SKIP_EAGER_OVERRIDE,
-// 아래 14번 섹션의 SKIP_LAZY_PATTERNS와 같은 기준으로 맞춘다.
-const SKIP_PRELOAD_PATTERNS = [
-  /blogger\.com/i, /gstatic\.com/i, /google\.com/i,
-  /\/img\.gif/i, /spacer/i, /favicon/i,
-];
-
 export function injectResourceHints(html) {
   if (html.includes('rel="preload"')) return html;
 
@@ -159,63 +149,9 @@ export function injectResourceHints(html) {
     hints.push('<link rel="preconnect" href="https://pagead2.googlesyndication.com" crossorigin>');
     hints.push('<link rel="dns-prefetch" href="//googleads.g.doubleclick.net">');
   }
-  // ✅ [화면 깨짐 수정] 이전에는 문서에서 "가장 먼저 나오는 <img> 태그"를
-  // 무조건 LCP 후보로 보고 preload 했다. 그런데 Blogger 테마는 보통 본문
-  // 이미지보다 앞쪽(헤더/네브바)에 로고나 아이콘, 추적 픽셀 같은 시스템
-  // 이미지를 먼저 두는 경우가 많다. 이 경우 실제 화면을 채우는 히어로
-  // 이미지는 전혀 preload되지 않고, 오히려 필요 없는 이미지가 높은
-  // 우선순위로 대역폭을 먼저 가져가 버려서 정작 중요한 이미지의 로딩이
-  // 늦어지고 화면이 빈 채로 오래 남는 문제를 악화시켰다. optimizeImageMarkup
-  // 이 실제 "첫 콘텐츠 이미지"를 고르는 것과 동일한 기준(시스템 이미지
-  // 스킵)으로 preload 대상을 찾는다.
-  const imgTagRe = /<img\b[^>]*>/gi;
-  let imgMatch;
-  let firstContentImgSrc = null;
-  while ((imgMatch = imgTagRe.exec(html))) {
-    const srcMatch = imgMatch[0].match(/\bsrc\s*=\s*["']([^"']+)["']/i);
-    if (!srcMatch) continue;
-    const src = srcMatch[1];
-    if (src.startsWith('data:')) continue;
-    if (SKIP_PRELOAD_PATTERNS.some(p => p.test(src))) continue;
-    firstContentImgSrc = src;
-    break;
-  }
-  if (firstContentImgSrc) {
-    hints.push(`<link rel="preload" as="image" href="${escapeAttr(firstContentImgSrc)}">`);
-  }
 
   if (!hints.length) return html;
   return html.replace(/(<head[^>]*>)/i, `$1\n${hints.join('\n')}`);
-}
-
-// ── 6. 이미지 alt 자동 보완 ──────────────────────────────────────────────
-const SKIP_ALT_PATTERNS = [
-  /\/img\.gif/i,         // Blogger 1px 투명 GIF
-  /blogger\.com\/tracker/i, // Blogger 추적 픽셀
-  /\/s1\//, /\/s\d+\/spacer/i,  // spacer 이미지
-  /feeds\.feedburner/i,
-];
-export function injectImageAlts(html, pageTitle = '') {
-  return html.replace(/<img([^>]*?)>/gi, (match, attrs) => {
-    if (/\balt\s*=\s*["'][^"']*["']/i.test(attrs)) return match;
-    const srcMatch = attrs.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
-    if (!srcMatch) return match;
-    const src = srcMatch[1];
-    // 시스템/추적 이미지는 건드리지 않음
-    if (SKIP_ALT_PATTERNS.some(p => p.test(src))) return match;
-    const alt = buildAltFromSrc(src, pageTitle);
-    return `<img${attrs} alt="${escapeAttr(alt)}">`;
-  });
-}
-
-function buildAltFromSrc(src, pageTitle) {
-  try {
-    const u    = new URL(src);
-    const name = u.pathname.split('/').pop().replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
-    return name || pageTitle || 'image';
-  } catch (_) {
-    return pageTitle || 'image';
-  }
 }
 
 // ── 7. 내부 링크 rel 자동 제어 ───────────────────────────────────────────
@@ -353,28 +289,6 @@ export function injectLabelPageSeo(html, url) {
   }
 
   return tags.length ? html.replace(/(<\/head>)/i, `${tags.join('\n')}\n$1`) : html;
-}
-
-// ── 14. 이미지 Lazy Loading ──────────────────────────────────────────────
-const SKIP_LAZY_PATTERNS = [
-  /blogger\.com/i, /gstatic\.com/i, /google\.com/i,
-  /\/img\.gif/i, /spacer/i, /favicon/i,
-];
-export function injectLazyLoading(html) {
-  let firstContentDone = false;
-  return html.replace(/<img([^>]*?)>/gi, (match, attrs) => {
-    if (attrs.includes('loading=')) return match;
-    const srcMatch = attrs.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
-    if (!srcMatch) return match;
-    const src = srcMatch[1];
-    // Blogger 시스템 이미지는 건드리지 않음
-    if (SKIP_LAZY_PATTERNS.some(p => p.test(src))) return match;
-    if (!firstContentDone) {
-      firstContentDone = true;
-      return `<img${attrs} loading="eager">`;
-    }
-    return `<img${attrs} loading="lazy">`;
-  });
 }
 
 // ── 15. 웹폰트 Preconnect 최적화 ────────────────────────────────────────
@@ -569,7 +483,6 @@ export function applyAllSeoFeatures(html, ctx, url, env) {
   o = injectRobotsMeta(o, pageType);
   o = strengthenCanonical(o, url, titlePath);
   o = injectResourceHints(o);
-  o = injectImageAlts(o, ctx.title);
   o = normalizeLinks(o, host);
   // SearchAction은 홈/포스트에만
   if (pageType === 'home' || pageType === 'post') {
@@ -578,15 +491,6 @@ export function applyAllSeoFeatures(html, ctx, url, env) {
   o = injectOgImageSize(o);
   o = strengthenTwitterCard(o, hasImage);
   o = injectLabelPageSeo(o, url);
-  // [버그 수정] lazyload는 image-optimizer.js의 optimizeImageMarkup()에서
-  // 파이프라인 앞단(worker.js transformHtml)에 이미 처리된다. 여기서
-  // injectLazyLoading()을 한 번 더 돌리면 두 구현이 "첫 이미지를 어떻게
-  // 판단하는지"를 서로 다르게 적용해 결과가 어긋날 수 있었다 (실제로
-  // optimizeImageMarkup이 먼저 실행되며 첫 이미지까지 lazy 처리해버려
-  // 히어로 이미지가 늦게 뜨는 화면 깨짐 현상의 원인이 되었다). 같은 일을
-  // 두 곳에서 하지 않도록 여기서는 호출을 제거하고 optimizeImageMarkup
-  // 한 곳에서만 담당하게 했다. (injectLazyLoading 함수 자체는 다른 곳에서
-  // 재사용될 수 있어 export는 유지)
   o = injectFontOptimization(o);
   o = optimizeAdsense(o);
   o = injectFeedLinks(o, baseUrl, siteTitle);

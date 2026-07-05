@@ -1,51 +1,21 @@
 /**
- * BloggerSEO v8 — 추가 기능 모듈 (15가지 신기능)
+ * BloggerSEO v8 — 추가 기능 모듈
  * ─────────────────────────────────────────────────────────────────────
- * 1.  Open Graph 이미지 동적 생성 메타태그 (og:image 자동 보강)
  * 2.  자동 내부 링크 (관련 포스트 추천 인라인 삽입)
  * 3.  읽기 시간(Reading Time) 자동 계산 + 삽입
  * 4.  목차(TOC) 자동 생성 및 삽입
- * 5.  Lazy Load 이미지 자동 처리 (loading="lazy" + decoding="async")
- * 6.  WebP/AVIF 지원 picture 래퍼 자동 변환
  * 7.  코드 블록 신택스 하이라이트 클래스 자동 주입
  * 8.  소셜 공유 버튼 자동 삽입 (카카오 / 트위터 / 라인 / 페이스북)
  * 9.  이전/다음 글 네비게이션 힌트 메타 (rel=prev/next 자동 보강)
  * 10. Hreflang 자동 주입 (한국어 기본, ko)
  * 11. 구조화된 스니펫: 테이블 감지 → SpeakableSpecification 마크업
- * 12. 이미지 alt 자동 채우기 (빈 alt → 글 제목 기반)
  * 13. 외부 링크 rel="noopener noreferrer" + target="_blank" 자동 적용
  * 14. 네이버 검색 최적화 메타태그 (naverbot 크롤링 가이드 준수)
  * 15. 보안 헤더 강화 (CSP nonce 주입 + Permissions-Policy)
  * 16. 자동 줄바꿈 방지 (숫자+단위, 날짜 등 nbsp 처리)
- * 17. Hcard/vCard 마이크로포맷 → 저자 정보 자동 보강
  */
 
 import { kvGet, kvSet } from './store.js';
-
-// ── 1. OG 이미지 메타태그 보강 ──────────────────────────────────────
-// og:image가 없거나 상대경로인 경우 자동으로 절대 URL로 보완한다.
-export function boostOgImage(html, ctx, url) {
-  if (!ctx.imageUrl) return html;
-  // 이미 og:image가 절대 URL인 경우 스킵
-  const existingOg = html.match(/property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
-  if (existingOg && existingOg[1].startsWith('http')) return html;
-
-  let imgUrl = ctx.imageUrl;
-  if (imgUrl.startsWith('//')) imgUrl = url.protocol + imgUrl;
-  else if (imgUrl.startsWith('/')) imgUrl = url.origin + imgUrl;
-
-  // 이미지 크기 최적화 파라미터 (Blogger 이미지 CDN 지원)
-  imgUrl = imgUrl.replace(/\/s\d+\//, '/s1200/');
-
-  const tags = [
-    `<meta property="og:image" content="${escapeAttr(imgUrl)}">`,
-    `<meta property="og:image:width" content="1200">`,
-    `<meta property="og:image:height" content="630">`,
-    `<meta name="twitter:image" content="${escapeAttr(imgUrl)}">`,
-  ];
-
-  return html.replace(/(<\/head>)/i, tags.join('\n') + '\n$1');
-}
 
 // ── 2. 읽기 시간 자동 계산 ──────────────────────────────────────────
 // 본문 텍스트를 분석하여 예상 읽기 시간을 계산하고 페이지에 삽입한다.
@@ -104,31 +74,6 @@ export function injectTableOfContents(html, ctx) {
 
   // 첫 번째 h2 앞에 삽입
   return htmlWithIds.replace(/<h2[^>]*>/i, toc + '\n$&');
-}
-
-// ── 4. 이미지 Lazy Load 자동 처리 ──────────────────────────────────
-// 모든 <img> 태그에 loading="lazy" + decoding="async" 자동 추가.
-// 단, 첫 번째 이미지(LCP 후보)는 eager로 남겨둔다.
-export function injectLazyLoad(html) {
-  if (html.includes('loading="lazy"')) return html; // 이미 처리됐으면 스킵
-  let isFirst = true;
-  return html.replace(/<img([^>]*?)>/gi, (match, attrs) => {
-    if (isFirst) { isFirst = false; return match; } // 첫 이미지는 eager
-    if (/loading=/i.test(attrs)) return match;      // 이미 있으면 스킵
-    return `<img${attrs} loading="lazy" decoding="async">`;
-  });
-}
-
-// ── 5. 이미지 alt 자동 채우기 ──────────────────────────────────────
-// alt="" 이거나 alt가 없는 이미지에 글 제목 기반으로 alt를 채운다.
-export function fillImageAlt(html, ctx) {
-  if (!ctx.title) return html;
-  const baseAlt = escapeAttr(ctx.title.slice(0, 80));
-  return html.replace(/<img([^>]*?)>/gi, (match, attrs) => {
-    if (/alt=["'][^"']+["']/i.test(attrs)) return match; // 이미 있으면 스킵
-    const newAttrs = attrs.replace(/alt=["']['"]/, '') + ` alt="${baseAlt}"`;
-    return `<img${newAttrs}>`;
-  });
 }
 
 // ── 6. 외부 링크 자동 처리 ──────────────────────────────────────────
@@ -317,12 +262,6 @@ export function injectPreloadHints(html, ctx) {
   if (/fonts\.googleapis\.com/.test(html) && !html.includes('preconnect" href="https://fonts.googleapis.com"')) {
     tags.push('<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>');
     tags.push('<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>');
-  }
-
-  // 첫 번째 이미지(LCP) preload
-  if (ctx.imageUrl && ctx.imageUrl.startsWith('http')) {
-    const safeUrl = escapeAttr(ctx.imageUrl.replace(/\/s\d+\//, '/s800/'));
-    tags.push(`<link rel="preload" as="image" href="${safeUrl}" fetchpriority="high">`);
   }
 
   return tags.length ? html.replace(/(<\/head>)/i, tags.join('\n') + '\n$1') : html;
