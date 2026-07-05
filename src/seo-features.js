@@ -131,21 +131,28 @@ function buildCanonical(url, titlePath = null) {
 
 // ── 5. Resource Hints (Preload/Prefetch) ─────────────────────────────────
 export function injectResourceHints(html) {
-  if (html.includes('rel="preload"')) return html;
-
+  // [버그 수정] 기존에는 `rel="preload"` 존재 여부로 중복 삽입을 막으려
+  // 했는데, 이 함수는 애초에 preload 태그를 만든 적이 없어서 그 체크가
+  // 항상 통과되어 매 요청마다 새로 preconnect/dns-prefetch를 추가했다.
+  // 그 결과 worker.js의 injectPerformanceOptimizations가 이미 넣어둔
+  // 태그 위에 계속 쌓여 PageSpeed의 "5개가 넘는 preconnect" 경고로
+  // 이어졌다. 이제는 각 힌트를 넣기 전에 해당 origin이 이미 있는지
+  // 개별적으로 확인해 중복만 정확히 걸러낸다.
   const hints = [];
 
   // Blogger 핵심 JS preload
-  if (html.includes('www.blogger.com')) {
+  if (html.includes('www.blogger.com') && !html.includes('preconnect" href="https://www.blogger.com"')) {
     hints.push('<link rel="preconnect" href="https://www.blogger.com">');
   }
   // Google Analytics
-  if (html.includes('google-analytics.com') || html.includes('gtag')) {
+  if ((html.includes('google-analytics.com') || html.includes('gtag')) &&
+      !html.includes('dns-prefetch" href="//www.google-analytics.com"')) {
     hints.push('<link rel="dns-prefetch" href="//www.google-analytics.com">');
     hints.push('<link rel="dns-prefetch" href="//www.googletagmanager.com">');
   }
   // AdSense
-  if (html.includes('googlesyndication.com') || html.includes('adsense')) {
+  if ((html.includes('googlesyndication.com') || html.includes('adsense')) &&
+      !html.includes('preconnect" href="https://pagead2.googlesyndication.com"')) {
     hints.push('<link rel="preconnect" href="https://pagead2.googlesyndication.com" crossorigin>');
     hints.push('<link rel="dns-prefetch" href="//googleads.g.doubleclick.net">');
   }
