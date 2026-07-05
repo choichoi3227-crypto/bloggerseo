@@ -46,7 +46,6 @@ import {
   retryAsync, retryOriginFetch, circuitStatus,
 } from './src/utils.js';
 import { enforceVpnBlock, hasCloudflareBotMfa, handleAdsClick, injectAdSenseClickGuard, shouldHideAds, hideAds, securitySettings, isKnownSearchEngineCrawler } from './src/security.js';
-import { isOptimizableImagePath, imageCfOptions, optimizeImageMarkup } from './src/image-optimizer.js';
 import { googleIntegrationStatus, runGoogleSync } from './src/google-integrations.js';
 
 // MyDurableObject: Cloudflare Durable Objects 바인딩에서 이 클래스를 찾으려면
@@ -198,7 +197,7 @@ async function handleFetch(request, env, ctx) {
 
   // ── 정적 자산 / Passthrough ──────────────────────────────────────
   if (isPassthrough(path, url)) {
-    const resp = await proxyPass(url, request, isOptimizableImagePath(path) ? imageCfOptions(request, env) : null);
+    const resp = await proxyPass(url, request);
     recordMetric(resp.status, Date.now() - t0);
     return resp;
   }
@@ -460,7 +459,6 @@ async function transformHtml(html, ctx, url, env, pRoute, request = null) {
   o = safeTransform(o, h => injectSeoTags(h, ctx));
   o = safeTransform(o, h => injectSearchEngineTags(h, ctx, env));
   o = safeTransform(o, injectPerformanceOptimizations);
-  o = safeTransform(o, optimizeImageMarkup);
   o = safeTransform(o, h => injectDeviceOptimizations(h, pRoute));
 
   // ── 추가 SEO 기능 20+ (목차/읽기시간 제외) ──────────────────────
