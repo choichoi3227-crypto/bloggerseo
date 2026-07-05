@@ -165,6 +165,7 @@ export function priorityRoute(request) {
 let  _workerId      = null;
 let  _inFlight      = 0;
 let  _clusterTotal  = 0;   // KV에서 동기화된 클러스터 전체 inFlight
+let  _clusterWorkers = 0;  // KV에서 동기화된 클러스터 활성 워커 수
 let  _lastHbAt      = 0;
 const MAX_INFLIGHT   = 48;
 const LOAD_THRESH    = 0.85;  // 85%에서 새 요청 거부
@@ -179,11 +180,23 @@ function ensureWorkerId() {
   return _workerId;
 }
 
+// [버그 수정] 기존 공식 `_clusterTotal / (_clusterTotal + 1) > 0.85`는
+// 클러스터 전체 inFlight 합(_clusterTotal) 자체를 분모에 넣는 잘못된
+// 비율 계산이었다. 이 식은 _clusterTotal이 약 6만 넘어도 0.85를 초과해,
+// 정상적인 트래픽(Cloudflare Workers는 트래픽에 따라 워커 인스턴스를
+// 자동으로 늘려 총 inFlight 합도 함께 커지는 게 정상)에서도 사실상 거의
+// 모든 신규 요청을 503으로 거부해버렸다. 이것이 사이트 속도 편차(같은
+// 페이지가 어떨 때는 정상, 어떨 때는 503으로 실패)와 SEO 점수 급락
+// (구글봇이 503을 받으면 해당 페이지가 오류로 기록됨)의 핵심 원인이었다.
+// 이제는 활성 워커 수(_clusterWorkers) 기준 "클러스터 총 처리 가능량
+// (workers × MAX_INFLIGHT) 대비 실제 사용량" 비율로 정확히 비교한다.
 export function lbAcquire() {
   ensureWorkerId();
   if (_inFlight >= MAX_INFLIGHT) return false;
-  // 클러스터 전체 부하도 체크 (클러스터 분산 거부)
-  if (_clusterTotal > 0 && _clusterTotal / (_clusterTotal + 1) > LOAD_THRESH) return false;
+  if (_clusterWorkers > 0) {
+    const clusterCapacity = _clusterWorkers * MAX_INFLIGHT;
+    if (_clusterTotal / clusterCapacity > LOAD_THRESH) return false;
+  }
   _inFlight++;
   return true;
 }
@@ -216,10 +229,11 @@ export async function lbHeartbeat(env) {
 
   await workerHeartbeat(env, id, payload);
 
-  // 클러스터 전체 inFlight 동기화 (KV listActiveWorkers 결과 캐시)
+  // 클러스터 전체 inFlight + 활성 워커 수 동기화 (KV listActiveWorkers 결과 캐시)
   try {
     const workers     = await listActiveWorkers(env);
-    _clusterTotal = workers.reduce((s, w) => s + (w.inFlight || 0), 0);
+    _clusterTotal   = workers.reduce((s, w) => s + (w.inFlight || 0), 0);
+    _clusterWorkers = workers.length;
   } catch (_) {}
 }
 
