@@ -1186,12 +1186,18 @@ function enforceHttps(html) {
 
 function injectPerformanceOptimizations(html) {
   if (html.includes('rel="dns-prefetch"')) return html;
+  // [버그 수정] PageSpeed Insights가 "5개가 넘는 preconnect 연결이
+  // 발견되었습니다. 사전 연결은 가장 중요한 출처에 한해 최소한으로만
+  // 사용해야 합니다"라고 경고하는 원인이 바로 이 함수였다. preconnect는
+  // 브라우저가 즉시 TCP+TLS 핸드셰이크를 미리 열어두는 무거운 작업이라
+  // 남발하면 오히려 실제로 중요한 리소스(LCP 등)의 연결 수립을 늦춰
+  // 성능이 떨어진다. dns-prefetch(가벼움)는 유지하되, preconnect는 실제
+  // 렌더링 초기에 반드시 쓰이는 gstatic 폰트 출처 하나로 최소화한다.
   const tags = [
     '<link rel="dns-prefetch" href="//www.blogger.com">',
     '<link rel="dns-prefetch" href="//www.gstatic.com">',
     '<link rel="dns-prefetch" href="//fonts.googleapis.com">',
     '<link rel="dns-prefetch" href="//fonts.gstatic.com">',
-    '<link rel="preconnect" href="https://www.gstatic.com" crossorigin>',
     '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
   ].join('\n');
   return html.replace(/(<head[^>]*>)/i, `$1\n${tags}`);
