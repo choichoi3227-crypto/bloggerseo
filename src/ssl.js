@@ -38,10 +38,58 @@ const CERT_CHECK_TTL  = 3600 * 24;           // 상태 갱신: 24시간마다
 /**
  * handleFetch() 최상단에서 호출.
  * http:// 요청이면 즉시 301 https://로 보내고, 이미 https면 null 반환.
+ *
+ * [리디렉션 루프 수정 v12] "Cloudflare에서 이 도메인의 레코드를 Proxied
+ * (주황 구름)로 켜면 ERR_TOO_MANY_REDIRECTS가 뜬다" 문제의 실제 원인.
+ *
+ * 기존 코드는 `new URL(request.url).protocol`만으로 HTTP/HTTPS를
+ * 판단했다. 이 판단은 Cloudflare가 Worker에 request.url을 어떻게
+ * 구성해 넘기는지에 암묵적으로 의존하는데, 아래 조건에서 실제 방문자는
+ * 이미 HTTPS로 접속했음에도 request.url이 http:// 스킴으로 관측될 수
+ * 있다(예: SSL/TLS 모드가 Flexible인 상태로 Proxied를 켰을 때, 또는
+ * Cloudflare 엣지 ↔ Worker 런타임 사이의 프로토콜 정규화 방식에 따라).
+ * 이 경우 매 요청마다:
+ *   1) enforceHttpsRedirect가 "http:// 요청"으로 오판 → 301 https://
+ *   2) 브라우저가 https://로 재요청 → Cloudflare가 다시 Worker로 프록시
+ *   3) Worker에서 또 http://로 관측 → 다시 1)로 복귀
+ *   → 무한 루프(ERR_TOO_MANY_REDIRECTS)
+ *
+ * 방문자가 실제로 어떤 프로토콜로 접속했는지는 url.protocol보다
+ * Cloudflare가 엣지에서 직접 채워주는 헤더가 훨씬 신뢰도가 높다:
+ *   - `cf-visitor`: JSON 문자열 {"scheme":"https"} — Cloudflare 프록시
+ *     경유 요청에는 거의 항상 존재하며, 엣지가 실제로 받은 스킴을 담는다.
+ *   - `x-forwarded-proto`: 다수의 프록시/로드밸런서가 채우는 표준 헤더.
+ * 이 헤더들 중 하나라도 "https"를 가리키면 이미 HTTPS이므로 리디렉션을
+ * 절대 발생시키지 않는다. 두 헤더가 전혀 없는 경우(Cloudflare를 거치지
+ * 않은 극히 예외적 상황 등)에만 기존처럼 url.protocol로 최종 폴백한다.
  */
+function resolveVisitorScheme(request) {
+  // 1순위: cf-visitor 헤더 (Cloudflare 엣지가 직접 채움, 가장 신뢰도 높음)
+  const cfVisitor = request.headers.get('cf-visitor');
+  if (cfVisitor) {
+    try {
+      const parsed = JSON.parse(cfVisitor);
+      if (parsed && typeof parsed.scheme === 'string') return parsed.scheme.toLowerCase();
+    } catch (_) { /* 파싱 실패 시 다음 신호로 폴백 */ }
+  }
+  // 2순위: x-forwarded-proto (표준 프록시 헤더, 콤마 구분 시 첫 값 사용)
+  const xfp = request.headers.get('x-forwarded-proto');
+  if (xfp) return xfp.split(',')[0].trim().toLowerCase();
+  // 3순위: request.cf.tlsVersion 존재 여부 — Workers가 TLS 핸드셰이크를
+  // 직접 처리한 요청(HTTPS)에만 채워지는 필드
+  if (request.cf && request.cf.tlsVersion) return 'https';
+  return null; // 신호 없음 → 호출부에서 url.protocol로 최종 폴백
+}
+
 export function enforceHttpsRedirect(request) {
   const url = new URL(request.url);
-  if (url.protocol === 'https:') return null;
+
+  const visitorScheme = resolveVisitorScheme(request);
+  if (visitorScheme === 'https') return null;           // 이미 HTTPS로 접속함 — 리디렉션 불필요
+  if (visitorScheme === null && url.protocol === 'https:') return null; // 신호 없을 때만 URL 스킴 폴백
+
+  // 여기 도달 = 방문자가 실제로 http://로 접속한 경우(또는 판별 불가하며
+  // url.protocol도 http:)뿐이므로, 이때만 안전하게 301 https://로 보낸다.
   const httpsUrl = 'https://' + url.host + url.pathname + url.search + url.hash;
   return Response.redirect(httpsUrl, 301);
 }
