@@ -92,10 +92,10 @@ async function run() {
     const outPtr = Number(getOutputPtr());
     const result = dec.decode(new Uint8Array(memory.buffer, outPtr, Number(outLen)));
     const ok = result === expected;
-    console.log(\`  [\${ok ? 'OK' : 'FAIL'}] "\${input}" → "\${result}" (expected: "\${expected}")\`);
+    console.log(`  [${ok ? 'OK' : 'FAIL'}] "${input}" -> "${result}" (expected: "${expected}")`);
     if (ok) passed++;
   }
-  console.log(\`\\n결과: \${passed}/\${cases.length} 통과\`);
+  console.log(`\n결과: ${passed}/${cases.length} 통과`);
   if (passed < cases.length) process.exit(1);
 }
 run().catch(e => { console.error(e); process.exit(1); });
