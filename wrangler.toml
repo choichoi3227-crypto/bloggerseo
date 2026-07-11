@@ -86,7 +86,7 @@ CF_ACCOUNT_ID          = ""           # Account ID (비밀 아님, 여기 직접
 #   (필요 권한: Zone:SSL and Certificates:Edit, Zone:Zone Settings:Edit)
 #
 # SSL_CA: 인증서 발급 CA 선택 (lets_encrypt 또는 google)
-SSL_CA                 = "google"  # 또는 "google" (Google Trust Services)
+SSL_CA                 = "lets_encrypt"  # 또는 "google" (Google Trust Services)
 
 # ─── Workers AI 바인딩 (FAQ 자동 추출) ──────────────────────────────────
 [ai]
