@@ -5,11 +5,20 @@
 //   1) npx asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime
 //   2) node build-blob.js
 // 순서로 다시 실행해 wasm-blob.js를 갱신해야 한다.
-const fs = require('fs');
-const path = require('path');
+//
+// [버그 수정] package.json에 "type": "module"이 설정되어 있어 .js 파일은
+// 항상 ESM으로 해석된다. 이 파일은 CommonJS 문법(require/__dirname)을
+// 쓰고 있어서 `node build-blob.js`(그리고 npm run build)를 실행할 때마다
+// "require is not defined in ES module scope"로 즉시 실패했다. ESM으로
+// 전환해 실제로 동작하게 한다.
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const wasmPath = path.join(__dirname, 'bloggerseo.wasm');
-const outPath = path.join(__dirname, 'wasm-blob.js');
+const outPath  = path.join(__dirname, 'wasm-blob.js');
 
 const buf = fs.readFileSync(wasmPath);
 const b64 = buf.toString('base64');
