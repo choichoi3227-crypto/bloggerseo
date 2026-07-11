@@ -40,7 +40,7 @@ import {
 import { buildSchemas, injectSchemaMarkup, injectSearchEngineTags } from './src/schema.js';
 import { handleSitemapRequest, handleRssRequest, generateSitemap, generateRss } from './src/sitemap.js';
 import {
-  fnv1a32Hex, extractMeta, extractTagContent, extractBodyText,
+  extractMeta, extractTagContent, extractBodyText,
   buildMetaDescription, extractFirstImage, extractSiteName, extractLogoUrl,
   extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform,
   retryAsync, retryOriginFetch, circuitStatus,
@@ -405,9 +405,12 @@ async function handleFetch(request, env, ctx) {
   // (Google 공식: 크롤링 인프라가 ETag/Last-Modified 캐싱을 지원하며,
   //  이를 활용하면 크롤링 효율이 올라간다 — SEO 랭킹 직접 요인은 아니지만
   //  크롤 예산을 아껴주는 효과가 있어 손해는 없고 이득만 있다.)
+  // [v10] 렌더링된 HTML 전체(수십~수백KB)를 매 요청 해싱하는 핫패스이므로
+  // WASM 가속 해시(wasmCore.fnv1a32Hex)를 사용한다 — 대용량 입력은 내부적으로
+  // 128KB 청크 스트리밍으로 처리되어 JS 문자별 순회보다 훨씬 빠르다.
   let etag = '';
   try {
-    etag = `"${fnv1a32Hex(result)}"`;
+    etag = `"${await wasmCore.fnv1a32Hex(result)}"`;
     const ifNoneMatch = request.headers.get('if-none-match');
     if (ifNoneMatch && ifNoneMatch === etag) {
       recordMetric(304, Date.now() - t0);
