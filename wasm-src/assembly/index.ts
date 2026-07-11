@@ -301,6 +301,41 @@ export function rawFnv1a32(inLen: i32): u32 {
   return hash;
 }
 
+// ── [4b] FNV-1a 32bit — 청크 이어쓰기(continuation) ────────────────
+// 입력 버퍼(BUF_SIZE=128KB)보다 큰 데이터(렌더링된 전체 HTML 등)를
+// JS 쪽에서 여러 조각으로 나눠 INPUT_BUF에 채운 뒤 이 함수를 반복
+// 호출하면, 매 호출 사이에 해시 상태(prevHash)를 이어받아 스트리밍
+// 방식으로 임의 길이 데이터를 해싱할 수 있다. FNV-1a는 순수 순차
+// XOR+곱셈 누적이라 청크 경계에서 결과가 전체를 한 번에 처리한 것과
+// 수학적으로 완전히 동일하다(청크 크기와 무관하게 항상 같은 최종 해시).
+export function fnv1a32Chunk(prevHash: u32, inLen: i32): u32 {
+  let hash: u32 = prevHash;
+  for (let i = 0; i < inLen; i++) {
+    hash ^= INPUT_BUF[i];
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return hash;
+}
+export function fnv1a32Seed(): u32 { return 0x811c9dc5; }
+
+// [버그 수정] 이 프로젝트는 --runtime stub으로 빌드되고 JS 글루 코드
+// (asc의 bindings/loader) 없이 raw WebAssembly.instantiate로 직접
+// 호출한다. 이 방식에서 AssemblyScript의 관리형 `string` 반환값은
+// 자동으로 JS 문자열로 변환되지 않고, 메모리 포인터(숫자)가 그대로
+// 넘어와 그 자체로는 사용할 수 없다. 이 파일의 다른 모든 함수(예:
+// writeOutputUtf8 기반의 rawGenerateSlug, rawSha256 등)는 이미 이
+// 문제를 피하려고 "OUTPUT_BUF에 UTF-8 바이트로 쓰고 길이(i32)만
+// 반환" 하는 관례를 따르고 있다. 아래 함수를 그 관례에 맞춰 고친다.
+export function fnv1a32FinalizeHex(hash: u32): i32 {
+  const hc = "0123456789abcdef";
+  let out = "";
+  for (let i = 7; i >= 0; i--) {
+    const nibble = (hash >>> (i * 4)) & 0xf;
+    out += hc.charAt(nibble);
+  }
+  return writeOutputUtf8(out);
+}
+
 // ── [5] countOccurrences (raw bytes 직접 비교) ─────────────────────
 export function rawCountOccurrences(hLen: i32, nLen: i32): i32 {
   if (nLen == 0 || nLen > hLen) return 0;
