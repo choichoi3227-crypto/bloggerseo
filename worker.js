@@ -433,8 +433,18 @@ async function handleFetch(request, env, ctx) {
         return stale;
       }
     }
+    // ✅ [Error 525 수정] retryOriginFetch/retryAsync가 이미 520~527 계열을
+    // 재시도했음에도 여전히 실패한 경우, 이전에는 originResp.status(예: 525)를
+    // 그대로 방문자에게 노출했다. 525는 "Cloudflare 엣지 ↔ origin(ghs.google.com)
+    // 간 TLS 핸드셰이크 실패"를 뜻하는 Cloudflare 전용 합성 코드로, 방문자
+    // 브라우저에 그대로 보여줘 봐야 이해할 수 없고 SEO/방문자 신뢰도만
+    // 떨어뜨린다. 이 Worker는 방문자에게 항상 HTTPS로 응답하는(Flexible
+    // 모드 대응) 프록시이므로, origin 쪽 TLS 상태와 무관하게 방문자에게는
+    // 표준 502(Bad Gateway)로 정규화해서 반환한다. 실제 원인(525 등)은
+    // 로그/메트릭에만 남긴다.
+    const normalizedStatus = originResp.status >= 520 ? 502 : originResp.status;
     recordMetric(originResp.status, Date.now() - t0);
-    return errResp(originResp.status, 'Origin error ' + originResp.status);
+    return errResp(normalizedStatus, 'Origin temporarily unavailable (upstream ' + originResp.status + ')');
   }
   if (!isHtml(originResp) || !originResp.ok) {
     recordMetric(originResp.status, Date.now() - t0);
@@ -1155,6 +1165,12 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
 async function proxyPass(url, request, cfOverride = null) {
   try {
     const resp = await retryAsync(() => bloggerFetch(url, request.headers, null, cfOverride), 1);
+    // ✅ [Error 525 수정] 정적 자산 패스스루 경로도 재시도 후 여전히 실패한
+    // 경우 Cloudflare 합성 코드(520~527)를 그대로 방문자에게 노출하지 않고
+    // 표준 502로 정규화한다 (HTML 렌더링 경로와 동일한 정책).
+    if (resp.status >= 520 && resp.status <= 527) {
+      return errResp(502, 'Origin temporarily unavailable (upstream ' + resp.status + ')');
+    }
     return stripInternalHeaders(resp, url, isPassthrough(url.pathname, url));
   } catch (e) {
     return errResp(502, 'Proxy failed: ' + String(e?.message ?? e));
@@ -1906,6 +1922,21 @@ tr:hover td{background:#334155}
       </div>
     </div>
 
+    <!-- ✅ [Error 525 방지 + 블로그스팟 인증서 불필요] 안내 배너 -->
+    <div class="card" style="margin-bottom:20px;border-left:3px solid #22c55e">
+      <div class="card-title" style="margin-bottom:10px">✅ 블로그스팟 SSL 인증서 발급 불필요</div>
+      <div style="color:#94a3b8;font-size:12px;line-height:1.8">
+        이 Worker는 원본(ghs.google.com)에 직접 HTTPS로 접속하고 <code>Host</code> 헤더로 블로그를
+        구분하므로, 블로그스팟(개인도메인)에서 별도로 SSL 인증서를 발급받을 필요가 없습니다 — Worker가
+        방문자용 HTTPS와 원본 연결을 모두 대신 처리합니다.<br><br>
+        <strong>⚠️ Error 525가 보인다면:</strong> Cloudflare 대시보드 →
+        <strong>SSL/TLS → Overview</strong>에서 암호화 모드를 반드시
+        <strong>"Flexible"</strong>로 설정하세요. Full/Full(strict)로 설정되어 있으면 Cloudflare
+        엣지가 (이 Worker와 무관하게) 커스텀 도메인 자체의 인증서를 요구하다가 실패해 Error 525/526을
+        반환할 수 있습니다.
+      </div>
+    </div>
+
     <!-- 도메인 추가 -->
     <div class="card" style="margin-bottom:20px">
       <div class="card-title" style="margin-bottom:10px">➕ 도메인 수동 추가</div>
@@ -2291,13 +2322,4 @@ async function loadCachePolicyInfo() {
     🕐 마지막 초기화: <strong>\${last}</strong><br>
     ⏭️ 다음 초기화 예정: <strong>\${next}</strong><br><br>
     📋 TTL 정책:<br>
-    \${Object.entries(pol).map(([k,v])=>\`  &nbsp;&nbsp;<span class="tag">\${k}</span> \${v}초\`).join('<br>')}
-  \`;
-}
-
-// 초기 로드 (모든 함수 정의 완료 후)
-document.addEventListener('DOMContentLoaded', () => { loadDashboard(); });
-</script>
-</body>
-</html>`;
-}
+    \${Object.entries(pol).map(([k
