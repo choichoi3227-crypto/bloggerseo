@@ -1,4 +1,4 @@
-import { kvGetJson, kvSetJson, kvGet, kvSet, blockIp } from './store.js';
+import { kvGetJson, kvSetJson, blockIp } from './store.js';
 
 function clientIp(request) {
   return request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
@@ -14,8 +14,22 @@ async function sha256Hex(s) {
 }
 export function hasCloudflareBotMfa(request, env) {
   if (String(env.PANEL_CF_BOT_MFA || 'true') !== 'true') return true;
-  const score = Number(request.headers.get('cf-bot-score') || '99');
-  const verified = request.headers.get('cf-verified-bot') === 'true';
+  // ✅ [에러 방지 장치 — 심각한 보안 결함 수정] 이전 구현은
+  // request.headers.get('cf-bot-score') / request.headers.get('cf-verified-bot')
+  // 처럼 "요청자가 직접 보낸 HTTP 헤더"를 신뢰했다. 이 헤더들은 Cloudflare가
+  // 표준으로 채워주는 값이 아니라 그냥 클라이언트가 자유롭게 지정할 수 있는
+  // 임의의 헤더 이름이라서, 누구든 `cf-verified-bot: true`를 요청에 직접
+  // 붙이기만 하면 이 MFA 체크를 100% 우회할 수 있었다(관리 패널 접근에
+  // 사실상 아무 의미가 없는 보호막이었던 셈).
+  //
+  // Cloudflare가 실제로 서버측(엣지)에서 검증해 채워주는 신뢰 가능한 값은
+  // request.cf.botManagement.score / request.cf.botManagement.verifiedBot이며,
+  // 이는 클라이언트가 조작할 수 없는 Workers 런타임 제공 메타데이터다.
+  // (Bot Management는 Enterprise 플랜 전용 기능이라 request.cf.botManagement가
+  // 없는 플랜에서는 verified=false, score=기본 통과값으로 안전하게 폴백한다.)
+  const bm = request.cf && request.cf.botManagement;
+  const score = bm && typeof bm.score === 'number' ? bm.score : 99; // 신호 없으면 차단하지 않음(기존 폴백 유지)
+  const verified = !!(bm && bm.verifiedBot === true);
   return verified || score >= (Number(env.PANEL_MIN_BOT_SCORE) || 30);
 }
 
