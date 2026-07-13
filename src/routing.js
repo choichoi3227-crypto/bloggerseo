@@ -27,7 +27,10 @@
  */
 
 import { workerHeartbeat, listActiveWorkers, regionCacheSet, regionCacheGet } from './store.js';
-import { fnv1a32Hex } from './utils.js';
+// ✅ [에러 방지/정리] 이전에는 여기서 utils.js의 fnv1a32Hex를 import했지만
+// 이 파일 어디에서도 실제로 호출되지 않는 죽은 import였다(ETag 해시는
+// worker.js에서 wasmCore.fnv1a32Hex로 직접 계산됨). 미사용 import는 실행에
+//영향은 없지만 "이 파일이 해시를 계산한다"는 오해를 유발할 수 있어 제거한다.
 
 // ── 지역 정의 및 우선순위 ─────────────────────────────────────────────
 const REGIONS = {
@@ -84,11 +87,20 @@ export function argoRecordLatency(region, latencyMs) {
 
 // ── Argo: 요청 헤더에 라우팅 힌트 추가 ──────────────────────────────
 export function argoBuildFetchOptions(route) {
-  // CF hint: smart routing을 위해 최적 PoP에 가까운 리졸버 선택
+  // ✅ [SSL handshake failed 수정, v13] 이전에는 여기도 resolveOverride:
+  // 'ghs.google.com'을 지정했는데, bloggerFetch()의 targetUrl이 이제
+  // 이미 https://ghs.google.com/... 을 직접 가리키므로 완전히 중복이었다.
+  // 일부 Workers 런타임에서 resolveOverride가 설정된 채로 http3와 함께
+  // TLS 연결을 맺을 때 SNI/인증서 검증 경로에 문제가 생겨 SSL handshake
+  // 실패로 이어지는 사례가 있어 제거한다(상세 이유는 worker.js의
+  // bloggerFetch 주석 참고).
   return {
     cf: {
-      resolveOverride : 'ghs.google.com',
-      http3           : true,
+      // ✅ [SSL handshake failed 수정, v13] http3(QUIC)도 함께 제거한다.
+      // Blogger 인프라(ghs.google.com)가 이 경로에서 HTTP/3를 안정적으로
+      // 지원한다는 보장이 없고, QUIC 협상 실패가 상위 계층에는 종종
+      // "SSL handshake failed"에 준하는 형태로 드러난다. 표준 HTTP/2 +
+      // TLS 1.3 경로가 이 프록시 용도로는 충분히 빠르고 예측 가능하다.
       cacheTtl        : 0,
       cacheEverything : false,
       // Argo 자체 라우팅: 선택된 region 기반으로 minify·mirage 비활성화
