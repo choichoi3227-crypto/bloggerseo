@@ -44,7 +44,7 @@
  *   단 모바일/데스크톱/태블릿 및 이미지 포맷(avif/webp/std) variant는 분리
  */
 
-import { kvGet, kvSet, kvGetJson, kvSetJson, kvDel, kvScan } from './store.js';
+import { kvGetJson, kvSetJson, kvDel, kvScan } from './store.js';
 
 // TTL 정책
 // [버그 수정] 이전 주석은 "1시간/2시간"이라 적혀 있었지만 실제 상수 값은
