@@ -47,8 +47,13 @@ export class LocalSemaphore {
 }
 
 // ─── 커넥션 최적화 ─────────────────────────────────────────────────
+// ⚠️ [정리] 현재 이 함수는 worker.js/src/*.js 어디에서도 호출되지 않는
+// 미사용(대기) 상태다. http3:true는 v13에서 제거했다 — 실제 사용되는
+// bloggerFetch/argoBuildFetchOptions 경로에서 QUIC 협상 불안정성으로
+// SSL handshake 실패를 유발할 수 있어 제거한 것과 동일한 이유로,
+// 나중에 이 헬퍼를 실제로 연결할 때도 같은 값을 물려주지 않도록 한다.
 export function connectionOptimizedCf(baseCf) {
-  return { ...baseCf, http3: true };
+  return { ...baseCf };
 }
 
 // ─── 구조화 로깅 (KV 없이 console만) ─────────────────────────────
