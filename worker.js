@@ -2322,4 +2322,13 @@ async function loadCachePolicyInfo() {
     🕐 마지막 초기화: <strong>\${last}</strong><br>
     ⏭️ 다음 초기화 예정: <strong>\${next}</strong><br><br>
     📋 TTL 정책:<br>
-    \${Object.entries(pol).map(([k
+    \${Object.entries(pol).map(([k,v])=>\`  &nbsp;&nbsp;<span class="tag">\${k}</span> \${v}초\`).join('<br>')}
+  \`;
+}
+
+// 초기 로드 (모든 함수 정의 완료 후)
+document.addEventListener('DOMContentLoaded', () => { loadDashboard(); });
+</script>
+</body>
+</html>`;
+}
