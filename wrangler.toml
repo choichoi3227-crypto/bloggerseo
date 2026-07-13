@@ -1,5 +1,9 @@
-# wrangler.toml — BloggerSEO Worker v7
+# wrangler.toml — BloggerSEO Worker v13
 # ─────────────────────────────────────────────────────────────────────
+# v13 신규/변경 (우선순위 1+2):
+#   - DNS Proxied(주황 구름) 리디렉션 무한 루프 근본 수정 (bloggerFetch)
+#   - WASM 사용 확대: 본문 텍스트 추출/meta description(CJK-aware)/
+#     SHA-256/HMAC/Base64/상수시간비교 실연결 + 인코딩 버그 수정
 # v7 신규/변경 기능:
 #   1. 자동 스키마 마크업 (Article/FAQ/Breadcrumb/Product, 필수: Article/FAQ)
 #   2. Argo Smart Routing (자체 구현)
