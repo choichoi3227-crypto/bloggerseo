@@ -1,6 +1,34 @@
 /**
- * BloggerSEO Worker v9
+ * BloggerSEO Worker v13
  * ─────────────────────────────────────────────────────────────────────
+ * v13 수정 사항 (v12 대비, 우선순위 1):
+ *   1.  [DNS Proxied(주황 구름) 리디렉션 무한 루프 근본 수정]
+ *       bloggerFetch()가 cf.resolveOverride만으로 origin DNS를 Blogger로
+ *       돌리려던 방식을 버리고, fetch target host 자체를 ghs.google.com
+ *       으로 직접 치환 + Host 헤더로 커스텀 도메인 전달하는 방식으로
+ *       교체. resolveOverride는 "URL host와 override host가 모두 같은
+ *       zone 안에 있을 때만" 동작하는데 ghs.google.com은 사용자의 zone이
+ *       아니므로 항상 무시되고, 그 결과 DNS가 Proxied(주황 구름)인 순간
+ *       fetch가 Worker 자기 자신을 호출해 무한 루프가 발생했다. 이 근본
+ *       원인을 제거해 Proxied 여부와 무관하게 항상 정상 동작한다.
+ *       (상세 원리는 bloggerFetch() 주석 참고)
+ *   2.  자기호출 방어 어서션 추가 — 향후 리팩터링으로 회귀가 생겨도
+ *       무한 루프 대신 즉시 명확한 에러로 실패.
+ *
+ * v13 수정 사항 (우선순위 2 — WASM 사용 확대):
+ *   3.  [본문 텍스트 추출 + meta description 생성 WASM 가속]
+ *       매 요청(캐시 미스 시) 렌더링 경로의 실질 핫패스인 extractBodyText/
+ *       buildMetaDescription을 순수 JS 정규식 체인에서 WASM(AssemblyScript,
+ *       O(n) 단일 패스 상태 머신)으로 교체. meta description은 한글/한자
+ *       등 전각 문자를 폭 2로 계산하는 CJK-aware 절단 로직 추가.
+ *   4.  [SHA-256/HMAC/Base64/상수시간비교 WASM 실연결]
+ *       wasm-src/assembly/index.ts에는 이미 존재했지만 wasm-loader.js의
+ *       wasmCore에는 연결되지 않아 github-tenant.js 등에서 호출 시 즉시
+ *       TypeError로 깨지던 sha256HexShort/hmacSha256Hex/constantTimeEqual을
+ *       실제로 wire. Base64 인코더의 패딩 계산 버그와 디코더의 패딩(=)
+ *       처리 버그(길이가 3의 배수가 아닌 입력에서 스퓨리어스 바이트 발생)도
+ *       함께 수정.
+ *
  * v9 수정 사항 (v8 대비):
  *   1.  [리디렉션 과다 수정] 슬러그 확정 시 발생하던 이중 301 지점을 하나로
  *       통합. 방금 슬러그가 새로 생성된 요청은 그 자리에서 바로 렌더링하고,
@@ -40,8 +68,8 @@ import {
 import { buildSchemas, injectSchemaMarkup, injectSearchEngineTags } from './src/schema.js';
 import { handleSitemapRequest, handleRssRequest, generateSitemap, generateRss } from './src/sitemap.js';
 import {
-  extractMeta, extractTagContent, extractBodyText,
-  buildMetaDescription, extractFirstImage, extractSiteName, extractLogoUrl,
+  extractMeta, extractTagContent,
+  extractFirstImage, extractSiteName, extractLogoUrl,
   extractLabels, extractJsonLdDate, escapeAttr, escapeRe, safeTransform,
   retryAsync, retryOriginFetch, circuitStatus,
 } from './src/utils.js';
@@ -963,11 +991,69 @@ async function dnsCname(host) {
 // ─────────────────────────────────────────────
 // Origin Fetch (Argo 경로 통합)
 // ─────────────────────────────────────────────
+/**
+ * bloggerFetch — [리디렉션 루프 근본 수정 v13]
+ * ─────────────────────────────────────────────────────────────────────
+ * ## v12까지의 문제 (Proxied/주황 구름 활성화 시 항상 무한 루프)
+ *
+ * v12까지는 `targetUrl = url.origin + ...` 로 "커스텀 도메인 자기 자신"을
+ * fetch 대상으로 사용하고, `cf.resolveOverride: 'ghs.google.com'` 으로
+ * DNS 조회만 Blogger로 바꾸려 시도했다. 그러나 Cloudflare의 실제 동작은:
+ *
+ *   resolveOverride는 "URL의 host"와 "override 대상 host"가 **둘 다
+ *   같은 Cloudflare 계정의 zone에 등록되어 있을 때만" 적용된다.
+ *   (공식 문서: resolveOverride will only take effect if both the URL
+ *   host and the host specified by resolveOverride are within your zone.)
+ *
+ * `ghs.google.com`은 사용자의 zone이 아니므로 이 조건을 절대 만족할 수
+ * 없다 → resolveOverride가 조용히 **무시**된다 → 실제 DNS 조회는 URL의
+ * host(커스텀 도메인) 그대로 진행된다.
+ *
+ *   • DNS가 Cloudflare로 Proxied(주황 구름)인 경우:
+ *     커스텀 도메인의 A/AAAA가 Cloudflare 엣지 IP를 가리키므로, 이
+ *     fetch()는 결국 "자기 자신의 Worker"를 다시 호출하게 된다. Worker는
+ *     다시 이 함수를 실행해 또 자기 자신을 호출 → 무한 루프
+ *     (ERR_TOO_MANY_REDIRECTS / subrequest depth 초과)로 이어진다.
+ *     이것이 "Proxied를 켜면 항상 리디렉션 무한 루프에 빠지는" 근본 원인.
+ *   • DNS가 DNS-only(회색 구름)인 경우:
+ *     우연히 A/CNAME이 실제 Blogger 인프라를 가리키고 있을 때만 동작해
+ *     "회색 구름에서는 되는데 주황 구름만 켜면 안 된다"는 증상으로
+ *     보고된다.
+ *
+ * ## v13 수정
+ *
+ * DNS 조회 자체를 힌트가 아니라 **fetch target host를 직접
+ * `ghs.google.com`으로 치환**하는 방식으로 바꾼다. 즉:
+ *   1. fetch를 보낼 URL의 hostname을 GHS_TARGET으로 직접 교체한다
+ *      (DNS 조회 무시 로직에 의존하지 않고, fetch가 애초에 Blogger
+ *      인프라로만 나가도록 강제 — Proxied 여부와 무관하게 항상 정확).
+ *   2. Blogger는 Host 헤더로 어떤 블로그인지 판별하므로, 원래 커스텀
+ *      도메인을 `Host` 헤더에 명시적으로 담아 그대로 전달한다.
+ *   3. resolveOverride는 zone 내부 도메인 간 라우팅에는 여전히 유효할 수
+ *      있으므로 하위 호환을 위해 보조 힌트로만 유지하고, 주 라우팅
+ *      메커니즘으로는 더 이상 의존하지 않는다.
+ *   4. 방어적으로 fetch 대상 hostname이 절대 "이 Worker가 서비스 중인
+ *      원래 요청 host"와 같아지지 않도록 어서션을 추가해, 향후 리팩터링
+ *      실수로 자기 자신을 호출하는 회귀가 생기면 조용히 루프에 빠지는
+ *      대신 즉시 명확한 에러로 실패하게 한다.
+ */
 async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
   const params = new URLSearchParams(url.search);
   params.delete('m');
-  const qs        = params.toString() ? '?' + params.toString() : '';
-  const targetUrl = url.origin + url.pathname + qs;
+  const qs = params.toString() ? '?' + params.toString() : '';
+
+  // ── 방어적 자기호출 어서션 (에러 방지 장치) ─────────────────────────
+  // 원래 요청 hostname이 이미 GHS_TARGET 자신인 경우(있을 수 없는
+  // 상태지만) 그대로 진행하면 무한 루프로 이어질 수 있으므로 즉시
+  // 명확한 예외로 실패시켜 원인 파악을 쉽게 한다.
+  if (url.hostname === GHS_TARGET) {
+    throw new Error('bloggerFetch self-call guard: request host equals GHS_TARGET unexpectedly, refusing to fetch self.');
+  }
+
+  // ✅ v13: DNS 조회 힌트가 아니라 fetch 대상 자체를 Blogger 인프라로
+  // 직접 고정한다. Proxied(주황 구름) 여부, DNS 레코드 타입(A/CNAME),
+  // resolveOverride의 zone 제약과 완전히 무관하게 항상 Blogger로 나간다.
+  const targetUrl = `https://${GHS_TARGET}${url.pathname}${qs}`;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
@@ -975,17 +1061,21 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
     if (kl === 'host' || kl.startsWith('cf-') || kl === 'x-forwarded-for' || kl === 'x-real-ip') continue;
     headers.set(k, v);
   }
+  // Blogger가 어떤 블로그(커스텀 도메인)인지 판별할 수 있도록 원래 host를
+  // Host 헤더로 명시 전달. (URL 자체는 GHS_TARGET이므로 Host 헤더가 없으면
+  // Blogger가 ghs.google.com 자신으로 오인해 404/오류를 반환한다.)
+  headers.set('host', url.hostname);
   headers.set('user-agent', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
   // Argo 라우팅 힌트 헤더
   if (argoCtx?.region) headers.set('x-argo-region', argoCtx.region);
 
-  const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : { resolveOverride: GHS_TARGET, http3: true };
+  const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : { http3: true };
 
   return fetch(targetUrl, {
     method  : 'GET',
     headers,
     redirect: 'manual',
-    cf      : cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false },
+    cf      : cfOverride || { ...cfOpts, resolveOverride: GHS_TARGET, cacheTtl: 0, cacheEverything: false },
   });
 }
 
@@ -1267,8 +1357,13 @@ async function extractPageContext(html, url) {
     titlePath  : null,  // ✅ v8: SEO 슬러그 경로 (KV에서 나중에 채워짐)
   };
   ctx.title       = extractMeta(html, 'og:title') || extractTagContent(html, /<title[^>]*>([^<]+)<\/title>/i) || '';
-  const bodyText  = extractBodyText(html);
-  ctx.description = extractMeta(html, 'description') || extractMeta(html, 'og:description') || buildMetaDescription(bodyText, ctx.title);
+  // ✅ [v13: WASM 가속] 본문 텍스트 추출 + CJK-aware meta description 생성은
+  // 매 요청(캐시 미스 시) 렌더링 경로의 실질 핫패스이므로 WASM으로 처리한다.
+  // wasmCore의 각 메서드는 WASM 인스턴스화 실패 시 내부적으로 안전하게
+  // JS 폴백으로 전환되므로 이 호출부는 백엔드와 무관하게 항상 안전하다.
+  const bodyText  = await wasmCore.extractBodyText(html);
+  ctx.description = extractMeta(html, 'description') || extractMeta(html, 'og:description') ||
+                     await wasmCore.buildMetaDescription(bodyText, ctx.title, 160);
   ctx.imageUrl    = extractMeta(html, 'og:image')    || extractFirstImage(html)              || '';
   ctx.publishDate = extractMeta(html, 'article:published_time') || extractJsonLdDate(html, 'datePublished') || '';
   ctx.updateDate  = extractMeta(html, 'article:modified_time')  || extractJsonLdDate(html, 'dateModified')  || ctx.publishDate;
