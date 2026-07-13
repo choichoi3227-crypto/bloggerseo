@@ -45,6 +45,14 @@ new_sqlite_classes = ["MyDurableObject"]
 
 # ─── 환경 변수 (비밀이 아닌 값만) ────────────────────────────────────────
 [vars]
+# ⚠️ [필수 배포 전 조치 — 관리 패널 보안] PANEL_SECRET은 여기 [vars]에
+# 평문으로 적지 말고 반드시 `wrangler secret put PANEL_SECRET` 명령으로
+# 별도 등록하세요(16자 이상 임의 문자열 권장). worker.js v13부터 이
+# 시크릿이 없거나 16자 미만이면 /panel 자체가 503으로 완전히 차단되도록
+# 바뀌었습니다(이전 버전은 시크릿 미설정 시 소스코드에 노출된 기본값
+# 'change-me-in-dashboard'로 조용히 폴백해, 배포자가 이를 놓치면 관리
+# 패널이 사실상 인증 없이 전체 인터넷에 노출되는 심각한 보안 결함이
+# 있었습니다).
 RATE_LIMIT_PER_MIN     = "600"
 CACHE_RESERVE_TTL_SEC  = "1800"      # 4시간 = 14400초
 MAX_WORKER_INSTANCES   = "100"         # 로드밸런싱: 최대 워커 인스턴스
