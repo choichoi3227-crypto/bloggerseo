@@ -41,9 +41,13 @@ const GC_INTERVAL_MS = 5 * 60 * 1000; // 5분마다 만료 항목 정리
 
 // ── 키 → 샤드 번호 해시 (FNV-1a) ─────────────────────────────────────
 function shardOf(key, shardCount) {
+  // ✅ [에러 방지 장치] key가 문자열이 아니면(undefined, number, null 등)
+  // key.charCodeAt이 존재하지 않아 TypeError로 즉시 죽는다. 호출부에서
+  // 이미 검증하지만, 이 함수가 단독으로도 안전하도록 이중 방어한다.
+  const k = typeof key === 'string' ? key : String(key ?? '');
   let h = 0x811c9dc5;
-  for (let i = 0; i < key.length; i++) {
-    h ^= key.charCodeAt(i);
+  for (let i = 0; i < k.length; i++) {
+    h ^= k.charCodeAt(i);
     h = Math.imul(h, 0x01000193);
   }
   h = (h ^ (h >>> 16)) >>> 0;
@@ -77,7 +81,16 @@ async function sendToShard(env, key, cmd) {
       body: JSON.stringify(cmd),
     });
     if (!resp.ok) return { ok: false, error: 'shard-http-' + resp.status };
-    return await resp.json();
+    // ✅ [에러 방지 장치] resp.ok이어도 바디가 유효한 JSON이 아닐 가능성
+    // (예: DO 내부에서 처리되지 않은 예외로 빈 바디/HTML 에러 페이지가
+    // 반환되는 극단적 상황)을 대비해 별도로 감싼다. 이전에는 이 지점의
+    // 예외가 바깥 catch까지 전파되긴 했지만, try 블록 경계를 명확히 해
+    // 어느 단계에서 실패했는지 에러 메시지로 구분할 수 있게 한다.
+    try {
+      return await resp.json();
+    } catch (parseErr) {
+      return { ok: false, error: 'shard-bad-response-json: ' + String(parseErr?.message || parseErr) };
+    }
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
   }
@@ -292,6 +305,23 @@ export class MyDurableObject extends DurableObject {
     );
   }
 
+  // ✅ [에러 방지 장치] vdata는 항상 이 DO가 직접 JSON.stringify로 쓴
+  // 값이라 정상 상황에서는 파싱이 실패할 수 없지만, 만에 하나 외부 요인
+  // (수동 SQLite 조작, 향후 스키마 변경, 저장소 손상 등)으로 손상된 값이
+  // 들어있으면 이전 구현은 JSON.parse가 그대로 throw해서 그 요청 전체가
+  // 500으로 실패하고 해당 키는 이후 모든 접근에서 영구히 500만 반환하는
+  // "죽은 키"가 되어버렸다. 손상을 감지하면 해당 키를 자동 삭제해 다음
+  // 접근부터는 "키 없음"으로 정상 복구되도록 한다 — 사용자가 수동으로
+  // KV 관리 탭에서 삭제하지 않아도 스스로 치유된다.
+  _safeParse(row, key, fallback) {
+    try {
+      return JSON.parse(row.vdata);
+    } catch (_) {
+      try { this.sql.exec(`DELETE FROM kv WHERE key = ?`, key); } catch (_) {}
+      return fallback;
+    }
+  }
+
   async fetch(request) {
     let cmd;
     try { cmd = await request.json(); } catch (_) {
@@ -306,12 +336,21 @@ export class MyDurableObject extends DurableObject {
   }
 
   _exec(cmd) {
+    // ✅ [에러 방지 장치] cmd/cmd.op/cmd.key가 없거나 잘못된 타입이면
+    // SQL 바인딩에 undefined가 들어가 예측 불가능한 동작(SQLite가 NULL로
+    // 취급하거나 예외 발생)으로 이어질 수 있었다. 진입점에서 미리 검증해
+    // 명확한 에러 메시지로 즉시 실패시킨다.
+    if (!cmd || typeof cmd !== 'object') return { ok: false, error: 'bad-command: not an object' };
     const op = cmd.op;
+    if (typeof op !== 'string') return { ok: false, error: 'bad-command: missing op' };
+    if (op !== 'FLUSHALL' && op !== 'SCAN' && op !== 'STATS' && typeof cmd.key !== 'string') {
+      return { ok: false, error: 'bad-command: missing or invalid key' };
+    }
     switch (op) {
       case 'GET': {
         const row = this._row(cmd.key);
         if (!row) return { ok: true, value: null };
-        const parsed = JSON.parse(row.vdata);
+        const parsed = this._safeParse(row, cmd.key, null);
         return { ok: true, value: row.vtype === 'string' ? parsed : null };
       }
       case 'SET': {
@@ -346,7 +385,7 @@ export class MyDurableObject extends DurableObject {
         if (row && row.vtype !== 'string') {
           return { ok: false, error: 'WRONGTYPE: value is not a string/integer' };
         }
-        const rawCur = row ? JSON.parse(row.vdata) : 0;
+        const rawCur = row ? this._safeParse(row, cmd.key, 0) : 0;
         const cur = Number(rawCur);
         if (row && !Number.isFinite(cur)) {
           return { ok: false, error: 'ERR value is not an integer' };
@@ -357,20 +396,20 @@ export class MyDurableObject extends DurableObject {
       }
       case 'LPUSH': case 'RPUSH': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? JSON.parse(row.vdata) : [];
+        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
         if (op === 'LPUSH') list.unshift(cmd.value); else list.push(cmd.value);
         this._put(cmd.key, 'list', list, row ? this._remainingTtl(cmd.key) : 0);
         return { ok: true, len: list.length };
       }
       case 'LRANGE': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? JSON.parse(row.vdata) : [];
+        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
         const stop = cmd.stop < 0 ? list.length + cmd.stop + 1 : cmd.stop + 1;
         return { ok: true, items: list.slice(cmd.start, stop) };
       }
       case 'LTRIM': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? JSON.parse(row.vdata) : [];
+        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
         const stop = cmd.stop < 0 ? list.length + cmd.stop + 1 : cmd.stop + 1;
         const trimmed = list.slice(cmd.start, stop);
         this._put(cmd.key, 'list', trimmed, row ? this._remainingTtl(cmd.key) : 0);
@@ -378,24 +417,24 @@ export class MyDurableObject extends DurableObject {
       }
       case 'LLEN': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? JSON.parse(row.vdata) : [];
+        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
         return { ok: true, len: list.length };
       }
       case 'HSET': {
         const row = this._row(cmd.key);
-        const hash = row && row.vtype === 'hash' ? JSON.parse(row.vdata) : {};
+        const hash = row && row.vtype === 'hash' ? this._safeParse(row, cmd.key, {}) : {};
         hash[cmd.field] = cmd.value;
         this._put(cmd.key, 'hash', hash, row ? this._remainingTtl(cmd.key) : 0);
         return { ok: true };
       }
       case 'HGET': {
         const row = this._row(cmd.key);
-        const hash = row && row.vtype === 'hash' ? JSON.parse(row.vdata) : {};
+        const hash = row && row.vtype === 'hash' ? this._safeParse(row, cmd.key, {}) : {};
         return { ok: true, value: hash[cmd.field] ?? null };
       }
       case 'HGETALL': {
         const row = this._row(cmd.key);
-        const hash = row && row.vtype === 'hash' ? JSON.parse(row.vdata) : {};
+        const hash = row && row.vtype === 'hash' ? this._safeParse(row, cmd.key, {}) : {};
         return { ok: true, value: hash };
       }
       case 'SCAN': {
