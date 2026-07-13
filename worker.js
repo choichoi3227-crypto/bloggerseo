@@ -39,6 +39,17 @@
  *       경로가 일반 fetch와 달라져 SSL handshake 실패로 이어질 수 있어
  *       제거했다. 같은 이유로 http3(QUIC) 힌트도 제거해 표준 HTTP/2 +
  *       TLS 1.3 경로로 통일했다(argoBuildFetchOptions, 기본 cfOpts 모두).
+ *   6.  [Error 525 수정 — Host 헤더 오버라이드 방식 교체]
+ *       fetch(targetUrl, { headers, ... })처럼 "일반 init 객체"에 Host
+ *       헤더를 담아 넘기는 방식은 Fetch 표준상 Host가 forbidden(제한)
+ *       헤더라 Workers 런타임에서 안정적으로 반영되지 않는 사례가
+ *       있었다(Cloudflare 공식 커뮤니티: "we can't allow you to specify
+ *       a Host header that is inconsistent with the routing"). 그 결과
+ *       Blogger(ghs.google.com)가 어느 블로그인지 판별하지 못하거나
+ *       요청이 예기치 않게 처리되어 Error 525(Origin SSL handshake
+ *       failed)로 이어질 수 있었다. Cloudflare 공식 예제/커뮤니티에서
+ *       검증된 패턴대로 new Request(url, init) → outboundRequest.headers
+ *       .set('host', ...) → fetch(outboundRequest) 순서로 교체했다.
  *
  * v13 수정 사항 (우선순위 3 — 에러 방지 장치):
  *   6.  [관리 패널 하드코딩 기본 시크릿 제거 — 심각한 보안 결함]
@@ -1100,10 +1111,6 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
     if (kl === 'host' || kl.startsWith('cf-') || kl === 'x-forwarded-for' || kl === 'x-real-ip') continue;
     headers.set(k, v);
   }
-  // Blogger가 어떤 블로그(커스텀 도메인)인지 판별할 수 있도록 원래 host를
-  // Host 헤더로 명시 전달. (URL 자체는 GHS_TARGET이므로 Host 헤더가 없으면
-  // Blogger가 ghs.google.com 자신으로 오인해 404/오류를 반환한다.)
-  headers.set('host', url.hostname);
   headers.set('user-agent', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
   // Argo 라우팅 힌트 헤더
   if (argoCtx?.region) headers.set('x-argo-region', argoCtx.region);
@@ -1112,19 +1119,37 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
   // 동일한 이유(QUIC 협상 불안정성으로 인한 handshake 실패 가능성 배제).
   const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : {};
 
-  return fetch(targetUrl, {
+  // ✅ [Error 525 수정, v13] 이전에는 fetch(targetUrl, { headers, ... })처럼
+  // "일반 init 객체"에 Host 헤더를 담아 넘겼다. Fetch 표준상 Host는
+  // forbidden(제한) 헤더라서, 이 경로로는 Workers 런타임이 Host 설정을
+  // 안정적으로 반영하지 않는 사례가 보고되어 있다(Cloudflare 공식 포럼:
+  // "we can't allow you to specify a Host header that is inconsistent with
+  // the routing"). 그 결과 실제로는 Host가 GHS_TARGET 그대로 나가거나
+  // 요청이 예기치 않게 처리되어, Blogger가 어떤 블로그인지 판별하지
+  // 못하고 TLS 계층까지 영향을 주어 Error 525(Origin SSL handshake
+  // failed)로 이어졌을 가능성이 높다.
+  //
+  // Cloudflare가 공식 예제/커뮤니티에서 검증한 신뢰할 수 있는 패턴은:
+  //   1) new Request(url, init)으로 먼저 Request 객체를 만들고
+  //   2) 그 Request 인스턴스의 .headers.set('Host', ...)를 호출해
+  //      헤더를 "나중에" 얹은 뒤
+  //   3) 그 Request 객체 자체를 fetch()에 전달하는 것이다.
+  // 이 순서(Request 생성 → headers.set → fetch(request))만이 Workers
+  // 런타임에서 Host 오버라이드가 실제로 origin까지 전달되는 것으로
+  // 검증된 경로다.
+  const cfInit = cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false };
+  const outboundRequest = new Request(targetUrl, {
     method  : 'GET',
     headers,
     redirect: 'manual',
-    // ✅ [SSL handshake failed 수정] targetUrl이 이미 `https://ghs.google.com/...`
-    // 이므로 resolveOverride: GHS_TARGET은 "URL host를 자기 자신으로 다시
-    // override"하는 완전한 중복 설정이었다. 무해해 보이지만, 일부 Workers
-    // 런타임에서 resolveOverride가 설정된 상태로 TLS 연결을 맺을 때 SNI/
-    // 인증서 검증 경로가 일반 fetch와 다르게 처리되어 SSL handshake 실패로
-    // 이어지는 사례가 보고되어 있다. URL 자체가 이미 정확한 목적지를
-    // 가리키므로 resolveOverride 없이 표준 fetch 경로 그대로 진행한다.
-    cf      : cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false },
+    cf      : cfInit,
   });
+  // Blogger가 어떤 블로그(커스텀 도메인)인지 판별할 수 있도록 원래 host를
+  // Host 헤더로 명시 전달. (URL 자체는 GHS_TARGET이므로 Host 헤더가 없으면
+  // Blogger가 ghs.google.com 자신으로 오인해 404/오류를 반환한다.)
+  outboundRequest.headers.set('host', url.hostname);
+
+  return fetch(outboundRequest);
 }
 
 async function proxyPass(url, request, cfOverride = null) {
