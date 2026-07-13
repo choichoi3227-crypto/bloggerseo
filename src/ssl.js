@@ -24,7 +24,7 @@
  * ─────────────────────────────────────────────────────────────────────
  */
 
-import { kvGet, kvSet, kvGetJson, kvSetJson } from './store.js';
+import { kvSet, kvGetJson, kvSetJson } from './store.js';
 
 // KV 키 prefix
 const KV_ROUTES_KEY   = 'ssl:routes';        // 등록된 라우트(도메인) 목록
