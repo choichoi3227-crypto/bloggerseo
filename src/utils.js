@@ -104,12 +104,22 @@ export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // ── 재시도 유틸 ──────────────────────────────────────────────────────
 // [v8] 서킷 브레이커와 연동: origin이 이미 열림(open) 상태면 재시도 없이
 // 즉시 실패시켜, 힘든 origin에 재시도 요청을 추가로 쏟아붓지 않는다.
+// [Error 525 수정] 502/503/504뿐 아니라 Cloudflare가 "origin(=ghs.google.com)과의
+// TLS 핸드셰이크/연결 자체"에 실패했을 때 합성하는 520~527 계열 상태 코드도
+// 모두 일시적 장애로 간주해 재시도 대상에 포함한다. 이전에는 502/503/504만
+// 재시도했기 때문에, ghs.google.com과의 TLS 핸드셰이크가 일시적으로 실패해
+// Cloudflare가 525를 반환하면 재시도 한 번 없이 그대로 방문자에게 525가
+// 노출됐다. 대부분의 525는 일시적 핸드셰이크 경합(코드 자체 문제가 아니라
+// TLS 세션 재사용/커넥션 풀 타이밍 이슈)이라 짧은 backoff 후 재시도만으로도
+// 상당수가 복구된다.
+const RETRIABLE_ORIGIN_STATUSES = [502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530];
+
 export async function retryAsync(fn, maxRetries = 2, baseDelayMs = 60) {
   let lastErr, lastResp;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const resp = await fn();
-      if (resp && ![502, 503, 504].includes(resp.status)) return resp;
+      if (resp && !RETRIABLE_ORIGIN_STATUSES.includes(resp.status)) return resp;
       lastResp = resp;
       if (attempt === maxRetries) return resp;
     } catch (e) {
