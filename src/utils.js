@@ -25,6 +25,13 @@ export function extractTagContent(html, re) {
   return (html.match(re) || ['', ''])[1].trim();
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// [v13] extractBodyText / buildMetaDescription 은 이제 worker.js의 핫패스
+// (extractPageContext)에서 wasmCore.extractBodyText / wasmCore.buildMetaDescription
+// (src/wasm-loader.js, WASM 가속 + 내장 JS 폴백)으로 대체되었다. 이 두
+// 함수는 외부에서 순수 JS 버전이 별도로 필요한 경우(테스트, 진단 등)를
+// 위해 그대로 남겨둔다.
+// ─────────────────────────────────────────────────────────────────────
 export function extractBodyText(html) {
   return html
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
