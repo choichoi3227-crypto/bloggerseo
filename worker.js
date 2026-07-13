@@ -29,6 +29,45 @@
  *       처리 버그(길이가 3의 배수가 아닌 입력에서 스퓨리어스 바이트 발생)도
  *       함께 수정.
  *
+ * v13 추가 수정 (배포 후 리포트된 "SSL handshake failed"):
+ *   5.  [resolveOverride/http3 중복·잠재 충돌 제거]
+ *       bloggerFetch()의 targetUrl이 이미 https://ghs.google.com/...을
+ *       직접 가리키도록 바뀐 뒤에도 cf.resolveOverride: GHS_TARGET이
+ *       그대로 남아있어 "URL host를 자기 자신으로 다시 override"하는
+ *       완전한 중복 설정이 되어 있었다. 일부 Workers 런타임에서
+ *       resolveOverride가 설정된 채로 TLS 연결을 맺으면 SNI/인증서 검증
+ *       경로가 일반 fetch와 달라져 SSL handshake 실패로 이어질 수 있어
+ *       제거했다. 같은 이유로 http3(QUIC) 힌트도 제거해 표준 HTTP/2 +
+ *       TLS 1.3 경로로 통일했다(argoBuildFetchOptions, 기본 cfOpts 모두).
+ *
+ * v13 수정 사항 (우선순위 3 — 에러 방지 장치):
+ *   6.  [관리 패널 하드코딩 기본 시크릿 제거 — 심각한 보안 결함]
+ *       env.PANEL_SECRET 미설정 시 소스코드에 노출된 기본값
+ *       'change-me-in-dashboard'로 조용히 폴백하던 것을 제거. 이제
+ *       PANEL_SECRET이 없거나 16자 미만이면 /panel 자체를 503으로 완전
+ *       차단한다. 인증 비교도 wasmCore.constantTimeEqual(상수시간)로 교체.
+ *   7.  [관리 패널 Bot MFA 우회 취약점 수정 — 심각한 보안 결함]
+ *       hasCloudflareBotMfa()가 클라이언트가 자유롭게 조작 가능한 HTTP
+ *       요청 헤더(cf-bot-score/cf-verified-bot)를 신뢰하던 것을, 실제
+ *       Cloudflare 엣지가 서버측에서 채워주는 request.cf.botManagement
+ *       객체 기반으로 교체. 이전 구현은 누구나 해당 헤더를 요청에 직접
+ *       붙이는 것만으로 관리 패널의 봇 MFA 체크를 완전히 우회할 수 있었다.
+ *   8.  [Durable Object Redis 손상 데이터 자동 치유 + 입력 검증]
+ *       redis-do.js: vdata JSON 파싱 실패 시 해당 키를 자동 삭제해 다음
+ *       접근부터 정상 복구되게 함(이전에는 손상 키가 영구히 500만 반환).
+ *       cmd/cmd.op/cmd.key 누락·타입 오류를 진입점에서 사전 검증.
+ *       shardOf()의 비문자열 key 방어, sendToShard()의 resp.json() 파싱
+ *       실패 방어도 추가.
+ *   9.  [인스턴스 메모리 캐시 무한 증가 방지]
+ *       store.js의 L1/L4/CNAME/RateLimit 메모리 Map들에 크기 상한과
+ *       자동 축출(만료 우선, 그다음 최오래된 항목) 로직 추가 — 다양한
+ *       키가 계속 유입되는 대형/멀티테넌트 배포에서 장시간 실행 시
+ *       메모리 사용량이 무한정 늘어나는 것을 방지.
+ *  10.  [미사용 import 정리] routing.js의 죽은 fnv1a32Hex import, security.js/
+ *       ssl.js/cache-reserve.js의 죽은 kvGet/kvSet import 제거.
+ *  11.  [비문자열 key 방어] store.js의 preferKvFirst/clampTtlForKey/kvScan이
+ *       key/pattern이 문자열이 아닐 때 TypeError로 죽지 않도록 방어.
+ *
  * v9 수정 사항 (v8 대비):
  *   1.  [리디렉션 과다 수정] 슬러그 확정 시 발생하던 이중 301 지점을 하나로
  *       통합. 방금 슬러그가 새로 생성된 요청은 그 자리에서 바로 렌더링하고,
@@ -1069,13 +1108,22 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
   // Argo 라우팅 힌트 헤더
   if (argoCtx?.region) headers.set('x-argo-region', argoCtx.region);
 
-  const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : { http3: true };
+  // ✅ [SSL handshake failed 수정, v13] http3 힌트 제거 — argoBuildFetchOptions와
+  // 동일한 이유(QUIC 협상 불안정성으로 인한 handshake 실패 가능성 배제).
+  const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : {};
 
   return fetch(targetUrl, {
     method  : 'GET',
     headers,
     redirect: 'manual',
-    cf      : cfOverride || { ...cfOpts, resolveOverride: GHS_TARGET, cacheTtl: 0, cacheEverything: false },
+    // ✅ [SSL handshake failed 수정] targetUrl이 이미 `https://ghs.google.com/...`
+    // 이므로 resolveOverride: GHS_TARGET은 "URL host를 자기 자신으로 다시
+    // override"하는 완전한 중복 설정이었다. 무해해 보이지만, 일부 Workers
+    // 런타임에서 resolveOverride가 설정된 상태로 TLS 연결을 맺을 때 SNI/
+    // 인증서 검증 경로가 일반 fetch와 다르게 처리되어 SSL handshake 실패로
+    // 이어지는 사례가 보고되어 있다. URL 자체가 이미 정확한 목적지를
+    // 가리키므로 resolveOverride 없이 표준 fetch 경로 그대로 진행한다.
+    cf      : cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false },
   });
 }
 
@@ -1092,10 +1140,31 @@ async function proxyPass(url, request, cfOverride = null) {
 // 관리 패널
 // ─────────────────────────────────────────────
 async function handlePanel(request, url, env, ctx) {
-  // 인증 체크
+  // ✅ [에러 방지 장치 — 심각한 보안 결함 수정] 이전에는 env.PANEL_SECRET이
+  // 설정되지 않은 경우 하드코딩된 기본값 'change-me-in-dashboard'로
+  // 조용히 폴백했다. 이 값은 공개 소스코드에 그대로 노출되어 있으므로,
+  // 배포자가 실수로 PANEL_SECRET 환경변수/시크릿 설정을 빠뜨리면 관리
+  // 패널(KV/DO 데이터 조회·삭제, IP 차단 해제, 캐시 플러시 등 민감한
+  // 작업 포함)이 사실상 인증 없이 전체 인터넷에 노출되는 심각한 보안
+  // 결함이었다. 이제는 PANEL_SECRET이 설정되지 않았거나 너무 짧으면
+  // (추측이 쉬운 값 방지) 어떤 입력으로도 절대 통과할 수 없는 503으로
+  // 명확히 차단하고, 콘솔에 이유를 남긴다.
+  if (!env.PANEL_SECRET || env.PANEL_SECRET.length < 16) {
+    return new Response(
+      'Admin panel disabled: PANEL_SECRET is not configured (or is too short). ' +
+      'Set a strong PANEL_SECRET (16+ chars) in your Worker secrets/environment ' +
+      'variables (wrangler secret put PANEL_SECRET) before using /panel.',
+      { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }
+    );
+  }
+  // 인증 체크 — 상수시간 비교(WASM 가속, wasmCore.constantTimeEqual)로
+  // 타이밍 공격을 방지한다. 이전의 `auth !== secret`은 문자열 비교 시
+  // 첫 불일치 문자에서 조기 종료되는 JS 엔진 특성상 이론적으로 타이밍
+  // 차이를 이용한 무차별 대입에 노출될 수 있었다.
   const auth   = request.headers.get('x-panel-secret') || url.searchParams.get('secret') || '';
-  const secret = env.PANEL_SECRET || 'change-me-in-dashboard';
-  if (auth !== secret || !hasCloudflareBotMfa(request, env)) {
+  const secret = env.PANEL_SECRET;
+  const authOk = await wasmCore.constantTimeEqual(auth, secret);
+  if (!authOk || !hasCloudflareBotMfa(request, env)) {
     return new Response(panelLoginHtml(), {
       status : 401,
       headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
