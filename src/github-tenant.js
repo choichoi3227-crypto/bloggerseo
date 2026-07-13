@@ -1,6 +1,19 @@
 // ═══════════════════════════════════════════════════════════════════
 // [GitHub Tenant Coordinator] — Durable Objects 완전 대체
 //
+// ⚠️ [에러 방지 장치 — 활성화 상태 안내] 이 모듈은 현재 worker.js
+//    어디에서도 import되지 않는 "미연결(대기)" 상태다. 즉 아래 함수들은
+//    지금 배포된 Worker의 실제 요청 처리 경로에 전혀 관여하지 않는다.
+//    (동시성/circuit breaker는 현재 TenantCoordinator DO 또는 인스턴스
+//    메모리 기반 경로로만 동작 중이며, 이 파일이 그 경로를 대체하지
+//    않는다.) 이 파일이 참조하는 wasm.sha256HexShort/hmacSha256Hex/
+//    constantTimeEqual은 v13에서 wasm-loader.js의 wasmCore에 정식으로
+//    연결되어 함수 자체는 정상 동작하지만(우선순위 2 참고), 이 모듈을
+//    실제로 활성화하려면 worker.js에서 명시적으로 import해 호출부를
+//    연결하고 env.STATE_SIGNING_KEY, GitHub PAT 등 필요한 바인딩/시크릿을
+//    별도로 구성해야 한다. 향후 GitHub 레포 기반 테넌트 상태 관리를
+//    실제로 쓰기로 결정하면 이 주석을 제거하고 연결 작업을 진행할 것.
+//
 // 기존 TenantCoordinator(Durable Object)가 메모리에 들고 있던 상태
 // (inFlight, consecutiveFailures, circuitOpenUntil, totalRequests,
 //  totalRejected)를 GitHub 레포(state/tenants/{hash}.json)에 직접
