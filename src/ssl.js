@@ -8,19 +8,39 @@
  * ✅ 패널에서 라우트(도메인) 추가·삭제·목록 관리
  * ✅ 인증서 상태를 DNS + TLS 핸드셰이크로 직접 확인 (API 불필요)
  * ✅ 자동 갱신 — Cloudflare Universal SSL이 90일마다 자동 처리
+ * ✅ 블로그스팟(Blogger)에 별도 SSL 인증서 발급이 전혀 필요 없음
  *
  * ── 동작 원리 ──────────────────────────────────────────────────────
  *  Cloudflare Zone에 도메인 DNS가 연결되어 있으면,
- *  Cloudflare Universal SSL이 자동으로 인증서를 발급·갱신합니다.
+ *  Cloudflare Universal SSL이 방문자용 인증서를 자동으로 발급·갱신합니다.
  *  Worker는 그 앞단에서:
  *    1) HTTP 요청 → 301 HTTPS 리디렉션 (즉시, 설정 불필요)
  *    2) 요청 host를 KV에 자동 저장 → 패널 라우트 목록에 표시
  *    3) TLS 핸드셰이크 메타데이터로 인증서 상태를 직접 확인
  *    4) 패널에서 수동 라우트 추가/삭제 가능
  *
- *  블로그스팟 특이사항:
- *    방문자 ──HTTPS──▶ Cloudflare Worker ──HTTP──▶ ghs.google.com
- *    (Cloudflare Flexible SSL 모드 — 원본이 HTTP여도 방문자는 HTTPS)
+ *  블로그스팟 특이사항 (SSL 발급 불필요 + Error 525 방지의 핵심):
+ *    방문자 ──HTTPS──▶ Cloudflare 엣지 ──HTTP or HTTPS──▶ Worker 실행
+ *                                                    │
+ *                                                    └─ Worker 내부 fetch()
+ *                                                       ──HTTPS──▶ ghs.google.com
+ *                                                       (Host: 커스텀도메인)
+ *
+ *    ✅ [SSL 인증서 발급 불필요] Worker는 커스텀 도메인(블로그스팟에 연결된
+ *       개인 도메인) 자체로는 절대 origin에 접속하지 않는다. 항상
+ *       ghs.google.com(구글이 관리하는 유효 인증서 보유 호스트)으로 직접
+ *       접속하고, 그 안에서 Host 헤더로만 어떤 블로그인지 구분한다. 즉
+ *       "블로그스팟에서 개인도메인용 SSL 인증서를 발급"하는 절차 자체가
+ *       필요 없다 — 그 절차를 Worker가 완전히 대체한다.
+ *    ✅ [Error 525 방지] 방문자 ↔ Cloudflare 엣지 구간의 SSL/TLS 모드는
+ *       Cloudflare 대시보드에서 "Flexible"로 두어도 항상 정상 동작한다.
+ *       Full/Full(strict) 모드는 Cloudflare 엣지가 "커스텀 도메인 자신"에
+ *       대한 유효 인증서를 요구하는데, 블로그스팟 커스텀 도메인은 원래
+ *       그런 인증서가 없으므로 그 모드에서는 Error 525(또는 526)가 발생할
+ *       수 있다. 이 Worker의 origin fetch는 (위 그림처럼) 커스텀 도메인이
+ *       아니라 ghs.google.com으로 직접 나가므로 Flexible 모드에서 아무
+ *       문제 없이 동작하도록 설계되어 있다. 반드시 Cloudflare 대시보드 →
+ *       SSL/TLS → Overview 에서 암호화 모드를 "Flexible"로 설정할 것.
  * ─────────────────────────────────────────────────────────────────────
  */
 
@@ -311,6 +331,14 @@ export async function getSslStatus(env) {
     unavailableCount,
     httpsEnforced: true,   // Worker 레벨에서 항상 강제
     autoRenew    : true,   // Cloudflare Universal SSL 자동 갱신
+    // ✅ [Error 525 안내] Cloudflare 대시보드의 SSL/TLS 암호화 모드는
+    // 반드시 "Flexible"이어야 한다. 이 Worker의 origin fetch는 항상
+    // ghs.google.com으로 직접 나가므로 블로그스팟 커스텀 도메인 자체의
+    // 인증서 발급은 불필요하지만, 방문자 ↔ Cloudflare 엣지 구간의 모드가
+    // Full/Full(strict)로 설정되어 있으면 Cloudflare가 (Worker와 무관하게)
+    // 엣지 단계에서 자체적으로 Error 525/526을 반환할 수 있다.
+    recommendedSslMode: 'Flexible',
+    blogspotCertRequired: false,
     ts           : new Date().toISOString(),
   };
 }
