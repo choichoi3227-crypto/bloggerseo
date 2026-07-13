@@ -1,7 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════
-// bloggerseo WASM core v5
-// 변경: KV-less 자체 NoSQL 스토리지 지원, 슬러그 버그 수정,
-//       고성능 인코딩/암호화, 안정성 강화
+// bloggerseo WASM core v13 (우선순위 2: WASM 사용 확대)
+// v13 추가:
+//   - rawExtractBodyText: HTML→본문 텍스트 추출 O(n) 단일 패스
+//     (script/style 블록 스킵 + 태그 제거 + 공백 압축, JS 정규식 3연쇄 대체)
+//   - rawBuildMetaDescription: CJK-aware(한글/한자 폭 2) meta description
+//     생성 — 표시 폭 기준 160 근처에서 자연스럽게 절단
+//   - rawSha256Hex / rawHmacSha256Hex / rawConstantTimeEqual: 버퍼 API
+//     관례에 맞춘 문자열 반환 래퍼 (wasm-loader.js에서 실사용 wire)
+//   - rawBase64Decode: rawBase64Encode의 역함수
+// v5까지: KV-less 자체 NoSQL 스토리지 지원, 슬러그 버그 수정,
+//         고성능 인코딩/암호화, 안정성 강화
 // ═══════════════════════════════════════════════════════════════════
 
 // ── 버퍼 설정 ──────────────────────────────────────────────────────
@@ -374,18 +382,269 @@ export function rawUrlEncode(inLen: i32): i32 {
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 export function rawBase64Encode(inLen: i32): i32 {
+  // [버그 수정] 기존 `(i - 1 < inLen)` / `(i < inLen + 1)` 조건은 루프
+  // 내부에서 이미 증가된 i를 기준으로 판단해 항상 참이 되어, 입력 길이가
+  // 3의 배수가 아닌 경우에도 패딩('=')이 전혀 붙지 않는 문제가 있었다
+  // (예: 26바이트 입력 → 마지막 그룹에 b2가 없는데도 4문자 전부 실제 문자로
+  // 출력됨). 그룹 시작 시점의 "남은 바이트 수"를 기준으로 명확히 판단한다.
   let out = "";
   let i = 0;
   while (i < inLen) {
+    const remaining = inLen - i; // 이 그룹에서 실제로 존재하는 바이트 수(1~3)
     const b0 = INPUT_BUF[i++];
     const b1 = i < inLen ? INPUT_BUF[i++] : 0;
     const b2 = i < inLen ? INPUT_BUF[i++] : 0;
     out += B64_CHARS.charAt((b0 >> 2) & 0x3f);
     out += B64_CHARS.charAt(((b0 & 0x3) << 4) | (b1 >> 4));
-    out += (i - 1 < inLen) ? B64_CHARS.charAt(((b1 & 0xf) << 2) | (b2 >> 6)) : "=";
-    out += (i < inLen + 1) ? B64_CHARS.charAt(b2 & 0x3f) : "=";
+    out += (remaining > 1) ? B64_CHARS.charAt(((b1 & 0xf) << 2) | (b2 >> 6)) : "=";
+    out += (remaining > 2) ? B64_CHARS.charAt(b2 & 0x3f) : "=";
   }
   return writeOutputUtf8(out);
 }
 
-export function wasmVersion(): string { return "bloggerseo-wasm-5.0.0"; }
+// ── [8] HTML → 본문 텍스트 추출 (script/style 제거 + 태그 제거 + 공백 압축) ──
+// JS의 정규식 3연쇄(.replace(script).replace(style).replace(tag)) 를 단일
+// 순방향 스캔으로 대체 — 대형 HTML(수십~수백KB)에서 정규식 백트래킹/중간
+// 문자열 재할당 비용을 없애고 O(n) 단일 패스로 처리한다.
+// 상태 머신: NORMAL / IN_TAG / IN_SCRIPT / IN_STYLE
+function matchesTagName(bytes: Uint8Array, pos: i32, len: i32, name: string): bool {
+  // pos는 '<' 다음 위치. name(예: "script")과 대소문자 무시 비교 후
+  // 다음 문자가 태그명 경계(공백/'>'/'/')인지 확인.
+  const nlen = name.length;
+  if (pos + nlen > len) return false;
+  for (let i = 0; i < nlen; i++) {
+    let c = bytes[pos + i];
+    if (c >= 65 && c <= 90) c += 32; // toLower
+    const nc = name.charCodeAt(i);
+    if (c != nc) return false;
+  }
+  if (pos + nlen < len) {
+    const after = bytes[pos + nlen];
+    if (after != 32 && after != 62 && after != 47 && after != 9 && after != 10 && after != 13) return false;
+  }
+  return true;
+}
+
+export function rawExtractBodyText(inLen: i32): i32 {
+  const bytes = new Uint8Array(inLen);
+  for (let i = 0; i < inLen; i++) bytes[i] = INPUT_BUF[i];
+
+  let out = "";
+  let i = 0;
+  let lastWasSpace = true; // 선행 공백 생략
+  const SCRIPT = "script", STYLE = "style";
+
+  while (i < inLen) {
+    const c = bytes[i];
+    if (c == 60 /* '<' */) {
+      // 종료 스크립트/스타일 태그인지, 시작 태그인지 판별해 해당 블록을 스킵
+      let closeTagLen = 0;
+      let isCloseScript = false, isCloseStyle = false;
+      if (i + 1 < inLen && bytes[i + 1] == 47 /* '/' */) {
+        if (matchesTagName(bytes, i + 2, inLen, SCRIPT)) { isCloseScript = true; }
+        else if (matchesTagName(bytes, i + 2, inLen, STYLE)) { isCloseStyle = true; }
+      }
+      const isOpenScript = matchesTagName(bytes, i + 1, inLen, SCRIPT);
+      const isOpenStyle  = matchesTagName(bytes, i + 1, inLen, STYLE);
+
+      if (isOpenScript || isOpenStyle) {
+        // 여는 태그 자체를 건너뛰고, 대응하는 닫는 태그까지 전부 스킵
+        const wantClose = isOpenScript ? SCRIPT : STYLE;
+        // '>' 까지 이동
+        while (i < inLen && bytes[i] != 62) i++;
+        i++; // '>' 다음으로
+        // 닫는 태그 검색
+        let found = false;
+        while (i < inLen) {
+          if (bytes[i] == 60 && i + 1 < inLen && bytes[i + 1] == 47 &&
+              matchesTagName(bytes, i + 2, inLen, wantClose)) {
+            found = true;
+            break;
+          }
+          i++;
+        }
+        if (found) {
+          while (i < inLen && bytes[i] != 62) i++;
+          i++; // '>' 다음
+        }
+        // ✅ [버그 수정] script/style 블록 전체를 제거한 뒤 앞뒤 텍스트가
+        // 공백 없이 붙어버리는 문제(예: "안녕<style>...</style>Hello" →
+        // "안녕Hello"가 되어 서로 다른 단어가 합성어처럼 붙음)를 막기 위해
+        // 일반 태그와 동일하게 공백 구분자를 삽입한다.
+        if (!lastWasSpace && out.length > 0) { out += " "; lastWasSpace = true; }
+        continue;
+      }
+      if (isCloseScript || isCloseStyle) {
+        while (i < inLen && bytes[i] != 62) i++;
+        i++;
+        continue;
+      }
+      // 일반 태그: '>' 까지 스킵하고 공백 하나로 치환
+      while (i < inLen && bytes[i] != 62) i++;
+      i++; // '>' 다음
+      if (!lastWasSpace && out.length > 0) { out += " "; lastWasSpace = true; }
+      continue;
+    }
+
+    // 일반 문자: UTF-8 시퀀스 길이 판별 후 그대로 복사 (공백류는 압축)
+    let seqLen = 1;
+    if ((c & 0xe0) == 0xc0) seqLen = 2;
+    else if ((c & 0xf0) == 0xe0) seqLen = 3;
+    else if ((c & 0xf8) == 0xf0) seqLen = 4;
+
+    const isAsciiSpace = (c == 32 || c == 9 || c == 10 || c == 13);
+    if (isAsciiSpace) {
+      if (!lastWasSpace) { out += " "; lastWasSpace = true; }
+      i++;
+      continue;
+    }
+
+    // UTF-8 멀티바이트 문자를 문자열로 디코드해서 추가 (드물게 잘린 시퀀스는
+    // 안전하게 남은 바이트만큼만 사용)
+    const avail = inLen - i;
+    const n = seqLen < avail ? seqLen : avail;
+    const chunk = new Uint8Array(n);
+    for (let k = 0; k < n; k++) chunk[k] = bytes[i + k];
+    out += utf8Decode(chunk);
+    lastWasSpace = false;
+    i += n;
+  }
+
+  // 끝의 공백 제거 (trim)
+  let start = 0, end = out.length;
+  while (start < end && out.charCodeAt(start) == 32) start++;
+  while (end > start && out.charCodeAt(end - 1) == 32) end--;
+  return writeOutputUtf8(out.substring(start, end));
+}
+
+// ── [9] CJK-aware meta description 빌더 ────────────────────────────
+// 한글/한자/가나(전각) 1글자를 폭 2로, 그 외(ASCII 등, 반각)를 폭 1로
+// 계산해 "실제 노출 폭" 기준 160 근처에서 자연스럽게 자른다. 기존 JS
+// 구현(bodyText.length > 160 단순 문자수 컷)은 한글처럼 폭이 넓은
+// 문자가 많은 본문에서 실제 표시 폭 기준으로는 지나치게 길게 잘리는
+// 문제가 있었다 — 대부분의 한국어 SEO 도구(네이버 등)가 검색결과
+// 미리보기를 표시 폭 기준으로 자르는 것과 일치시킨다.
+function isWideChar(cp: i32): bool {
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) || // 한글 자모
+    (cp >= 0x2e80 && cp <= 0xa4cf) || // CJK 부수/한자 영역 전반
+    (cp >= 0xac00 && cp <= 0xd7a3) || // 완성형 한글
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK 호환 한자
+    (cp >= 0xff00 && cp <= 0xff60) || // 전각 기호
+    (cp >= 0xffe0 && cp <= 0xffe6)
+  );
+}
+
+export function rawBuildMetaDescription(bodyLen: i32, titleLen: i32, maxWidth: i32): i32 {
+  const body  = readInputUtf8(bodyLen);
+  // titleLen > 0이면 INPUT_BUF2에서 title을 읽어 본문 앞부분에서 제거 시도
+  let text = body;
+  if (titleLen > 0) {
+    const ptr = changetype<usize>(INPUT_BUF2);
+    const tbytes = new Uint8Array(titleLen);
+    for (let i = 0; i < titleLen; i++) tbytes[i] = load<u8>(ptr + i);
+    const title = utf8Decode(tbytes);
+    const idx = text.indexOf(title);
+    if (idx >= 0) text = text.substring(0, idx) + text.substring(idx + title.length);
+  }
+  // 앞뒤 공백 trim
+  let s = 0, e = text.length;
+  while (s < e && text.charCodeAt(s) == 32) s++;
+  while (e > s && text.charCodeAt(e - 1) == 32) e--;
+  text = text.substring(s, e);
+
+  const limit = maxWidth > 0 ? maxWidth : 160;
+  let width = 0;
+  let cutAt = -1;      // 마지막 공백 위치(폭 기준 fallback 절단점)
+  let cutAtWidth = 0;
+  let result = "";
+  let truncated = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const cp = text.charCodeAt(i);
+    const w  = isWideChar(cp) ? 2 : 1;
+    if (width + w > limit) { truncated = true; break; }
+    if (cp == 32 && width > 100) { cutAt = i; cutAtWidth = width; }
+    width += w;
+    result += String.fromCharCode(cp);
+  }
+
+  if (truncated) {
+    if (cutAt >= 0 && cutAtWidth > 100) {
+      result = text.substring(0, cutAt);
+    }
+    result += "…";
+  }
+  return writeOutputUtf8(result);
+}
+
+// ── [10] SHA-256 / HMAC — 저수준 버퍼 API 문자열 hex 출력 래퍼 ──────
+// wasm-loader.js가 버퍼 기반(rawXxx) 관례로 호출할 수 있도록 노출.
+export function rawSha256Hex(inLen: i32): i32 {
+  const copy = new Uint8Array(inLen);
+  for (let i = 0; i < inLen; i++) copy[i] = INPUT_BUF[i];
+  const hex = bytesToHex(sha256Digest(copy));
+  return writeOutputUtf8(hex);
+}
+export function rawHmacSha256Hex(keyLen: i32, msgLen: i32): i32 {
+  const key = new Uint8Array(keyLen);
+  for (let i = 0; i < keyLen; i++) key[i] = INPUT_BUF[i];
+  const message = new Uint8Array(msgLen);
+  for (let i = 0; i < msgLen; i++) message[i] = INPUT_BUF2[i];
+  const hex = bytesToHex(hmacSha256Raw(key, message));
+  return writeOutputUtf8(hex);
+}
+// 상수시간 비교: 두 hex 다이제스트를 INPUT_BUF / INPUT_BUF2에 각각 담아 호출.
+export function rawConstantTimeEqual(aLen: i32, bLen: i32): i32 {
+  if (aLen != bLen) {
+    // 길이가 달라도 dummy 비교로 타이밍을 흡수한 뒤 false(0) 반환
+    let dummy: i32 = 0;
+    const maxLen = aLen > bLen ? aLen : bLen;
+    for (let i = 0; i < maxLen; i++) {
+      const ca = i < aLen ? INPUT_BUF[i] : 0;
+      const cb = i < bLen ? INPUT_BUF2[i] : 0;
+      dummy |= ca ^ cb;
+    }
+    return 0;
+  }
+  let diff: i32 = 0;
+  for (let i = 0; i < aLen; i++) diff |= INPUT_BUF[i] ^ INPUT_BUF2[i];
+  return diff == 0 ? 1 : 0;
+}
+
+// ── [11] Base64 디코딩 (rawBase64Encode의 역함수) ───────────────────
+function b64CharVal(c: i32): i32 {
+  if (c >= 65 && c <= 90) return c - 65;         // A-Z
+  if (c >= 97 && c <= 122) return c - 97 + 26;   // a-z
+  if (c >= 48 && c <= 57) return c - 48 + 52;    // 0-9
+  if (c == 43) return 62;                         // +
+  if (c == 47) return 63;                         // /
+  return -1; // '=' 또는 패딩/무효 문자
+}
+export function rawBase64Decode(inLen: i32): i32 {
+  // [버그 수정] '=' 패딩 문자를 단순히 "건너뛰기"만 하면, 6비트 누적
+  // 상태(bits)가 패딩 이후에도 계속 이어지다 마지막에 남은 조각을 추가로
+  // flush해 실제 데이터보다 1바이트 더 많은 출력이 생길 수 있었다(예:
+  // 26바이트 원본을 인코딩→디코딩하면 27바이트로 복원되며 끝에 스퓨리어스
+  // null 바이트가 붙음). 표준 Base64 규격대로 '=' 를 만나는 즉시 디코딩을
+  // 종료한다.
+  const out = new Uint8Array(inLen); // 디코딩 결과는 항상 입력보다 작거나 같음
+  let outLen = 0;
+  let buffer: i32 = 0;
+  let bits = 0;
+  for (let i = 0; i < inLen; i++) {
+    const c = INPUT_BUF[i];
+    if (c == 61 /* '=' */) break; // 패딩 시작 → 즉시 종료
+    const v = b64CharVal(c);
+    if (v < 0) continue; // 개행/공백 등 base64 알파벳이 아닌 문자만 무시
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[outLen++] = u8((buffer >> bits) & 0xff);
+    }
+  }
+  return writeOutputBytes(out.subarray(0, outLen));
+}
+
+export function wasmVersion(): string { return "bloggerseo-wasm-13.0.0"; }
