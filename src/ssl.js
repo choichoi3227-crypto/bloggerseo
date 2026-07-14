@@ -59,45 +59,57 @@ const CERT_CHECK_TTL  = 3600 * 24;           // 상태 갱신: 24시간마다
  * handleFetch() 최상단에서 호출.
  * http:// 요청이면 즉시 301 https://로 보내고, 이미 https면 null 반환.
  *
- * [리디렉션 루프 수정 v12] "Cloudflare에서 이 도메인의 레코드를 Proxied
- * (주황 구름)로 켜면 ERR_TOO_MANY_REDIRECTS가 뜬다" 문제의 실제 원인.
+ * [리디렉션 루프 근본 수정 v15] "Flexible 모드에서 항상 리디렉션 무한
+ * 루프(ERR_TOO_MANY_REDIRECTS)에 빠진다" 문제의 실제 원인.
  *
- * 기존 코드는 `new URL(request.url).protocol`만으로 HTTP/HTTPS를
- * 판단했다. 이 판단은 Cloudflare가 Worker에 request.url을 어떻게
- * 구성해 넘기는지에 암묵적으로 의존하는데, 아래 조건에서 실제 방문자는
- * 이미 HTTPS로 접속했음에도 request.url이 http:// 스킴으로 관측될 수
- * 있다(예: SSL/TLS 모드가 Flexible인 상태로 Proxied를 켰을 때, 또는
- * Cloudflare 엣지 ↔ Worker 런타임 사이의 프로토콜 정규화 방식에 따라).
- * 이 경우 매 요청마다:
- *   1) enforceHttpsRedirect가 "http:// 요청"으로 오판 → 301 https://
- *   2) 브라우저가 https://로 재요청 → Cloudflare가 다시 Worker로 프록시
- *   3) Worker에서 또 http://로 관측 → 다시 1)로 복귀
- *   → 무한 루프(ERR_TOO_MANY_REDIRECTS)
+ * v12~v14는 `cf-visitor` 헤더를 최우선 신호로 사용했다. 그런데 `cf-visitor`
+ * 의 scheme 필드는 "방문자가 실제로 접속한 프로토콜"이 아니라 "Cloudflare
+ * 엣지가 origin에게 어떤 프로토콜로 갈 것인지"를 나타내는 필드다. Flexible
+ * SSL 모드의 정의 자체가 "방문자 ↔ 엣지는 HTTPS, 엣지 ↔ origin은 HTTP로
+ * 취급"이므로, Flexible 모드에서는 방문자가 실제로 https://로 접속했어도
+ * `cf-visitor`가 **항상 `{"scheme":"http"}`로 채워진다.** 이 Worker는
+ * Blogger 프록시 특성상 SSL/TLS 모드를 반드시 Flexible로 설정해야 하므로
+ * (원리는 파일 상단 주석 참고), 이전 우선순위대로라면:
+ *   1) resolveVisitorScheme가 cf-visitor를 최우선으로 신뢰 → 매번 'http'로
+ *      오판 (방문자가 실제로는 https로 접속했어도)
+ *   2) enforceHttpsRedirect가 "아직 http" 판정 → 301 https:// 리디렉션
+ *   3) 브라우저가 https://로 재요청해도 Cloudflare는 여전히 Flexible이라
+ *      cf-visitor를 또 http로 채움 → 다시 1)로 복귀
+ *   → 무한 루프. 이것이 Flexible 모드(이 Worker가 요구하는 설정)에서
+ *   "항상" 리디렉션 루프에 빠지는 근본 원인이었다.
  *
- * 방문자가 실제로 어떤 프로토콜로 접속했는지는 url.protocol보다
- * Cloudflare가 엣지에서 직접 채워주는 헤더가 훨씬 신뢰도가 높다:
- *   - `cf-visitor`: JSON 문자열 {"scheme":"https"} — Cloudflare 프록시
- *     경유 요청에는 거의 항상 존재하며, 엣지가 실제로 받은 스킴을 담는다.
- *   - `x-forwarded-proto`: 다수의 프록시/로드밸런서가 채우는 표준 헤더.
- * 이 헤더들 중 하나라도 "https"를 가리키면 이미 HTTPS이므로 리디렉션을
- * 절대 발생시키지 않는다. 두 헤더가 전혀 없는 경우(Cloudflare를 거치지
- * 않은 극히 예외적 상황 등)에만 기존처럼 url.protocol로 최종 폴백한다.
+ * v15 수정: 방문자가 실제로 어떤 프로토콜로 "Cloudflare 엣지와 TLS
+ * 핸드셰이크"를 했는지는 `request.cf.tlsVersion`가 훨씬 신뢰도 높은
+ * 신호다. 이 필드는 Cloudflare 엣지가 방문자와 실제로 TLS 핸드셰이크를
+ * 완료했을 때만(=방문자가 실제로 https://로 접속했을 때만) 채워지며,
+ * Flexible/Full 등 SSL 모드나 엣지↔origin 프로토콜 취급 방식과 무관하게
+ * 항상 정확하다. 이제 이 필드를 최우선으로 사용하고, cf-visitor/
+ * x-forwarded-proto는 "https를 가리킬 때만" 보조적으로 신뢰한다(둘 다
+ * "http"를 가리켜도 그 자체만으로 리디렉션을 강제하지 않는다 — Flexible
+ * 모드에서는 이 값이 origin 프로토콜을 뜻할 뿐, 방문자 프로토콜의 반증이
+ * 아니기 때문이다). 세 신호 모두 없는 극히 예외적 경우에만 최종적으로
+ * url.protocol로 폴백한다.
  */
 function resolveVisitorScheme(request) {
-  // 1순위: cf-visitor 헤더 (Cloudflare 엣지가 직접 채움, 가장 신뢰도 높음)
+  // 1순위: request.cf.tlsVersion — Cloudflare 엣지가 방문자와 실제로 TLS
+  // 핸드셰이크를 완료했을 때만 채워지는 필드. SSL/TLS 모드(Flexible 포함)
+  // 와 무관하게 "방문자가 실제로 https로 접속했는지"를 가장 정확히 반영.
+  if (request.cf && request.cf.tlsVersion) return 'https';
+  // 2순위: cf-visitor 헤더 — "https"를 가리킬 때만 신뢰한다. Flexible
+  // 모드에서는 이 값이 항상 "http"로 채워지므로(엣지→origin 프로토콜을
+  // 나타낼 뿐), "http"라는 결과 자체는 리디렉션 근거로 쓰지 않는다.
   const cfVisitor = request.headers.get('cf-visitor');
   if (cfVisitor) {
     try {
       const parsed = JSON.parse(cfVisitor);
-      if (parsed && typeof parsed.scheme === 'string') return parsed.scheme.toLowerCase();
+      if (parsed && typeof parsed.scheme === 'string' && parsed.scheme.toLowerCase() === 'https') {
+        return 'https';
+      }
     } catch (_) { /* 파싱 실패 시 다음 신호로 폴백 */ }
   }
-  // 2순위: x-forwarded-proto (표준 프록시 헤더, 콤마 구분 시 첫 값 사용)
+  // 3순위: x-forwarded-proto — 마찬가지로 "https"를 가리킬 때만 신뢰.
   const xfp = request.headers.get('x-forwarded-proto');
-  if (xfp) return xfp.split(',')[0].trim().toLowerCase();
-  // 3순위: request.cf.tlsVersion 존재 여부 — Workers가 TLS 핸드셰이크를
-  // 직접 처리한 요청(HTTPS)에만 채워지는 필드
-  if (request.cf && request.cf.tlsVersion) return 'https';
+  if (xfp && xfp.split(',')[0].trim().toLowerCase() === 'https') return 'https';
   return null; // 신호 없음 → 호출부에서 url.protocol로 최종 폴백
 }
 
