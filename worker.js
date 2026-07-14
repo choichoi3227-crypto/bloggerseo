@@ -1110,10 +1110,31 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
     throw new Error('bloggerFetch self-call guard: request host equals GHS_TARGET unexpectedly, refusing to fetch self.');
   }
 
-  // ✅ v13: DNS 조회 힌트가 아니라 fetch 대상 자체를 Blogger 인프라로
-  // 직접 고정한다. Proxied(주황 구름) 여부, DNS 레코드 타입(A/CNAME),
-  // resolveOverride의 zone 제약과 완전히 무관하게 항상 Blogger로 나간다.
-  const targetUrl = `https://${GHS_TARGET}${url.pathname}${qs}`;
+  // ✅ [Error 525 근본 수정, v14] v13까지는 fetch target host 자체를
+  // ghs.google.com으로 고정하고 Host 헤더만 원래 커스텀 도메인으로
+  // 얹었다 — 즉 TLS SNI는 'ghs.google.com', HTTP Host 헤더는 커스텀
+  // 도메인으로 서로 달랐다. 무한 루프는 확실히 막았지만, 실서비스에서는
+  // Google 프론트엔드가 "SNI와 Host 헤더가 불일치하는 요청"을 TLS
+  // 핸드셰이크 단계에서 거부하는 사례가 있고, Cloudflare는 이를 525로
+  // 합성해 반환한다. 즉 v13 방식은 안전하지만 원본(Google) 쪽에서
+  // 차단될 수 있는 패턴이었다.
+  //
+  // v14는 SNI와 Host를 항상 일치시킨다: fetch target host를 원래 커스텀
+  // 도메인 그대로 두고, 그 도메인의 실제 DNS(CNAME 체인)가 정말로
+  // ghs.google.com을 가리키는지 warmCname()으로 먼저 확인한다.
+  //   • DNS가 실제로 ghs.google.com을 가리키는 경우(정상 Blogger 커스텀
+  //     도메인 설정): fetch host를 원래 도메인 그대로 사용해도 Worker
+  //     내부의 fetch()는 Cloudflare 존의 프록시 레코드가 아니라 실제
+  //     퍼블릭 DNS 조회 결과로 연결되므로, 결국 Blogger 인프라로 정확히
+  //     연결되면서 SNI=Host=실제 방문 도메인인 "완전히 정상적인" HTTPS
+  //     요청이 된다. (무한 루프가 재발하지 않는 이유: 이 zone/Route가
+  //     서비스하는 도메인이 ghs.google.com을 직접 CNAME으로 가리킬 수는
+  //     없으므로 — Blogger가 Google 소유이지 이 zone 소유가 아니다.)
+  //   • DNS가 아직 ghs.google.com을 가리키지 않는(오설정/전파 지연) 경우만
+  //     예외적으로 GHS_TARGET 직접 접속 폴백(v13 방식)을 사용한다.
+  const dnsConfirmedGhs = await warmCname(url.hostname).catch(() => false);
+  const targetHost = dnsConfirmedGhs ? url.hostname : GHS_TARGET;
+  const targetUrl  = `https://${targetHost}${url.pathname}${qs}`;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
@@ -1129,24 +1150,11 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
   // 동일한 이유(QUIC 협상 불안정성으로 인한 handshake 실패 가능성 배제).
   const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : {};
 
-  // ✅ [Error 525 수정, v13] 이전에는 fetch(targetUrl, { headers, ... })처럼
-  // "일반 init 객체"에 Host 헤더를 담아 넘겼다. Fetch 표준상 Host는
-  // forbidden(제한) 헤더라서, 이 경로로는 Workers 런타임이 Host 설정을
-  // 안정적으로 반영하지 않는 사례가 보고되어 있다(Cloudflare 공식 포럼:
-  // "we can't allow you to specify a Host header that is inconsistent with
-  // the routing"). 그 결과 실제로는 Host가 GHS_TARGET 그대로 나가거나
-  // 요청이 예기치 않게 처리되어, Blogger가 어떤 블로그인지 판별하지
-  // 못하고 TLS 계층까지 영향을 주어 Error 525(Origin SSL handshake
-  // failed)로 이어졌을 가능성이 높다.
-  //
-  // Cloudflare가 공식 예제/커뮤니티에서 검증한 신뢰할 수 있는 패턴은:
-  //   1) new Request(url, init)으로 먼저 Request 객체를 만들고
-  //   2) 그 Request 인스턴스의 .headers.set('Host', ...)를 호출해
-  //      헤더를 "나중에" 얹은 뒤
-  //   3) 그 Request 객체 자체를 fetch()에 전달하는 것이다.
-  // 이 순서(Request 생성 → headers.set → fetch(request))만이 Workers
-  // 런타임에서 Host 오버라이드가 실제로 origin까지 전달되는 것으로
-  // 검증된 경로다.
+  // ✅ [Error 525 근본 수정, v14] SNI(targetUrl의 host)와 HTTP Host 헤더를
+  // 최대한 일치시킨다. dnsConfirmedGhs === true인 경우 targetHost가 이미
+  // url.hostname과 같으므로 아래 host 헤더 설정은 사실상 no-op이 되고
+  // (SNI=Host=원래 도메인), dnsConfirmedGhs === false인 폴백 경로에서만
+  // 이전 v13 방식(SNI=ghs.google.com, Host=커스텀도메인)이 적용된다.
   const cfInit = cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false };
   const outboundRequest = new Request(targetUrl, {
     method  : 'GET',
@@ -1155,8 +1163,10 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
     cf      : cfInit,
   });
   // Blogger가 어떤 블로그(커스텀 도메인)인지 판별할 수 있도록 원래 host를
-  // Host 헤더로 명시 전달. (URL 자체는 GHS_TARGET이므로 Host 헤더가 없으면
-  // Blogger가 ghs.google.com 자신으로 오인해 404/오류를 반환한다.)
+  // Host 헤더로 명시 전달. dnsConfirmedGhs===true 경로에서는 targetUrl의
+  // host와 동일한 값을 다시 설정하는 것뿐이라 안전하며, false(GHS_TARGET
+  // 직접 접속) 폴백 경로에서는 여전히 필수적이다(없으면 Blogger가
+  // ghs.google.com 자신으로 오인해 404/오류를 반환한다).
   outboundRequest.headers.set('host', url.hostname);
 
   return fetch(outboundRequest);
