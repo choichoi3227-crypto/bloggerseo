@@ -1110,31 +1110,26 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
     throw new Error('bloggerFetch self-call guard: request host equals GHS_TARGET unexpectedly, refusing to fetch self.');
   }
 
-  // ✅ [Error 525 근본 수정, v14] v13까지는 fetch target host 자체를
-  // ghs.google.com으로 고정하고 Host 헤더만 원래 커스텀 도메인으로
-  // 얹었다 — 즉 TLS SNI는 'ghs.google.com', HTTP Host 헤더는 커스텀
-  // 도메인으로 서로 달랐다. 무한 루프는 확실히 막았지만, 실서비스에서는
-  // Google 프론트엔드가 "SNI와 Host 헤더가 불일치하는 요청"을 TLS
-  // 핸드셰이크 단계에서 거부하는 사례가 있고, Cloudflare는 이를 525로
-  // 합성해 반환한다. 즉 v13 방식은 안전하지만 원본(Google) 쪽에서
-  // 차단될 수 있는 패턴이었다.
+  // ✅ [Error 525 근본 수정, v16] v14는 SNI/Host 일치 여부를 warmCname()의
+  // DoH(1.1.1.1) 조회 결과로 판단했다. 그런데 dnsCname()도 Worker 내부의
+  // 또 다른 아웃바운드 fetch(https://1.1.1.1/dns-query)이고, 이 fetch
+  // 자체가 실패(타임아웃/제한 등)하면 checkCnameGhs가 조용히 false를
+  // 반환해 dnsConfirmedGhs = false가 되어 버렸다. 그 결과 실제로는 CNAME이
+  // ghs.google.com이 확실한 정상 도메인인데도 매번 v13 폴백(SNI=
+  // ghs.google.com, Host=커스텀도메인 — 서로 불일치)으로 떨어졌고, 이
+  // 불일치 패턴이 Google 프론트엔드의 TLS 핸드셰이크 거부(525)를
+  // 유발했다. 즉 "525를 피하려던 안전장치(DoH 확인)"가 오히려 DoH
+  // 조회 실패 시 525를 유발하는 경로로 매번 빠지는 역설적 상황이었다.
   //
-  // v14는 SNI와 Host를 항상 일치시킨다: fetch target host를 원래 커스텀
-  // 도메인 그대로 두고, 그 도메인의 실제 DNS(CNAME 체인)가 정말로
-  // ghs.google.com을 가리키는지 warmCname()으로 먼저 확인한다.
-  //   • DNS가 실제로 ghs.google.com을 가리키는 경우(정상 Blogger 커스텀
-  //     도메인 설정): fetch host를 원래 도메인 그대로 사용해도 Worker
-  //     내부의 fetch()는 Cloudflare 존의 프록시 레코드가 아니라 실제
-  //     퍼블릭 DNS 조회 결과로 연결되므로, 결국 Blogger 인프라로 정확히
-  //     연결되면서 SNI=Host=실제 방문 도메인인 "완전히 정상적인" HTTPS
-  //     요청이 된다. (무한 루프가 재발하지 않는 이유: 이 zone/Route가
-  //     서비스하는 도메인이 ghs.google.com을 직접 CNAME으로 가리킬 수는
-  //     없으므로 — Blogger가 Google 소유이지 이 zone 소유가 아니다.)
-  //   • DNS가 아직 ghs.google.com을 가리키지 않는(오설정/전파 지연) 경우만
-  //     예외적으로 GHS_TARGET 직접 접속 폴백(v13 방식)을 사용한다.
-  const dnsConfirmedGhs = await warmCname(url.hostname).catch(() => false);
-  const targetHost = dnsConfirmedGhs ? url.hostname : GHS_TARGET;
-  const targetUrl  = `https://${targetHost}${url.pathname}${qs}`;
+  // v16은 이 취약한 사전 확인 단계를 완전히 제거한다. Blogger 커스텀
+  // 도메인 설정 자체가 이미 "CNAME → ghs.google.com"을 요구하므로(그렇지
+  // 않으면애초에 Blogger가 그 도메인을 서비스하지 않는다), fetch target
+  // host는 항상 원래 방문 도메인(url.hostname) 그대로 사용한다.
+  // → SNI = Host = 실제 방문 도메인으로 항상 완전히 일치하며, 이 zone이
+  // ghs.google.com을 자체 CNAME으로 가질 수 없으므로(Google 소유 도메인)
+  // 무한 루프 위험도 없다. 추가 DNS 조회가 없어져 요청당 서브리퀘스트
+  // 사용량도 줄어든다(Workers Free 플랜의 50개 제한에 특히 유리하다).
+  const targetUrl = `https://${url.hostname}${url.pathname}${qs}`;
 
   const headers = new Headers();
   for (const [k, v] of reqHeaders.entries()) {
@@ -1150,11 +1145,10 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
   // 동일한 이유(QUIC 협상 불안정성으로 인한 handshake 실패 가능성 배제).
   const cfOpts = argoCtx ? argoBuildFetchOptions(argoCtx).cf : {};
 
-  // ✅ [Error 525 근본 수정, v14] SNI(targetUrl의 host)와 HTTP Host 헤더를
-  // 최대한 일치시킨다. dnsConfirmedGhs === true인 경우 targetHost가 이미
-  // url.hostname과 같으므로 아래 host 헤더 설정은 사실상 no-op이 되고
-  // (SNI=Host=원래 도메인), dnsConfirmedGhs === false인 폴백 경로에서만
-  // 이전 v13 방식(SNI=ghs.google.com, Host=커스텀도메인)이 적용된다.
+  // ✅ [Error 525 근본 수정, v16] targetUrl의 host(SNI)와 이후 설정하는
+  // Host 헤더가 항상 동일한 url.hostname이므로, 아래 headers.set('host', ...)
+  // 은 사실상 no-op에 가깝다(명시적으로 남겨 Request 생성자가 fetch()
+  // scheme만으로 Host를 유추하는 극히 드문 런타임 차이를 방지).
   const cfInit = cfOverride || { ...cfOpts, cacheTtl: 0, cacheEverything: false };
   const outboundRequest = new Request(targetUrl, {
     method  : 'GET',
@@ -1162,11 +1156,6 @@ async function bloggerFetch(url, reqHeaders, argoCtx, cfOverride = null) {
     redirect: 'manual',
     cf      : cfInit,
   });
-  // Blogger가 어떤 블로그(커스텀 도메인)인지 판별할 수 있도록 원래 host를
-  // Host 헤더로 명시 전달. dnsConfirmedGhs===true 경로에서는 targetUrl의
-  // host와 동일한 값을 다시 설정하는 것뿐이라 안전하며, false(GHS_TARGET
-  // 직접 접속) 폴백 경로에서는 여전히 필수적이다(없으면 Blogger가
-  // ghs.google.com 자신으로 오인해 404/오류를 반환한다).
   outboundRequest.headers.set('host', url.hostname);
 
   return fetch(outboundRequest);
@@ -1200,7 +1189,12 @@ async function handlePanel(request, url, env, ctx) {
   // 결함이었다. 이제는 PANEL_SECRET이 설정되지 않았거나 너무 짧으면
   // (추측이 쉬운 값 방지) 어떤 입력으로도 절대 통과할 수 없는 503으로
   // 명확히 차단하고, 콘솔에 이유를 남긴다.
-  if (!env.PANEL_SECRET || env.PANEL_SECRET.length < 16) {
+  // ✅ [부수 버그 수정] Cloudflare 대시보드에서 Secret 값을 붙여넣을 때
+  // 끝에 개행(\n)이나 공백이 섞여 들어가는 경우가 있다. trim() 없이 길이만
+  // 검사하면 "대시보드에는 분명 16자 이상으로 등록했는데 계속 짧다고
+  // 거부당하는" 혼란스러운 오탐이 생길 수 있으므로 trim 후 검사한다.
+  const panelSecretTrimmed = (env.PANEL_SECRET || '').trim();
+  if (!panelSecretTrimmed || panelSecretTrimmed.length < 16) {
     return new Response(
       'Admin panel disabled: PANEL_SECRET is not configured (or is too short). ' +
       'Set a strong PANEL_SECRET (16+ chars) in your Worker secrets/environment ' +
@@ -1213,7 +1207,7 @@ async function handlePanel(request, url, env, ctx) {
   // 첫 불일치 문자에서 조기 종료되는 JS 엔진 특성상 이론적으로 타이밍
   // 차이를 이용한 무차별 대입에 노출될 수 있었다.
   const auth   = request.headers.get('x-panel-secret') || url.searchParams.get('secret') || '';
-  const secret = env.PANEL_SECRET;
+  const secret = panelSecretTrimmed;
   const authOk = await wasmCore.constantTimeEqual(auth, secret);
   if (!authOk || !hasCloudflareBotMfa(request, env)) {
     return new Response(panelLoginHtml(), {
