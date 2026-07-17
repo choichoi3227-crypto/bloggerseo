@@ -125,6 +125,7 @@ import {
 } from './src/utils.js';
 import { enforceVpnBlock, hasCloudflareBotMfa, handleAdsClick, injectAdSenseClickGuard, shouldHideAds, hideAds, securitySettings, isKnownSearchEngineCrawler } from './src/security.js';
 import { googleIntegrationStatus, runGoogleSync } from './src/google-integrations.js';
+import { detectBunnyCdn, buildCdnCacheControl, buildStaticAssetHeaders } from './src/cdn-detect.js';
 
 // MyDurableObject: Cloudflare Durable Objects 바인딩에서 이 클래스를 찾으려면
 // main 파일(worker.js)에서 named export로 노출되어 있어야 한다.
@@ -513,7 +514,14 @@ async function handleFetch(request, env, ctx) {
   const pageType       = pageCtx?.type || detectPageType(url);
   const pageTtl        = getPageTypeTtl(pageType);
   const effectiveRoute = { ...pRoute, maxAge: pageTtl };
-  const cacheControl   = buildCacheControl(effectiveRoute, isBot);
+  const baseCacheControl = buildCacheControl(effectiveRoute, isBot);
+  // ✅ [v14 — 요청사항 1번] Bunny CDN이 앞단에 있으면 s-maxage/
+  // stale-while-revalidate/CDN-Cache-Control까지 명시해 Bunny와
+  // Cloudflare 양쪽이 같은 신선도 기준으로 HTML을 캐시하게 한다.
+  // Bunny가 없으면(순수 Cloudflare 단독) s-maxage/SWR만 추가로 보강된다.
+  const isBunnyForHtml = await detectBunnyCdn(host).catch(() => false);
+  const { cacheControl, extraHeaders: cdnExtraHeaders } =
+    buildCdnCacheControl(baseCacheControl, pageTtl, isBunnyForHtml);
 
   // Cache Reserve 저장 (성공 응답만, 봇 트래픽으로 캐시를 오염시키지 않기
   // 위해 쓰기는 사람 방문자 기준으로만 — 단, 읽기는 모두에게 적용됨)
@@ -548,7 +556,7 @@ async function handleFetch(request, env, ctx) {
 
   return new Response(result, {
     status : 200,
-    headers: buildResponseHeaders(etag, cacheControl, { serverTiming }),
+    headers: buildResponseHeaders(etag, cacheControl, { serverTiming, cdnExtraHeaders }),
   });
 }
 
@@ -677,6 +685,25 @@ async function resolveSlugRoute(rawPath, env, host) {
 async function updateSlugKV(pageCtx, originPath, env, originUrl, host) {
   if (!['post', 'page'].includes(pageCtx.type) || !pageCtx.title) return;
   if (!isPostPath(originPath)) return;
+
+  // ✅ [v14 — 요청사항 3번: 슬러그 로딩 가속화] 이전에는 캐시 미스가 날
+  // 때마다(즉 페이지 타입별 TTL이 30분~4시간이므로 실제로는 상당히
+  // 자주) 제목이 바뀌지 않았어도 매번 wasmCore.generateSlug()를 새로
+  // 호출하고, 그 결과로 upsertSlug() 안에서 slugOriginGet()을 또 한 번
+  // 조회했다. 같은 제목이면 어차피 같은 슬러그가 나오는 순수 함수이므로,
+  // 이미 확정된 기존 레코드(existing.title === pageCtx.title)가 있으면
+  // WASM 호출과 중복 조회를 모두 건너뛰고 기존 titlePath를 그대로
+  // 재사용한다 — 결과는 100% 동일하되 슬러그 확정 경로의 작업량 자체가
+  // 줄어든다(무관한 요청마다 재계산하던 것을 "제목이 실제로 바뀐 경우"로
+  // 한정).
+  const existing = await slugOriginGet(env, host, originPath).catch(() => null);
+  if (existing?.titlePath && existing.title === pageCtx.title) {
+    pageCtx.titlePath = existing.titlePath;
+    // TTL 갱신(touch)만 저비용으로 수행 — WASM 재계산/재삽입 없음.
+    touchSlug(env, host, originPath, existing).catch(() => {});
+    return;
+  }
+
   const titleSlug = await wasmCore.generateSlug(pageCtx.title);
   if (!titleSlug || titleSlug === 'post' || titleSlug === 'untitled') return;
   // ✅ ctx.titlePath 에도 저장 (SEO canonical, 스키마 마크업에 사용됨)
@@ -1170,7 +1197,12 @@ async function proxyPass(url, request, cfOverride = null) {
     if (resp.status >= 520 && resp.status <= 527) {
       return errResp(502, 'Origin temporarily unavailable (upstream ' + resp.status + ')');
     }
-    return stripInternalHeaders(resp, url, isPassthrough(url.pathname, url));
+    // ✅ [v14 — 요청사항 1번] Bunny CDN이 이 도메인 앞단에 있는지 DNS로
+    // 감지해서, JS/CSS 등 정적 자산의 캐시 헤더가 Bunny/Cloudflare 양쪽
+    // 모두에게 일관되게 해석되도록 한다. 결과는 인스턴스 메모리에 10분
+    // 캐싱되므로 매 요청 DNS 조회가 발생하지 않는다.
+    const isBunny = await detectBunnyCdn(url.hostname).catch(() => false);
+    return stripInternalHeaders(resp, url, isPassthrough(url.pathname, url), isBunny);
   } catch (e) {
     return errResp(502, 'Proxy failed: ' + String(e?.message ?? e));
   }
@@ -1469,6 +1501,7 @@ async function extractPageContext(html, url) {
     siteName   : extractSiteName(html),
     logoUrl    : extractLogoUrl(html),
     titlePath  : null,  // ✅ v8: SEO 슬러그 경로 (KV에서 나중에 채워짐)
+    wordCount  : 0,     // ✅ v14: schema.js Article.wordCount용 (아래서 계산)
   };
   ctx.title       = extractMeta(html, 'og:title') || extractTagContent(html, /<title[^>]*>([^<]+)<\/title>/i) || '';
   // ✅ [v13: WASM 가속] 본문 텍스트 추출 + CJK-aware meta description 생성은
@@ -1483,6 +1516,18 @@ async function extractPageContext(html, url) {
   ctx.updateDate  = extractMeta(html, 'article:modified_time')  || extractJsonLdDate(html, 'dateModified')  || ctx.publishDate;
   ctx.author      = extractMeta(html, 'article:author') || extractTagContent(html, /class="fn"[^>]*>([^<]+)</i) || '';
   ctx.tags        = extractLabels(html);
+  // ✅ [v14 — 요청사항 2번] wordCount — 이미 WASM으로 추출된 bodyText를
+  // 재사용해서 추가 파싱 비용 없이 계산한다(schema.js의 Article.wordCount).
+  // 한글은 공백으로 완전히 분리되지 않는 경우가 많아(조사가 붙는 등)
+  // 어절 수와 순수 글자 수를 함께 고려한 근사치를 쓴다: 공백 기준 토큰
+  // 수와 "글자 수/2"(평균 한글 어절 길이 근사) 중 큰 값을 취한다.
+  if (bodyText) {
+    const tokenCount = bodyText.split(/\s+/).filter(Boolean).length;
+    const charBasedEstimate = Math.round(bodyText.replace(/\s+/g, '').length / 2);
+    ctx.wordCount = Math.max(tokenCount, charBasedEstimate);
+  } else {
+    ctx.wordCount = 0;
+  }
   return ctx;
 }
 
@@ -1522,9 +1567,9 @@ function shouldBypassCache(request, url, path) {
 // ─────────────────────────────────────────────
 // 응답 유틸
 // ─────────────────────────────────────────────
-function stripInternalHeaders(resp, requestUrl, isStaticAsset) {
+function stripInternalHeaders(resp, requestUrl, isStaticAsset, isBunny = false) {
   try {
-    const h = new Headers(resp.headers);
+    let h = new Headers(resp.headers);
     ['cf-cache-status','cf-ray','nel','report-to','server'].forEach(k => h.delete(k));
     h.set('x-powered-by', 'BloggerSEO-v8');
 
@@ -1575,12 +1620,14 @@ function stripInternalHeaders(resp, requestUrl, isStaticAsset) {
     }
 
     if (isStaticAsset && resp.ok) {
-      const cc = h.get('cache-control') || '';
-      if (!cc || /no-store|no-cache|max-age=0/i.test(cc)) {
-        h.set('cache-control', 'public, max-age=86400, stale-while-revalidate=3600');
-      }
-      const vary = h.get('vary') || '';
-      if (!/accept-encoding/i.test(vary)) h.set('vary', vary ? vary + ', Accept-Encoding' : 'Accept-Encoding');
+      // ✅ [v14 — 요청사항 1번] Bunny/Cloudflare 두 CDN 계층 모두가 JS/CSS/
+      // 폰트/이미지를 안정적으로 오래 캐시하도록 s-maxage/immutable/
+      // cdn-cache-control까지 명시적으로 채운다. 기존 코드는 cache-control이
+      // 이미 있으면 그대로 두었지만, 정적 자산은 원본(Blogger/Google) 설정과
+      // 무관하게 항상 이 정책을 적용하는 편이 두 CDN 사이의 불일치(=드롭다운
+      // 등 위젯이 참조하는 JS/CSS가 CDN마다 다른 버전으로 캐시되어 보이는
+      // 문제)를 줄인다.
+      h = buildStaticAssetHeaders(h, isBunny);
     }
     return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: h });
   } catch (_) { return resp; }
@@ -1613,6 +1660,10 @@ function buildResponseHeaders(etag, cacheControl = 'no-store', extra = {}) {
   h.set('vary',                   'Accept-Encoding');
   h.set('x-powered-by',           'BloggerSEO-v8');
   if (extra.serverTiming) h.set('server-timing', extra.serverTiming);
+  // ✅ [v14 — 요청사항 1번] Bunny 감지 시 cdn-cache-control 등 추가 헤더
+  if (extra.cdnExtraHeaders) {
+    for (const [k, v] of Object.entries(extra.cdnExtraHeaders)) h.set(k, v);
+  }
   return h;
 }
 
