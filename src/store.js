@@ -233,9 +233,16 @@ async function redisScan(env, pattern, count = 100) {
 // 떨어져 Blogger에 존재하지 않는 경로로 요청이 가서 사실상 404가 났다.
 // 슬러그 매핑은 글이 삭제/제목 변경되기 전까지 사실상 영구적이어야 하는
 // 데이터이므로, cache:* 등 진짜 일시적 데이터와 분리해 훨씬 긴 상한(30일)을
-// 적용하고, 시간당 감사(runSlugAudit)에서 주기적으로 갱신해 안전망을 둔다.
+// 적용한다.
+// ✅ [슬러그 로직 재설계] 이전에는 시간당 전체 재스캔(runSlugAudit)이 모든
+// slug:* 매핑을 값 변경 여부와 무관하게 주기적으로 다시 써서 TTL을
+// 갱신했다. 이는 "발행 시 1회 확정, 이후 조회만" 원칙과 맞지 않아 제거
+// 했다. 이제 TTL 갱신은 오직 실제 방문이 그 슬러그를 조회할 때만
+// (resolveSlugRoute → touchSlug, worker.js) 저비용으로 일어난다. 즉 30일간
+// 아무도 방문하지 않은 글의 매핑만 자연 소멸하며, 실제로 트래픽이 있는
+// 글은 방문 자체가 TTL을 계속 연장한다.
 const MAX_DATA_TTL_SEC = 3600;              // 1시간 — cache:/schema: 등 일시적 데이터
-const SLUG_MAX_TTL_SEC = 30 * 24 * 3600;    // 30일 — slug:* 매핑 (사실상 영구, 주기적으로 갱신됨)
+const SLUG_MAX_TTL_SEC = 30 * 24 * 3600;    // 30일 — slug:* 매핑 (실제 방문 시에만 갱신)
 
 function clampTtlForKey(key, ttlSec) {
   const k = typeof key === 'string' ? key : String(key ?? '');
@@ -578,10 +585,12 @@ export async function upsertSlug(env, host, originPath, title, titleSlug) {
 }
 
 // ── 슬러그 매핑 TTL 갱신(touch) — 값이 안 바뀌어도 만료 시점을 늦춤 ────
-// slug:* 키의 저장 상한을 30일로 늘렸지만(clampTtlForKey), 트래픽이 뜸한
-// 블로그나 장기간 배포가 없는 경우를 대비한 이중 안전장치로, 시간당 감사
-// (runSlugAudit)가 스캔한 모든 슬러그 매핑을 값 변경 여부와 무관하게
-// 주기적으로 다시 써서 TTL을 계속 최신 상태로 유지한다.
+// slug:* 키의 저장 상한은 30일이다(clampTtlForKey). 이 함수는 더 이상
+// 시간당 전체 재스캔에서 호출되지 않는다(그 기능은 제거됨) — 대신
+// worker.js의 resolveSlugRoute()가 캐시 미스 시 실제로 조회된 슬러그에
+// 대해서만 이 함수를 호출한다. 즉 "발행 시 1회 확정 + 실제 방문 시에만
+// TTL 연장"이 되어, 트래픽이 있는 글의 매핑은 방문 자체로 계속 살아있고
+// 아무도 찾지 않는 매핑만 30일 후 자연 소멸한다.
 export async function touchSlug(env, host, originPath, existing) {
   if (!existing?.titlePath) return;
   await slugOriginPut(env, host, originPath, { ...existing, checkedAt: Date.now() });
