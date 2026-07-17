@@ -318,34 +318,27 @@ async function handleFetch(request, env, ctx) {
     return resp;
   }
 
-  // ── 슬러그 라우팅 (캐시 조회보다 먼저 판단) ─────────────────────────
-  // ✅ 원본(Blogspot) 경로가 이미 캐시에 있으면 그 캐시가 그대로 200으로
-  // 서빙되어 버려서, 슬러그가 확정되어 있어도 리디렉션되지 않고 계속
-  // Blogspot 경로가 노출되는 문제가 있었다. slug 조회는 이제 로컬 캐시
-  // (TTL 5초)로 매우 빠르므로, 캐시 조회보다 먼저 수행해서 "원본 경로 +
-  // 슬러그 존재"인 경우 캐시 확인 없이 즉시 301로 확정한다.
-  // [v9] 리디렉션 과다 수정: 이 지점에서의 301은 "원본(Blogspot) 경로에
-  // 접근했고, 이미 확정된 SEO 슬러그가 있는 경우" 단 하나의 케이스에서만
-  // 발생한다. 슬러그가 아직 없거나(신규 글) alias 조회가 KV eventual
-  // consistency로 인해 순간적으로 실패한 경우는 passthrough로 원본을 그대로
-  // 렌더링하고, 뒤쪽(라인 ~300 부근) HTML 파이프라인의 리디렉션 판단과
-  // 절대 겹치지 않도록 플래그(alreadyOnOriginPath)로 구분한다.
+  // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
+  // ✅ [슬러그 로직 재설계] 요청 처리 순서를 다음과 같이 확정한다:
+  //   요청 도착 → Edge Cache 확인 → (히트) 즉시 응답, slug-map 조회 없음
+  //                              → (미스) slug-map 조회 → 301 또는 origin fetch
+  // 슬러그는 "발행 시점"(updateSlugKV, HTML 변환 파이프라인 내부)에 이미
+  // 단 한 번 확정되어 slug-map(KV/Durable Objects)에 저장되어 있다. 방문자
+  // 접속마다 slug-map을 조회하는 것은 그 시점에 캐시가 비어 있을 때만
+  // 필요한 일이므로, 캐시 히트 여부보다 먼저 slug-map을 조회할 이유가 없다.
+  // 캐시 히트 시 KV/Redis 호출이 완전히 스킵되어 응답이 더 빨라진다.
+  //
+  // ✅ 원본(Blogspot) 경로 캐시로 인해 리디렉션이 씹히는 문제 방지:
+  // 원본 경로(/YYYY/MM/*.html)는 애초에 캐시에 저장되지 않는다(아래 HTML
+  // 변환 파이프라인은 이 경로에 대해 항상 301을 반환하며 200 캐시 저장
+  // 분기를 타지 않음 — cacheReservePut 호출부 참고). 따라서 "원본 경로가
+  // 캐시에 먼저 잡혀 슬러그 확정 후에도 200으로 계속 서빙되는" 상황 자체가
+  // 구조적으로 발생하지 않아, 캐시 조회를 슬러그 조회보다 먼저 두어도
+  // 안전하다.
   let slugRoute = { type: 'passthrough' };
   let originPathForKV = path;
   const requestedOriginalPath = isPostPath(path); // 이 요청 자체가 원본 경로인지
-  try {
-    slugRoute = await resolveSlugRoute(path, env, host);
-    if (slugRoute.type === 'redirect') {
-      recordMetric(301, Date.now() - t0);
-      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
-    }
-    if (slugRoute.type === 'alias') {
-      originPathForKV = slugRoute.originPath;
-    }
-  } catch (_) {}
 
-  // ── Cache Reserve 조회 (L0 Cache API → L2 영속 스토리지) ──────────
-  // 쿠키 유무와 무관하게 캐시를 적용한다 (v7.1: 캐시 히트율 극대화).
   if (isCacheable(request, null)) {
     const cached = await cacheReserveGet(env, request);
     if (cached) {
@@ -367,6 +360,24 @@ async function handleFetch(request, env, ctx) {
     }
     ctx.waitUntil(regionalCacheRecord(env, argoCtx.region, false).catch(() => {}));
   }
+
+  // ── 슬러그 라우팅 (캐시 미스일 때만 조회) ───────────────────────────
+  // [v9] 리디렉션 과다 수정: 이 지점에서의 301은 "원본(Blogspot) 경로에
+  // 접근했고, 이미 확정된 SEO 슬러그가 있는 경우" 단 하나의 케이스에서만
+  // 발생한다. 슬러그가 아직 없거나(신규 글) alias 조회가 KV eventual
+  // consistency로 인해 순간적으로 실패한 경우는 passthrough로 원본을 그대로
+  // 렌더링하고, 뒤쪽(라인 ~300 부근) HTML 파이프라인의 리디렉션 판단과
+  // 절대 겹치지 않도록 플래그(alreadyOnOriginPath)로 구분한다.
+  try {
+    slugRoute = await resolveSlugRoute(path, env, host);
+    if (slugRoute.type === 'redirect') {
+      recordMetric(301, Date.now() - t0);
+      return Response.redirect(new URL(slugRoute.titlePath, url).toString(), 301);
+    }
+    if (slugRoute.type === 'alias') {
+      originPathForKV = slugRoute.originPath;
+    }
+  } catch (_) {}
 
   // ── Load Balancer ────────────────────────────────────────────────
   if (!lbAcquire()) {
@@ -754,8 +765,15 @@ async function runScheduled30Min(env) {
 async function runScheduledHourly(env) {
   // 사이트맵 재생성 (TTL: 2시간)
   await runSitemapGeneration(env).catch(() => {});
-  // 슬러그 감사
-  await runSlugAudit(env).catch(() => {});
+  // ✅ [슬러그 로직 재설계] 이전에는 여기서 runSlugAudit(env)를 호출해
+  // 매시간 저장된 모든 slug-map 항목(slug:origin:*)을 스캔하며 제목마다
+  // wasmCore.generateSlug()를 다시 계산했다. 슬러그는 "발행 시점"에
+  // updateSlugKV()가 단 한 번 확정해 slug-map(KV/Durable Objects)에 저장
+  // 하므로, 방문/발행과 무관하게 전체 글을 주기적으로 재스캔·재계산하는
+  // 절차는 구조상 불필요하다(요청 사항: 발행 → 슬러그 생성 → slug-map
+  // 저장 이후에는 조회만 하고, 방문마다·주기적으로 재검사하지 않는다).
+  // TTL 만료 방지가 필요하면 실제로 조회되는 슬러그만 touchSlug()로
+  // 갱신되므로(resolveSlugRoute 경유), 별도의 전체 재스캔은 제거한다.
   // 만료된 캐시 항목 정리
   await cacheReservePurge(env).catch(() => {});
   // 검색엔진 핑 (사이트맵 갱신 알림) — 등록된 모든 사이트 각각에 대해 핑
@@ -1006,35 +1024,6 @@ function resolveSiteBase(env) {
     return 'https://' + _detectedHost;
   }
   return '';
-}
-
-async function runSlugAudit(env) {
-  const { kvScan, kvGetJson } = await import('./src/store.js');
-  const keys = await kvScan(env, 'slug:origin:*', 1000);
-  for (const key of keys) {
-    try {
-      const data = await kvGetJson(env, key);
-      if (!data?.title) continue;
-      // 키 형식: slug:origin:{site}:{originPath} — 사이트별로 격리되어 있으므로
-      // 감사(재확정)도 반드시 같은 사이트 네임스페이스에 다시 써야 한다.
-      const m = key.match(/^slug:origin:([^:]+):(.+)$/);
-      if (!m) continue;
-      const site       = m[1];
-      const originPath = m[2];
-      const newSlug = await wasmCore.generateSlug(data.title);
-      if (!newSlug || newSlug === 'post') continue;
-      const newTitlePath  = '/' + newSlug;
-      if (newTitlePath !== data.titlePath) {
-        await upsertSlug(env, site, originPath, data.title, newSlug);
-      } else {
-        // ✅ 슬러그 값 자체는 안 바뀌었어도, 이 감사 스캔에서 발견된
-        // 매핑은 여전히 유효/사용 중이라는 뜻이므로 TTL을 갱신(touch)한다.
-        // 이게 없으면 별칭(alias) URL로만 방문되는 인기 글의 매핑이
-        // 30일 상한에 걸려 소멸될 수 있다.
-        await touchSlug(env, site, originPath, data);
-      }
-    } catch (_) {}
-  }
 }
 
 // ─────────────────────────────────────────────
