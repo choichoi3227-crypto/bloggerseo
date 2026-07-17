@@ -1,39 +1,97 @@
 export function isOptimizableImagePath(path) { return /\.(png|jpe?g|gif|webp)$/i.test(path); }
+
 export function imageCfOptions(request, env) {
   const accept = request.headers.get('accept') || '';
   const format = accept.includes('image/avif') ? 'avif' : accept.includes('image/webp') ? 'webp' : undefined;
-  return { image: { fit: 'scale-down', quality: Number(env.IMAGE_QUALITY) || 82, metadata: 'none', ...(format ? { format } : {}) }, cacheEverything: true, cacheTtl: Number(env.IMAGE_CACHE_TTL_SEC) || 2592000 };
+  return { 
+    image: { 
+      fit: 'scale-down', 
+      quality: Number(env.IMAGE_QUALITY) || 82, 
+      metadata: 'none', 
+      ...(format ? { format } : {}) 
+    }, 
+    cacheEverything: true, 
+    cacheTtl: Number(env.IMAGE_CACHE_TTL_SEC) || 2592000 
+  };
 }
-// [버그 수정] 이전에는 첫 번째 이미지(LCP 후보)에도 무조건 loading="lazy" +
-// fetchpriority="low"를 강제로 붙였다. 이 때문에 방문자가 페이지에 들어왔을 때
-// 정작 가장 먼저 보여야 할 히어로/썸네일 이미지가 브라우저에 의해 로딩이
-// 지연되어, 화면이 빈 회색 박스로 한참 남아있다가 뒤늦게 채워지는(또는
-// 스크롤 전까지 아예 안 뜨는) "화면 깨짐" 현상의 핵심 원인이었다.
-// 게다가 이 결과가 그대로 Cache Reserve에 저장되어, 캐시가 만료되기
-// 전까지 모든 방문자가 계속 이 깨진 렌더링을 보게 되는 문제로 이어졌다.
-//
-// → 첫 번째 이미지는 LCP 후보로 간주해 eager + fetchpriority="high"로 두고,
-//   두 번째 이미지부터만 lazy 처리한다. seo-features.js의 injectLazyLoading과
-//   동일한 "첫 이미지는 즉시 로드" 규칙을 따르도록 통일했다.
+
 const SKIP_EAGER_OVERRIDE = [/blogger\.com/i, /gstatic\.com/i, /\/img\.gif/i, /spacer/i, /favicon/i];
 
-export function optimizeImageMarkup(html) {
+/**
+ * Generates an optimized responsive srcset for Google-hosted images
+ * utilizing Google's native CDN resizing & WebP auto-conversion (-rw).
+ */
+export function generateResponsiveSrcset(src) {
+  if (!src) return null;
+  const isGoogleImage = /bp\.blogspot\.com/i.test(src) || /googleusercontent\.com/i.test(src);
+  if (!isGoogleImage) return null;
+
+  // Skip typical small layout elements, icons, avatars, and trackers
+  if (/\b(favicon|avatar|logo|icon|button|spacer|marker|spinner|gravatar)\b/i.test(src)) return null;
+
+  let originalSize = 1600;
+  const pathSizeMatch = src.match(/\/(s|w|h)(\d+)(-[a-zA-Z0-9_-]+)?\//);
+  const paramSizeMatch = src.match(/=(s|w|h)(\d+)(-[a-zA-Z0-9_-]+)?$/);
+
+  let hasPathSize = false;
+  let hasParamSize = false;
+
+  if (pathSizeMatch) {
+    originalSize = parseInt(pathSizeMatch[2], 10);
+    hasPathSize = true;
+  } else if (paramSizeMatch) {
+    originalSize = parseInt(paramSizeMatch[2], 10);
+    hasParamSize = true;
+  }
+
+  // If original is very small (like a thumbnail or profile pic), don't generate massive srcset
+  if (originalSize < 200) return null;
+
+  // Responsive widths to generate
+  const widths = [320, 480, 640, 800, 1020, 1200, 1600];
+  const items = [];
+
+  for (const w of widths) {
+    if (w > originalSize * 1.5) break; // Don't upscale past reasonable limits
+    let resizedSrc = src;
+    if (hasPathSize) {
+      resizedSrc = src.replace(/\/(s|w|h)\d+([a-zA-Z0-9_-]+)?\//, `/s${w}-rw/`);
+    } else if (hasParamSize) {
+      resizedSrc = src.replace(/=(s|w|h)\d+([a-zA-Z0-9_-]+)?$/, `=s${w}-rw`);
+    } else {
+      // Append size param
+      resizedSrc = src + `=s${w}-rw`;
+    }
+    items.push(`${resizedSrc} ${w}w`);
+  }
+
+  if (items.length === 0) return null;
+  return items.join(', ');
+}
+
+/**
+ * Formats image tags to apply lazy loading, preloading, async decoding,
+ * responsive source sets, and automated SEO alt attributes.
+ */
+export function optimizeImageMarkup(html, ctx = null) {
   let firstContentImageDone = false;
+  let imgCount = 0;
+
   return html.replace(/<img\b([^>]*?)>/gi, (m, attrs) => {
     let a = attrs;
     const srcMatch = a.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
     const src = srcMatch ? srcMatch[1] : '';
+    
     const isSystemImage = src && SKIP_EAGER_OVERRIDE.some(p => p.test(src));
     const isFirstContentImage = !firstContentImageDone && !isSystemImage;
     if (isFirstContentImage) firstContentImageDone = true;
 
+    if (!isSystemImage) {
+      imgCount++;
+    }
+
+    // 1. Loading/priority optimization (LCP hero vs lazy content)
     if (isFirstContentImage) {
-      // ✅ [화면 깨짐 재수정] 위 주석의 v1 수정은 "loading=/fetchpriority=가
-      // 이미 있으면 건드리지 않는다"는 전제를 깔고 있었는데, 최근 Blogger
-      // 기본 테마는 <img>에 loading="lazy"를 이미 박아서 내려준다. 그러면
-      // 이 히어로 이미지가 여전히 lazy로 남아 처음 화면 진입 시 빈 박스로
-      // 있다가 늦게 채워지는 문제가 그대로 재발했다. 첫 콘텐츠 이미지는
-      // 원본에 어떤 값이 있었든 항상 eager/high로 강제 덮어쓴다.
       a = a
         .replace(/\s+loading\s*=\s*["'][^"']*["']/i, '')
         .replace(/\s+fetchpriority\s*=\s*["'][^"']*["']/i, '');
@@ -43,6 +101,33 @@ export function optimizeImageMarkup(html) {
       if (!/fetchpriority=/i.test(a)) a += ' fetchpriority="low"';
     }
     if (!/decoding=/i.test(a)) a += ' decoding="async"';
+
+    // 2. Responsive srcset & sizes using Google CDN resizer + WebP
+    if (!/srcset=/i.test(a)) {
+      const srcset = generateResponsiveSrcset(src);
+      if (srcset) {
+        a += ` srcset="${srcset}"`;
+        if (!/sizes=/i.test(a)) {
+          a += ' sizes="(max-width: 768px) 100vw, 1020px"';
+        }
+      }
+    }
+
+    // 3. Accessibility & SEO alt tag auto-generation
+    const altMatch = a.match(/\balt\s*=\s*["']([^"']*)["']/i);
+    const hasAlt = !!altMatch;
+    const altVal = hasAlt ? altMatch[1] : '';
+
+    if (!hasAlt || altVal.trim() === '') {
+      const pageTitle = ctx?.title || '블로그 이미지';
+      const newAlt = `${pageTitle} 이미지 ${imgCount}`;
+      if (hasAlt) {
+        a = a.replace(/\balt\s*=\s*["']([^"']*)["']/i, `alt="${newAlt}"`);
+      } else {
+        a += ` alt="${newAlt}"`;
+      }
+    }
+
     return `<img${a}>`;
   });
 }
