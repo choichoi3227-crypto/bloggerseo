@@ -63,6 +63,18 @@ export async function buildSchemas(html, ctx, url, env) {
     schemas.push(buildProductSchema(product, ctx, url));
   }
 
+  // 6. [v14 — 요청사항 2번] HowTo (번호 매겨진 단계형 본문 감지)
+  // "1. 재료 준비" / "Step 1:" / <ol><li>...</li></ol> 등 단계형 구조가
+  // 3단계 이상 있으면 요리/튜토리얼/가이드성 포스트로 보고 HowTo 스키마를
+  // 추가한다. Article과 HowTo는 배타적이지 않으므로(schema.org 공식) 둘 다
+  // 함께 실어도 무방하다.
+  if (['post', 'page'].includes(ctx.type)) {
+    const steps = extractHowToSteps(html);
+    if (steps.length >= 3) {
+      schemas.push(buildHowToSchema(steps, ctx, url));
+    }
+  }
+
   // 캐시 저장 (4시간)
   await schemaPut(env, cacheHash, schemas, 14400);
   return schemas;
@@ -94,9 +106,77 @@ function buildArticleSchema(ctx, url) {
   if (ctx.tags?.length) s.keywords      = ctx.tags.join(', ');
   // 네이버 블로그 최적화: articleSection
   if (ctx.tags?.[0])  s.articleSection  = ctx.tags[0];
+  // ✅ [v14 — 요청사항 2번] wordCount — Google이 콘텐츠 충실도 신호로
+  // 참고하는 값(순위 결정 요인이라는 공식 발표는 없지만, 스키마 필드
+  // 자체는 schema.org 공식 Article 속성이며 채워 넣어 손해가 없다).
+  // ctx.wordCount는 worker.js가 이미 WASM으로 추출한 bodyText 기준으로
+  // 계산해 넘겨준다(중복 파싱 없이 재사용).
+  if (ctx.wordCount > 0) s.wordCount = ctx.wordCount;
+  // ✅ [v14] speakable — Google Assistant/음성 검색이 소리 내어 읽어줄
+  // 후보 영역을 지정하는 SpeakableSpecification. 제목(h1/og:title)과
+  // 메타 설명 영역을 CSS 셀렉터로 지정한다(테마마다 실제 클래스명이
+  // 달라 셀렉터가 정확히 안 맞을 수 있으나, 존재 자체로 손해는 없고
+  // 셀렉터가 맞는 테마에서는 실제 이득이 있다).
+  s.speakable = {
+    '@type'      : 'SpeakableSpecification',
+    cssSelector  : ['h1', '.post-title', 'entry-title'].filter((v, i, a) => a.indexOf(v) === i),
+  };
   // 구조화 데이터 완전성 향상
   s.url = ctx.postUrl;
   return s;
+}
+
+// ── HowTo 스키마 (요청사항 2번: 단계형 콘텐츠 감지) ─────────────────
+// "1. ...", "Step 1", "단계 1", <ol><li> 패턴을 순서대로 스캔해 3개
+// 이상이면 요리법/튜토리얼로 보고 HowTo 스키마를 만든다. 각 단계 텍스트
+// 자체가 이미 콘텐츠에 있는 내용이므로 새로운 정보를 지어내지 않는다.
+const STEP_PATTERNS = [
+  /<li[^>]*>([\s\S]*?)<\/li>/gi,
+  /(?:^|\n)\s*(?:step\s*\d+|단계\s*\d+|\d+)[\.\):]\s*([^\n<]{4,200})/gi,
+];
+
+function extractHowToSteps(html) {
+  // <ol>...</ol> 블록이 있으면 그 안의 <li>만 우선 사용 (오탐 최소화 —
+  // 목차/댓글 목록 등 <ol> 밖의 무관한 리스트를 단계로 오인하지 않도록).
+  const olMatch = /<ol[^>]*>([\s\S]*?)<\/ol>/i.exec(html);
+  const scope = olMatch ? olMatch[1] : html;
+
+  const steps = [];
+  const re = /<li[^>]*>([\s\S]*?)<\/li>/gi;
+  let m;
+  while ((m = re.exec(scope)) !== null) {
+    const text = m[1].replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ').trim();
+    if (text.length >= 4 && text.length <= 500) steps.push(text);
+  }
+
+  // <ol>이 없거나 항목이 부족하면 "번호. 텍스트" 패턴으로 폴백.
+  if (steps.length < 3) {
+    steps.length = 0;
+    const plain = html.replace(/<[^>]+>/g, '\n');
+    const re2 = /(?:^|\n)\s*(?:step\s*\d+|단계\s*\d+|\d+)[\.\):]\s*([^\n]{4,200})/gi;
+    let m2;
+    while ((m2 = re2.exec(plain)) !== null) {
+      const text = m2[1].trim();
+      if (text) steps.push(text);
+    }
+  }
+
+  return steps.slice(0, 20); // 과도한 스키마 크기 방지
+}
+
+function buildHowToSchema(steps, ctx, url) {
+  return {
+    '@context': 'https://schema.org',
+    '@type'   : 'HowTo',
+    name      : ctx.title,
+    description: ctx.description,
+    ...(ctx.imageUrl ? { image: ctx.imageUrl } : {}),
+    step: steps.map((text, i) => ({
+      '@type'  : 'HowToStep',
+      position : i + 1,
+      text,
+    })),
+  };
 }
 
 // ── WebPage 스키마 ────────────────────────────────────────────────────
