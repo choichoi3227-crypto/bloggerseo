@@ -24,7 +24,11 @@
  *
  * 데이터 모델:
  *   각 샤드 DO는 SQLite 테이블 하나(`kv`)에 모든 키를 저장.
- *   value는 JSON 직렬화된 { type, data, expAt } 레코드.
+ *   value는 JSON 직렬화된 { type, data, expAt } 레코드이며, [v14]부터는
+ *   압축 이득이 있는 경우 gzip 압축 후 저장된다(kv-compress.js, 'z:' 접두사
+ *   포맷 — 기존 비압축 데이터와 100% 하위 호환, 자동 판별). 압축/해제는
+ *   조회·저장 경로에서 투명하게 처리되므로 이 파일의 나머지 명령어 구현은
+ *   압축 여부를 신경 쓸 필요가 없다.
  *   만료는 lazy eviction(조회 시 검사) + 주기적 alarm GC로 처리한다.
  * 참고: checkRateLimit/recordMetric(store.js)은 매 요청마다 호출되는 핫패스라서
  * 의도적으로 DO Redis(doRedisIncrBy 등)를 쓰지 않고 인스턴스 메모리로 처리한다.
@@ -35,9 +39,20 @@
  */
 
 import { DurableObject } from 'cloudflare:workers';
+import { encodeForStorage, decodeFromStorage } from './kv-compress.js';
 
 const SHARD_COUNT_DEFAULT = 64; // wrangler.toml의 REDIS_SHARD_COUNT로 조절 가능
 const GC_INTERVAL_MS = 5 * 60 * 1000; // 5분마다 만료 항목 정리
+
+// ── [v14] DO SQLite 저장 압축 (gzip) ────────────────────────────────────
+// 목표(요청사항 1번): "기존 크기의 최소 70%로 압축" — 저장 바이트 수를
+// 원본의 70% 이하로 줄인다(=최소 30% 절감). 실제 압축/해제 로직은
+// kv-compress.js에 분리되어 있다(Workers 런타임 밖에서도 단위 테스트가
+// 가능하도록). 저장 포맷(vdata 컬럼 값 자체의 접두사가 포맷 태그):
+//   'z:' + base64(gzip(JSON 문자열))  → 압축 저장
+//   원본 JSON 문자열 그대로            → 비압축 저장(기존 v13 포맷과 100%
+//                                       호환 — 기존에 저장된 행도 그대로
+//                                       읽힌다, 마이그레이션 불필요)
 
 // ── 키 → 샤드 번호 해시 (FNV-1a) ─────────────────────────────────────
 function shardOf(key, shardCount) {
@@ -296,26 +311,32 @@ export class MyDurableObject extends DurableObject {
     return row;
   }
 
-  _put(key, vtype, data, ttlSec) {
+  // ✅ [v14] gzip 압축(요청사항 1번: DO 저장 크기 최소 70%로 압축) —
+  // encodeForStorage()가 압축 이득이 있을 때만 'z:' 접두사 포맷으로
+  // 바꾸고, 이득이 없으면 원본 그대로 저장한다(항상 회귀 없음).
+  async _put(key, vtype, data, ttlSec) {
     const expAt = ttlSec > 0 ? Date.now() + ttlSec * 1000 : 0;
+    const stored = await encodeForStorage(JSON.stringify(data));
     this.sql.exec(
       `INSERT INTO kv (key, vtype, vdata, exp_at) VALUES (?, ?, ?, ?)
        ON CONFLICT(key) DO UPDATE SET vtype=excluded.vtype, vdata=excluded.vdata, exp_at=excluded.exp_at`,
-      key, vtype, JSON.stringify(data), expAt
+      key, vtype, stored, expAt
     );
   }
 
-  // ✅ [에러 방지 장치] vdata는 항상 이 DO가 직접 JSON.stringify로 쓴
-  // 값이라 정상 상황에서는 파싱이 실패할 수 없지만, 만에 하나 외부 요인
-  // (수동 SQLite 조작, 향후 스키마 변경, 저장소 손상 등)으로 손상된 값이
+  // ✅ [에러 방지 장치] vdata는 항상 이 DO가 직접 (압축 후) 쓴 값이라
+  // 정상 상황에서는 파싱이 실패할 수 없지만, 만에 하나 외부 요인(수동
+  // SQLite 조작, 향후 스키마 변경, 저장소 손상 등)으로 손상된 값이
   // 들어있으면 이전 구현은 JSON.parse가 그대로 throw해서 그 요청 전체가
   // 500으로 실패하고 해당 키는 이후 모든 접근에서 영구히 500만 반환하는
   // "죽은 키"가 되어버렸다. 손상을 감지하면 해당 키를 자동 삭제해 다음
   // 접근부터는 "키 없음"으로 정상 복구되도록 한다 — 사용자가 수동으로
   // KV 관리 탭에서 삭제하지 않아도 스스로 치유된다.
-  _safeParse(row, key, fallback) {
+  // [v14] 압축 여부('z:' 접두사)를 먼저 투명하게 해제한 뒤 JSON.parse한다.
+  async _safeParse(row, key, fallback) {
     try {
-      return JSON.parse(row.vdata);
+      const raw = await decodeFromStorage(row.vdata);
+      return JSON.parse(raw);
     } catch (_) {
       try { this.sql.exec(`DELETE FROM kv WHERE key = ?`, key); } catch (_) {}
       return fallback;
@@ -328,14 +349,15 @@ export class MyDurableObject extends DurableObject {
       return Response.json({ ok: false, error: 'bad-json' }, { status: 400 });
     }
     try {
-      const result = this._exec(cmd);
+      // [v14] 압축/해제(gzip)가 비동기이므로 _exec 자체도 비동기로 바뀌었다.
+      const result = await this._exec(cmd);
       return Response.json(result);
     } catch (e) {
       return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
     }
   }
 
-  _exec(cmd) {
+  async _exec(cmd) {
     // ✅ [에러 방지 장치] cmd/cmd.op/cmd.key가 없거나 잘못된 타입이면
     // SQL 바인딩에 undefined가 들어가 예측 불가능한 동작(SQLite가 NULL로
     // 취급하거나 예외 발생)으로 이어질 수 있었다. 진입점에서 미리 검증해
@@ -350,11 +372,11 @@ export class MyDurableObject extends DurableObject {
       case 'GET': {
         const row = this._row(cmd.key);
         if (!row) return { ok: true, value: null };
-        const parsed = this._safeParse(row, cmd.key, null);
+        const parsed = await this._safeParse(row, cmd.key, null);
         return { ok: true, value: row.vtype === 'string' ? parsed : null };
       }
       case 'SET': {
-        this._put(cmd.key, 'string', cmd.value, cmd.ttlSec || 0);
+        await this._put(cmd.key, 'string', cmd.value, cmd.ttlSec || 0);
         return { ok: true };
       }
       case 'DEL': {
@@ -385,56 +407,56 @@ export class MyDurableObject extends DurableObject {
         if (row && row.vtype !== 'string') {
           return { ok: false, error: 'WRONGTYPE: value is not a string/integer' };
         }
-        const rawCur = row ? this._safeParse(row, cmd.key, 0) : 0;
+        const rawCur = row ? await this._safeParse(row, cmd.key, 0) : 0;
         const cur = Number(rawCur);
         if (row && !Number.isFinite(cur)) {
           return { ok: false, error: 'ERR value is not an integer' };
         }
         const next = cur + (cmd.by || 1);
-        this._put(cmd.key, 'string', next, row ? this._remainingTtl(cmd.key) : 0);
+        await this._put(cmd.key, 'string', next, row ? this._remainingTtl(cmd.key) : 0);
         return { ok: true, value: next };
       }
       case 'LPUSH': case 'RPUSH': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
+        const list = row && row.vtype === 'list' ? await this._safeParse(row, cmd.key, []) : [];
         if (op === 'LPUSH') list.unshift(cmd.value); else list.push(cmd.value);
-        this._put(cmd.key, 'list', list, row ? this._remainingTtl(cmd.key) : 0);
+        await this._put(cmd.key, 'list', list, row ? this._remainingTtl(cmd.key) : 0);
         return { ok: true, len: list.length };
       }
       case 'LRANGE': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
+        const list = row && row.vtype === 'list' ? await this._safeParse(row, cmd.key, []) : [];
         const stop = cmd.stop < 0 ? list.length + cmd.stop + 1 : cmd.stop + 1;
         return { ok: true, items: list.slice(cmd.start, stop) };
       }
       case 'LTRIM': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
+        const list = row && row.vtype === 'list' ? await this._safeParse(row, cmd.key, []) : [];
         const stop = cmd.stop < 0 ? list.length + cmd.stop + 1 : cmd.stop + 1;
         const trimmed = list.slice(cmd.start, stop);
-        this._put(cmd.key, 'list', trimmed, row ? this._remainingTtl(cmd.key) : 0);
+        await this._put(cmd.key, 'list', trimmed, row ? this._remainingTtl(cmd.key) : 0);
         return { ok: true };
       }
       case 'LLEN': {
         const row = this._row(cmd.key);
-        const list = row && row.vtype === 'list' ? this._safeParse(row, cmd.key, []) : [];
+        const list = row && row.vtype === 'list' ? await this._safeParse(row, cmd.key, []) : [];
         return { ok: true, len: list.length };
       }
       case 'HSET': {
         const row = this._row(cmd.key);
-        const hash = row && row.vtype === 'hash' ? this._safeParse(row, cmd.key, {}) : {};
+        const hash = row && row.vtype === 'hash' ? await this._safeParse(row, cmd.key, {}) : {};
         hash[cmd.field] = cmd.value;
-        this._put(cmd.key, 'hash', hash, row ? this._remainingTtl(cmd.key) : 0);
+        await this._put(cmd.key, 'hash', hash, row ? this._remainingTtl(cmd.key) : 0);
         return { ok: true };
       }
       case 'HGET': {
         const row = this._row(cmd.key);
-        const hash = row && row.vtype === 'hash' ? this._safeParse(row, cmd.key, {}) : {};
+        const hash = row && row.vtype === 'hash' ? await this._safeParse(row, cmd.key, {}) : {};
         return { ok: true, value: hash[cmd.field] ?? null };
       }
       case 'HGETALL': {
         const row = this._row(cmd.key);
-        const hash = row && row.vtype === 'hash' ? this._safeParse(row, cmd.key, {}) : {};
+        const hash = row && row.vtype === 'hash' ? await this._safeParse(row, cmd.key, {}) : {};
         return { ok: true, value: hash };
       }
       case 'SCAN': {
@@ -449,6 +471,10 @@ export class MyDurableObject extends DurableObject {
       }
       case 'STATS': {
         this._gc();
+        // ✅ [v14] LENGTH(vdata)는 압축 적용 여부와 무관하게 "실제 SQLite에
+        // 저장된 바이트 수"를 반환한다 — 압축된 행은 압축 후 크기가 그대로
+        // 잡히므로, bytesApprox는 관리 패널에서 실질 저장 절감 효과를
+        // 확인하는 데도 그대로 쓸 수 있다(별도 계측 불필요).
         const cursor = this.sql.exec(`SELECT COUNT(*) AS c, COALESCE(SUM(LENGTH(vdata)),0) AS b FROM kv`);
         const rows = cursor.toArray ? cursor.toArray() : [...cursor];
         const row = rows[0] || { c: 0, b: 0 };
