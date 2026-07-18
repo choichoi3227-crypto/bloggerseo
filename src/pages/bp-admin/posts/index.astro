@@ -1,0 +1,32 @@
+---
+import AdminLayout from '../../layouts/AdminLayout.astro';
+---
+<AdminLayout title="글 관리" active="posts">
+  <header class="page-head">
+    <h1>글 관리</h1>
+    <p>Blogger에 직접 로그인하지 않고 여기서 글을 쓰고, 수정하고, 발행합니다.</p>
+  </header>
+
+  <div class="placeholder">
+    <strong>다음 단계에서 구현됩니다</strong>
+    <span>Blogger API 연동(글 목록 조회·작성·수정·삭제, 이미지 업로드, 예약 발행)이 이 화면에 붙습니다.</span>
+  </div>
+
+  <style>
+    .page-head { margin-bottom: 24px; }
+    .page-head h1 { font-size: 26px; margin-bottom: 6px; }
+    .page-head p { margin: 0; color: var(--bp-text-mute); font-size: 14px; }
+    .placeholder {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 22px 24px;
+      border: 1px dashed var(--bp-border);
+      border-radius: var(--bp-radius-md);
+      color: var(--bp-text-mute);
+      background: var(--bp-surface);
+    }
+    .placeholder strong { color: var(--bp-text); font-size: 14px; }
+    .placeholder span { font-size: 13px; }
+  </style>
+</AdminLayout>
