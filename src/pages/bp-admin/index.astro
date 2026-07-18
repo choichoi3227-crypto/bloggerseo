@@ -1,0 +1,80 @@
+---
+import AdminLayout from '../layouts/AdminLayout.astro';
+import DashboardSummary from '../components/DashboardSummary.tsx';
+---
+<AdminLayout title="대시보드" active="dashboard">
+  <header class="page-head">
+    <h1>대시보드</h1>
+    <p>사이트 상태와 핵심 지표를 한눈에 확인하세요.</p>
+  </header>
+
+  <DashboardSummary client:load />
+
+  <section class="quick-actions">
+    <h2>빠른 작업</h2>
+    <div class="actions-grid">
+      <a class="action" href="/bp-admin/posts/new">
+        <strong>새 글 작성</strong>
+        <span>Blogger에 직접 로그인하지 않고 바로 발행</span>
+      </a>
+      <a class="action" href="/bp-admin/performance">
+        <strong>캐시 상태 확인</strong>
+        <span>히트율, Redis 샤드, Cache Reserve</span>
+      </a>
+      <a class="action" href="/bp-admin/seo">
+        <strong>사이트맵 재생성</strong>
+        <span>사이트맵 / RSS 즉시 갱신</span>
+      </a>
+      <a class="action" href="/bp-admin/security">
+        <strong>보안 로그 보기</strong>
+        <span>차단된 IP, 봇 탐지 이력</span>
+      </a>
+    </div>
+  </section>
+
+  <style>
+    .page-head { margin-bottom: 24px; }
+    .page-head h1 { font-size: 26px; margin-bottom: 6px; }
+    .page-head p { margin: 0; color: var(--bp-text-mute); font-size: 14px; }
+
+    .quick-actions { margin-top: 32px; }
+    .quick-actions h2 {
+      font-size: 15px;
+      color: var(--bp-text-mute);
+      margin-bottom: 12px;
+      font-weight: 600;
+    }
+    .actions-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }
+    .action {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 16px 18px;
+      background: var(--bp-surface);
+      border: 1px solid var(--bp-border);
+      border-radius: var(--bp-radius-md);
+      text-decoration: none;
+      transition: border-color 0.12s ease, transform 0.12s ease;
+    }
+    .action:hover {
+      border-color: var(--bp-accent);
+      transform: translateY(-1px);
+    }
+    .action strong {
+      font-size: 14px;
+      color: var(--bp-text);
+    }
+    .action span {
+      font-size: 12px;
+      color: var(--bp-text-mute);
+    }
+
+    @media (max-width: 880px) {
+      .actions-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</AdminLayout>
