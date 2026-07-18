@@ -151,7 +151,7 @@ mode = "smart"
 # (권장 배치: bloggerseo 레포 루트에 bp-admin-dist/ 폴더로 빌드 산출물을
 #  복사한 뒤 아래 directory를 "./bp-admin-dist"로 지정)
 [assets]
-directory = "./bp-admin-dist"
+directory = "./src"
 binding   = "BP_ADMIN_ASSETS"
 # html_handling: "auto-trailing-slash" — 확장자 없는 경로(/bp-admin/login)를
 # 대응하는 디렉토리의 index.html(/bp-admin/login/index.html)로 자동 매핑한다.
