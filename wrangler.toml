@@ -143,3 +143,20 @@ head_sampling_rate = 1
 
 [placement]
 mode = "smart"
+
+# ─── bp-admin 정적 자산 (Astro 빌드 산출물) ────────────────────────────
+# bp-admin-src/ 에서 `npm run build`로 생성된 dist/ 폴더를 가리킨다.
+# 배포 전 반드시 bp-admin-src에서 빌드를 먼저 실행해야 하며, 이 Worker
+# 레포 안에 dist 결과물을 복사해 넣거나 경로를 맞춰야 한다.
+# (권장 배치: bloggerseo 레포 루트에 bp-admin-dist/ 폴더로 빌드 산출물을
+#  복사한 뒤 아래 directory를 "./bp-admin-dist"로 지정)
+[assets]
+directory = "./bp-admin-dist"
+binding   = "BP_ADMIN_ASSETS"
+# html_handling: "auto-trailing-slash" — 확장자 없는 경로(/bp-admin/login)를
+# 대응하는 디렉토리의 index.html(/bp-admin/login/index.html)로 자동 매핑한다.
+# Astro의 build.format = 'directory' 산출물 구조와 짝을 이루는 필수 설정이다.
+html_handling = "auto-trailing-slash"
+# not_found_handling: SPA가 아니라 Astro의 다중 정적 페이지 구조이므로
+# 404는 Astro가 생성한 실제 404 페이지 유무에 맡긴다(자동 폴백 없음).
+not_found_handling = "404-page"
