@@ -2,3 +2,11 @@ node_modules/
 .wrangler/
 package-lock.json
 *.log
+
+# bp-admin (Astro 관리자 패널) 빌드 산출물 —
+# 배포 전 `bash scripts/build-bp-admin.sh` 로 매번 새로 생성한다.
+bp-admin-dist/
+bp-admin-src/dist/
+bp-admin-src/.astro/
+bp-admin-src/node_modules/
+bp-admin-src/package-lock.json

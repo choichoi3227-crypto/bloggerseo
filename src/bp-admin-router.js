@@ -202,21 +202,17 @@ export async function handleBpAdminStatic(request, url, env) {
     }
   }
 
-  return env.BP_ADMIN_ASSETS.fetch(rewriteToAssetsRequest(request, url));
-}
-
-/**
- * Astro의 `base: '/bp-admin'` 설정은 HTML 안의 링크/에셋 URL에는
- * '/bp-admin' 프리픽스를 붙이지만, 실제 dist/ 파일 출력 경로에는 그
- * 프리픽스를 만들지 않는다(예: dist/login/index.html, dist/_astro/*.js —
- * dist/bp-admin/... 이 아니다). 반면 실제 브라우저 요청은 항상
- * '/bp-admin/...'로 들어온다. 그래서 Workers Assets에 넘기기 전에
- * 요청 경로에서 '/bp-admin' 프리픽스를 제거한 새 Request를 만들어야
- * dist의 실제 파일 위치와 맞아떨어진다.
- */
-function rewriteToAssetsRequest(request, url) {
-  let assetPath = url.pathname.replace(/^\/bp-admin/, '');
-  if (assetPath === '') assetPath = '/';
-  const assetUrl = new URL(assetPath + url.search, url.origin);
-  return new Request(assetUrl.toString(), request);
+  // Astro의 `base: '/bp-admin'` 설정 때문에 dist/ 산출물 자체가 이미
+  // '/bp-admin' 프리픽스를 반영한 경로로 생성된다
+  // (예: dist/bp-admin.html, dist/bp-admin/login.html, dist/_astro/*.js —
+  // 단 _astro는 프리픽스 없이 루트에 그대로 생성됨. 다만 HTML이 참조하는
+  // 스크립트 URL 자체는 '/bp-admin/_astro/...'로 박혀 있으므로 Assets가
+  // 그 요청도 처리할 수 있어야 한다. 그래서 여기서는 프리픽스를 제거하지
+  //않고 요청을 그대로 Assets 바인딩에 전달한다 — Workers Assets가
+  // '/bp-admin/login' → 'dist/bp-admin/login.html'을,
+  // '/bp-admin/_astro/x.js' → 'dist/bp-admin/_astro/x.js' 로 찾는데,
+  // 실제 _astro 산출물은 dist/_astro/에 있으므로 배포 시 이 폴더를
+  // dist/bp-admin/_astro로도 복사(또는 심링크)해 두어야 한다.
+  // (배포 스크립트에서 처리, README 참고)
+  return env.BP_ADMIN_ASSETS.fetch(request);
 }

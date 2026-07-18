@@ -145,18 +145,26 @@ head_sampling_rate = 1
 mode = "smart"
 
 # ─── bp-admin 정적 자산 (Astro 빌드 산출물) ────────────────────────────
-# bp-admin-src/ 에서 `npm run build`로 생성된 dist/ 폴더를 가리킨다.
-# 배포 전 반드시 bp-admin-src에서 빌드를 먼저 실행해야 하며, 이 Worker
-# 레포 안에 dist 결과물을 복사해 넣거나 경로를 맞춰야 한다.
-# (권장 배치: bloggerseo 레포 루트에 bp-admin-dist/ 폴더로 빌드 산출물을
-#  복사한 뒤 아래 directory를 "./bp-admin-dist"로 지정)
+# bp-admin-src/ 에서 `npm run build` → scripts/build-bp-admin.sh 로 생성된
+# bp-admin-dist/ 폴더를 가리킨다. 배포 전 반드시
+#   bash scripts/build-bp-admin.sh
+# 를 먼저 실행해야 한다 (Astro 빌드 + 경로 재배치를 한 번에 처리).
 [assets]
-directory = "./src"
+directory = "./bp-admin-dist"
 binding   = "BP_ADMIN_ASSETS"
 # html_handling: "auto-trailing-slash" — 확장자 없는 경로(/bp-admin/login)를
-# 대응하는 디렉토리의 index.html(/bp-admin/login/index.html)로 자동 매핑한다.
-# Astro의 build.format = 'directory' 산출물 구조와 짝을 이루는 필수 설정이다.
+# 대응하는 login.html 파일에 자동 매핑한다(astro.config.mjs의
+# build.format='file' 산출물과 짝을 이루는 필수 설정. 폴더+index.html 구조가
+# 아니라 파일 하나짜리 구조이므로 auto-trailing-slash가 file.html → /file
+# 로 정확히 매핑해 준다).
 html_handling = "auto-trailing-slash"
 # not_found_handling: SPA가 아니라 Astro의 다중 정적 페이지 구조이므로
 # 404는 Astro가 생성한 실제 404 페이지 유무에 맡긴다(자동 폴백 없음).
 not_found_handling = "404-page"
+# run_worker_first: [필수] 기본값(false)은 정적 자산이 매칭되면 Worker 코드를
+# 완전히 건너뛰고 Cloudflare가 곧바로 서빙한다. 그러면 bp-admin-router.js의
+# 세션 체크(로그인 안 한 사용자를 /bp-admin/login으로 리다이렉트하는 로직)가
+# 절대 실행되지 않아, 인증 없이도 대시보드 HTML이 그대로 노출된다.
+# /bp-admin* 경로는 Worker가 먼저 실행되어 인증 게이트를 통과해야 하므로
+# 명시적으로 지정한다(다른 정적 자산이 없는 프로젝트이므로 전체 경로 지정).
+run_worker_first = ["/bp-admin*"]
