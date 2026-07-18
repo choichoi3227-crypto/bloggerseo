@@ -6,6 +6,7 @@
   "main": "worker.js",
   "scripts": {
     "dev": "wrangler dev",
+    "build": "bash scripts/build-bp-admin.sh",
     "build:bp-admin": "bash scripts/build-bp-admin.sh",
     "deploy": "npm run build:bp-admin && wrangler deploy",
     "build:wasm": "cd wasm-src && npx asc assembly/index.ts -o bloggerseo.wasm --target release -O3 --runtime stub --exportRuntime && node build-blob.js",
