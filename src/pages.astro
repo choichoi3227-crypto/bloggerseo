@@ -1,0 +1,73 @@
+---
+import '../styles/tokens.css';
+import LoginForm from '../components/LoginForm.tsx';
+---
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>로그인 · bp-admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div class="login-shell">
+    <div class="login-card">
+      <div class="mark">
+        <span class="mark-badge">bp</span>
+        <h1>admin</h1>
+      </div>
+      <p class="subtitle">블로그스팟을 워드프레스처럼 운영합니다.</p>
+
+      <LoginForm client:load />
+    </div>
+  </div>
+
+  <style>
+    .login-shell {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(242,193,78,0.08), transparent 40%),
+        var(--bp-ink);
+      padding: 20px;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 380px;
+      background: var(--bp-surface);
+      border-radius: var(--bp-radius-lg);
+      box-shadow: var(--bp-shadow-lg);
+      padding: 36px 32px 32px;
+    }
+    .mark {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .mark-badge {
+      background: var(--bp-ink);
+      color: var(--bp-accent);
+      font-family: var(--bp-font-display);
+      font-weight: 700;
+      font-size: 14px;
+      padding: 3px 8px;
+      border-radius: var(--bp-radius-sm);
+    }
+    .mark h1 {
+      font-size: 22px;
+      color: var(--bp-text);
+    }
+    .subtitle {
+      margin: 0 0 24px;
+      font-size: 13px;
+      color: var(--bp-text-mute);
+    }
+  </style>
+</body>
+</html>
