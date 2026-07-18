@@ -1,0 +1,82 @@
+/*
+ * BloggerSEO bp-admin 디자인 토큰
+ * ────────────────────────────────────────────────────────────────
+ * 팔레트: 잉크 네이비 사이드바 + 오프화이트 캔버스 + 시그널 옐로우 액센트.
+ * Blogger의 주황(#FF5722 계열)이나 워드프레스의 파랑(#2271B1)과 겹치지
+ * 않도록 의도적으로 다른 색군을 선택해 "이 제품만의" 관리자 화면임을
+ * 시각적으로도 분리한다.
+ */
+:root {
+  /* 색 */
+  --bp-ink:        #12172B; /* 사이드바/헤더 배경 */
+  --bp-ink-soft:   #1B2140; /* 사이드바 hover/active 배경 */
+  --bp-canvas:     #F7F7F5; /* 본문 배경 */
+  --bp-surface:    #FFFFFF; /* 카드 배경 */
+  --bp-border:     #E4E3DD;
+  --bp-text:       #1B1D23;
+  --bp-text-mute:  #6B6E7A;
+  --bp-text-inv:   #F1F1EE; /* 어두운 배경 위 텍스트 */
+  --bp-text-inv-mute: #9296AC;
+
+  --bp-accent:      #F2C14E; /* 시그널 옐로우 — 능동 액션 전용 */
+  --bp-accent-ink:  #3A2C00; /* accent 위에 올라가는 텍스트 */
+  --bp-accent-hover:#E0AE3A;
+
+  --bp-success: #2FAE66;
+  --bp-warning: #E0A82E;
+  --bp-danger:  #D64545;
+  --bp-info:    #4E8CF2;
+
+  /* 타이포 */
+  --bp-font-display: "Space Grotesk", "Pretendard", sans-serif;
+  --bp-font-body:    "Inter", "Pretendard", sans-serif;
+  --bp-font-mono:    "JetBrains Mono", ui-monospace, monospace;
+
+  /* 스케일 */
+  --bp-radius-sm: 6px;
+  --bp-radius-md: 10px;
+  --bp-radius-lg: 16px;
+  --bp-shadow-sm: 0 1px 2px rgba(18, 23, 43, 0.06);
+  --bp-shadow-md: 0 4px 16px rgba(18, 23, 43, 0.08);
+  --bp-shadow-lg: 0 12px 32px rgba(18, 23, 43, 0.14);
+
+  --bp-sidebar-w: 248px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bp-canvas);
+  color: var(--bp-text);
+  font-family: var(--bp-font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--bp-font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+a { color: inherit; }
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* 키보드 포커스는 항상 시각적으로 보여야 한다 */
+:focus-visible {
+  outline: 2px solid var(--bp-info);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
