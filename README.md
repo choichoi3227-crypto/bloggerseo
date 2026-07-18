@@ -1,299 +1,41 @@
-# BloggerSEO Worker v7
+# bp-admin 1단계: 로그인 + 대시보드 뼈대
 
-## 📋 신규 기능 (v6 → v7)
+## 무엇이 바뀌었나
 
-| 기능 | 설명 |
-|------|------|
-| **100% 자체 제작 서버리스 Redis** | Durable Objects(SQLite storage) 기반, 64-way 샤딩으로 자체 한도를 우회해 확장. KV/D1 미사용, Upstash 미사용도 가능 |
-| **자동 스키마 마크업** | 필수: Article, FAQ(AI 추출) / 선택: Breadcrumb, Product |
-| **Argo Smart Routing** | 지역 레이턴시 기반 최적 경로 자동 선택 (KR→JP→US→EU) |
-| **Regional Tiered Cache** | 지역별 캐시 계층 구조 + DO Redis 영속 히트율 추적 |
-| **Priority Routing** | 봇(Tier1) > 모바일(Tier2) > 데스크탑(Tier3) 우선순위 처리 |
-| **Cache Reserve (4h)** | SWR 지원, 백그라운드 재검증, URL 단위 무효화 |
-| **Load Balancer** | inFlight 기반, 503+Retry-After, 워커 heartbeat |
-| **Cron: 사이트맵(1h)/RSS(30m)** | DO Redis 저장 후 엔드포인트 서빙 |
-| **SEO 극대화** | 구글/네이버/빙 인증태그, og:locale, IndexNow 힌트 |
-| **관리 패널** | `/panel` SPA: 대시보드, 캐시, **Redis 클러스터 관리**, 라우팅, LB, 애널리틱스, IP 차단 |
+### 수정된 파일 (기존 bloggerseo 레포)
+- `worker.js` — `/bp-admin` 및 `/bp-admin/api/*` 라우팅 분기 추가 (기존 로직은 그대로)
+- `wrangler.toml` — `[assets]` 바인딩(`BP_ADMIN_ASSETS`) 추가
 
----
+### 신규 파일 (기존 bloggerseo 레포에 추가)
+- `src/bp-admin-auth.js` — 계정/세션/비밀번호 해싱 (KV 기반, 별도 D1 불필요)
+- `src/bp-admin-router.js` — `/bp-admin` API 핸들러 + 정적 자산 서빙/인증 게이트
 
-## 🏗️ 스토리지 아키텍처 (v7 핵심 변경)
+### 신규 프로젝트 (Astro + React 하이브리드 프론트엔드)
+- `bp-admin-src/` — 전체 소스. `npm install && npm run build`로 `dist/`가 생성됨
+- `bp-admin-dist/` — 위 소스를 미리 빌드해 둔 산출물 (즉시 배포 가능하도록 동봉)
 
-```
-읽기 우선순위:
-  1순위 DO Redis (자체 제작, Durable Objects)  ← 메인
-  2순위 SLUG_KV (Cloudflare KV)                ← 백업
-  3순위 Upstash Redis (REST API, 선택)         ← 추가 백업
-  4순위 L1 메모리 (30초 TTL)                    ← 초고속 폴백
-  5순위 L4 메모리 (TTL 없음)                    ← 최후 안전망
+## 배포 방법
 
-쓰기: 위 1~3순위 모두에 동시 기록 (하나가 죽어도 나머지로 즉시 폴백)
-```
+1. `bp-admin-step1/` 안의 파일들을 기존 bloggerseo 레포 루트에 그대로 덮어쓰기 (worker.js, wrangler.toml, src/*, bp-admin-dist/, bp-admin-src/)
+2. `wrangler deploy`
+3. 배포 후 `{도메인}/bp-admin/login`에 접속 → 계정이 하나도 없으므로 자동으로 "관리자 계정 만들기" 화면이 뜸 → 최초 계정 생성
+4. 이후 `{도메인}/bp-admin`으로 로그인해 대시보드 확인
 
-### ⚠️ "무한 용량"에 대한 정확한 설명
-Durable Object 1개의 SQLite storage는 계정/플랜에 따라 자체 한도를 가집니다. 이 구현은
-키를 해시로 `REDIS_SHARD_COUNT`개(기본 64개)의 **독립된 DO 인스턴스**에 분산시켜,
-**총 용량 = 샤드 수 × 1개 DO 한도**로 선형 확장합니다. 샤드 수를 늘리면 코드 변경 없이
-용량이 그만큼 늘어나며, 실용적으로는 거의 닿기 어려운 수준까지 커지지만 수학적으로
-완전한 "무한"은 아닙니다. `wrangler.toml`의 `REDIS_SHARD_COUNT`만 조절하면 됩니다.
+## 지금 이 단계에서 되는 것 / 안 되는 것
 
-### Workers Free 플랜에서 동작하는 이유
-Durable Objects는 SQLite storage backend를 사용하면 **Workers Free 플랜에서도 생성·사용 가능**합니다
-(Key-Value storage backend는 유료 플랜 전용). 이 레포의 `MyDurableObject` 클래스는 SQLite storage만 사용하므로
-별도 결제 없이 동작합니다. 단, Free 플랜에는 요청 수·GB-초 등의 일일 한도가 있으니
-트래픽이 많다면 Workers Paid 플랜($5/월)으로 업그레이드를 검토하세요.
+**됨:**
+- `/bp-admin/login`에서 아이디+비밀번호 로그인 (Blogspot 계정과 무관한 별도 계정)
+- 로그인 세션 유지(12시간, HttpOnly 쿠키)
+- 대시보드에서 사이트 상태·캐시 히트율·차단 IP 수 등 실시간 조회
+- 좌측 네비게이션 전체 뼈대 (글 관리/SEO/광고/성능/보안/설정)
 
----
+**아직 안 됨 (다음 단계):**
+- 실제 Blogger API 연동 (글 목록 조회, 작성, 수정, 이미지 업로드) — 지금은 "글 관리" 메뉴가 플레이스홀더
+- alpack/aibp-pro 플러그인 기능 이식
+- WP Rocket 수준 캐시 엔진 확장
 
-## 🚀 빠른 시작
+## 설계 메모
 
-### 1. 시크릿 설정 (필수, wrangler.toml에 직접 적지 않습니다)
-
-```bash
-# 관리 패널 인증 키 (필수)
-wrangler secret put PANEL_SECRET
-
-# Upstash Redis — 선택 사항(자체 DO Redis의 추가 백업이 필요할 때만)
-wrangler secret put UPSTASH_REDIS_URL
-wrangler secret put UPSTASH_REDIS_TOKEN
-
-# 관리 패널의 Cloudflare 연동 기능(워커/라우트 자동 관리)을 쓸 경우
-wrangler secret put CF_API_TOKEN
-
-# ── SSL/TLS 인증서 자동 관리 (필요 권한: Zone:SSL and Certificates:Edit, Zone Settings:Edit)
-wrangler secret put CF_API_TOKEN   # (위와 동일 토큰으로 SSL도 관리)
-```
-
-> **CF_API_TOKEN 권한 설정**: Cloudflare 대시보드 → My Profile → API Tokens → Create Token
-> - `Zone:SSL and Certificates:Edit`
-> - `Zone:Zone Settings:Edit`
-> - (선택) `Zone:Zone:Read`
-
----
-
-### 🔒 SSL/TLS 자동 인증서 설정
-
-BloggerSEO v7은 **블로그스팟에서 별도 SSL 설정 없이** Cloudflare가 앞단에서 완전한 HTTPS를 처리합니다.
-
-#### 동작 구조
-```
-방문자 (HTTPS) ──▶ Cloudflare Worker ──▶ 블로그스팟 원본 (HTTP/ghs.google.com)
-                    ↑ TLS 1.2+, Let's Encrypt 또는 Google Trust Services
-```
-
-#### 설정 방법
-
-1. **wrangler.toml** 에서 Zone ID 설정:
-   ```toml
-   CF_ZONE_ID = "your-cloudflare-zone-id"
-   SSL_CA = "lets_encrypt"   # 또는 "google" (Google Trust Services)
-   ```
-
-2. **API 토큰 등록**:
-   ```bash
-   wrangler secret put CF_API_TOKEN
-   ```
-
-3. **패널에서 초기 설정 실행**: `/panel` → 🔒 SSL/TLS 인증서 → "초기 설정" 버튼 클릭
-
-#### 포함 기능
-| 기능 | 설명 |
-|------|------|
-| **HTTP → HTTPS 자동 리디렉션** | Worker 레벨에서 301 리디렉션, 즉시 처리 |
-| **Let's Encrypt 인증서** | Cloudflare Universal SSL 통해 자동 발급 |
-| **Google Trust Services 인증서** | 선택 가능, 구글 신뢰체인 |
-| **자동 갱신** | Cron (매 1시간) — 만료 30일 전 자동 갱신 |
-| **TLS 1.2 최소 버전** | 구식 TLS 차단 |
-| **패널에서 현황 확인** | `/panel` → 🔒 SSL/TLS 탭에서 인증서 목록, 만료일, 상태 조회 |
-| **블로그스팟 SSL 불필요** | Cloudflare Flexible 모드로 원본 HTTP 허용 |
-
----
-
-> 기존에 `wrangler.toml`에 평문으로 들어있던 Upstash URL/토�큰과 `PANEL_SECRET`은
-> 모두 제거되었습니다. 이미 깃허브에 커밋된 적이 있다면 **반드시 해당 자격증명을
-> 폐기(rotate)** 하세요 — git 히스토리에 남아있는 과거 값은 더 이상 유효하지 않은
-> 새 값으로 교체해도 히스토리 자체에서는 지워지지 않습니다.
-
-### 2. wrangler.toml의 비밀 아님 값만 직접 수정
-
-```toml
-[vars]
-SITE_BASE_URL       = "https://yourdomain.com"
-SITE_TITLE          = "내 블로그 이름"
-REDIS_SHARD_COUNT   = "64"   # 자체 Redis 샤드 수 — 늘릴수록 총 용량 선형 증가
-GOOGLE_SITE_VERIFY  = "..."
-NAVER_SITE_VERIFY   = "..."
-BING_SITE_VERIFY    = "..."
-AI_FAQ_ENABLED      = "true"
-```
-
-### 3. KV 네임스페이스 (백업용, 선택이지만 권장)
-
-```toml
-[[kv_namespaces]]
-binding = "SLUG_KV"
-id      = "기존 KV ID 유지"
-```
-
-### 4. 배포
-
-```bash
-npm install
-wrangler deploy
-```
-
-첫 배포 시 `wrangler.toml`의 `[[migrations]]` 설정에 따라 `MyDurableObject` Durable Object
-클래스가 자동으로 등록됩니다. 별도 작업이 필요 없습니다.
-
-### 5. Workers AI 바인딩 (FAQ 자동 추출, 기본 포함됨)
-
-`wrangler.toml`에 이미 `[ai]` 바인딩이 설정되어 있습니다. FAQ 추출에 사용하는 모델은
-`@cf/meta/llama-3.1-8b-instruct-fast`입니다. Workers **Free** 플랜은 하루 10,000 neurons
-한도가 있으므로, AI FAQ 추출 트래픽이 많다면 사용량을 모니터링하세요.
-
----
-
-## 🛡️ 관리 패널
-
-`https://yourdomain.com/panel` 접속 → 시크릿 키 입력
-
-| 탭 | 기능 |
-|----|------|
-| 📊 대시보드 | 총 요청, 에러율, 레이턴시, 워커 부하, 상태 코드 분포 |
-| 💾 캐시 관리 | Cache Reserve 현황, 전체 삭제 |
-| 🧬 **Redis 관리** | **DO 샤드별 키 개수/용량, 전체 비우기(FLUSHALL)** |
-| 🌐 라우팅 상태 | 지역별 캐시 히트율 (KR/JP/US/EU/SG/AU) |
-| ⚖️ 로드밸런서 | 활성 인스턴스 목록, 부하 현황 |
-| 📈 캐시 애널리틱스 | 캐시 HIT/MISS, 페이지뷰, 지역/디바이스 분포 |
-| 🛡️ 보안/IP 관리 | IP 차단/해제, 차단 목록 조회 |
-| 🗺️ 사이트맵/RSS | 즉시 생성, Cron 스케줄 확인 |
-
----
-
-## 📡 API 엔드포인트
-
-| 경로 | 설명 |
-|------|------|
-| `/sitemap.xml` | 자동 생성 사이트맵 (1시간 캐시) |
-| `/rss.xml` | 자동 생성 RSS 피드 (30분 캐시) |
-| `/atom.xml` | RSS와 동일 |
-| `/__debug` | 워커 상태 정보 (DO Redis 연동 여부 포함) |
-| `/__metrics` | 실시간 메트릭 (JSON) |
-| `/__lb_status` | 로드밸런서 상태 |
-| `/__cache_stats` | Cache Reserve 통계 |
-| `/panel` | 관리 패널 SPA |
-| `/panel/api/redis_stats` | DO Redis 클러스터 통계 (인증 필요) |
-| `/panel/api/redis_flush` | DO Redis 전체 비우기 (POST, 인증 필요) |
-
----
-
-## 🏗️ 아키텍처
-
-```
-요청 → IP 차단 체크 → Priority Routing (티어 결정)
-     → Argo Smart Routing (지역 선택)
-     → Rate Limit
-     → Cache Reserve L2 조회 (DO Redis 1순위 → KV → Upstash)
-       ├─ HIT → 반환 (SWR이면 백그라운드 재검증)
-       └─ MISS → 슬러그 라우팅 → Load Balancer
-               → Origin Fetch (Argo 경로)
-               → HTML 변환 파이프라인
-                 ├─ 스키마 마크업 (필수: Article/FAQ, 선택: Breadcrumb/Product)
-                 ├─ SEO 태그 (구글/네이버/빙)
-                 ├─ 모바일/데스크탑 최적화
-                 └─ 성능 최적화
-               → Cache Reserve 저장 (4h TTL, DO Redis + KV + Upstash 동시 기록)
-               → 응답 반환
-```
-
----
-
-## ⚙️ 스키마 마크업 동작
-
-| 스키마 | 필수/선택 | 조건 | AI 사용 |
-|--------|-----------|------|---------|
-| WebSite | - | 항상 | ❌ |
-| Article | **필수** | 포스트/페이지 | ❌ |
-| FAQPage | **필수** | HTML에 Q&A 패턴 or AI 추출 | ✅ (Workers AI) |
-| BreadcrumbList | 선택 | URL 경로 2단계+ | ❌ |
-| Product | 선택 | 가격 패턴 감지 | ❌ |
-
----
-
-## 🔧 환경 변수 / 시크릿 전체 목록
-
-### 시크릿 (`wrangler secret put`으로 등록)
-| 이름 | 필수 | 설명 |
-|------|------|------|
-| `PANEL_SECRET` | ✅ | 관리 패널 인증 키 |
-| `UPSTASH_REDIS_URL` | 선택 | DO Redis의 추가 백업용 (없어도 정상 동작) |
-| `UPSTASH_REDIS_TOKEN` | 선택 | 위와 동일 |
-| `CF_API_TOKEN` | 선택 | 관리 패널의 Cloudflare 연동 기능용 |
-
-### 변수 (`wrangler.toml`의 `[vars]`)
-| 변수 | 필수 | 설명 |
-|------|------|------|
-| `SITE_BASE_URL` | ✅ | 사이트 기본 URL (사이트맵용) |
-| `SITE_TITLE` | 권장 | 사이트 이름 (RSS용) |
-| `REDIS_SHARD_COUNT` | 선택 | 자체 Redis 샤드 수 (기본 64, 늘릴수록 총 용량 증가) |
-| `RATE_LIMIT_PER_MIN` | 선택 | 분당 요청 제한 (기본 600) |
-| `CACHE_RESERVE_TTL_SEC` | 선택 | 캐시 만료 (기본 14400 = 4h) |
-| `GOOGLE_SITE_VERIFY` | 선택 | 구글 서치콘솔 인증 |
-| `NAVER_SITE_VERIFY` | 선택 | 네이버 서치어드바이저 인증 |
-| `BING_SITE_VERIFY` | 선택 | 빙 웹마스터 인증 |
-| `AI_FAQ_ENABLED` | 선택 | AI FAQ 추출 활성화 (true/false, 기본 true) |
-
----
-
-## 🔎 참고: 무료 서버리스 Redis 대체 서비스 5종 (조사 자료)
-
-이 레포는 DO 기반 자체 Redis를 1순위로 사용하지만, 비교 참고용으로 무료 티어가
-있는 서버리스 Redis 호환 서비스 5개를 정리합니다. (2026년 6월 기준, 변동 가능)
-
-| 서비스 | 무료 티어 | 특징 |
-|--------|-----------|------|
-| **Upstash Redis** | 월 50만 커맨드, 256MB, 대역폭 10GB/월 | HTTP REST API로 Cloudflare Workers/Vercel Edge 등에서 직접 사용 가능. 표준 Redis 프로토콜과 호환. 이 레포에서 선택적 백업으로 지원 |
-| **Momento Cache** | 매달 50GB 무료 | AWS ElastiCache 팀 출신이 만든 서버리스 캐시로, Lambda 등과 연동이 쉬움. Redis 프로토콜이 아닌 자체 SDK 사용 |
-| **Redis Cloud (Redis Ltd. 공식)** | Free 플랜 제공 | 공식 Redis 서비스로 RediSearch, RedisJSON 등 모듈 생태계가 가장 풍부하지만 TCP 전용이라 서버리스/엣지 런타임에서는 별도 프록시가 필요 |
-| **Vercel Marketplace Redis (Upstash 기반)** | Upstash Redis를 그대로 사용하지만 커맨드당 2배 요금 | Vercel 대시보드에서 원클릭 연동, Vercel 생태계에 한정하면 설정이 가장 단순 |
-| **AWS ElastiCache Serverless** | AWS 프리티어 가입 시점에 따라 일부 무료 사용량 제공(신규 가입자 기준) | VPC 내부에서만 동작, Cloudflare Workers 같은 외부 엣지 런타임에서는 직접 연결 불가 |
-
-> 참고: Cloudflare 자체 KV/D1도 무료 티어를 제공하지만 Redis 호환 명령어(LPUSH, SCAN
-> 등)를 지원하지 않으므로 이 비교에서는 제외했습니다. 이 레포는 정확히 그 빈틈을
-> DO 기반 자체 Redis 구현으로 메우는 방식입니다.
-
-## v10 자동 연동·성능·보안 기능
-
-- **구글 자원 연동**: Search Console, AdSense, Trends 상태/동기화 엔드포인트를 서비스 계정 모드로 준비했습니다. 클라이언트 ID/클라이언트 시크릿을 패널에서 입력하지 않고 `GOOGLE_SERVICE_ACCOUNT_JSON` secret만 사용합니다.
-- **이미지 자동 최적화**: 이미지 요청은 Cloudflare Image Resizing(`format=avif/webp`, `quality`, metadata 제거)과 30일 CDN 캐시를 적용합니다. HTML `<img>`에는 lazy/async/fetchpriority 힌트를 자동 주입합니다. `npm run optimize:images`가 ImageMagick으로 원본을 선최적화하고 WebP를 생성하며, Worker는 런타임 엣지 변환 폴백을 담당합니다.
-- **CDN/Cache Rate 개선**: 정적 이미지/자산은 `cacheEverything` 및 긴 TTL을 사용하고, HTML은 기존 L0 Cache API + L2 저장소 캐시를 유지합니다.
-- **애드센스 부정 클릭 보호**: AdSense 광고를 자동 감지해 클릭 비콘을 삽입하고, 동일 IP+기기에서 설정 시간 내 최대 클릭 수를 넘으면 설정 일수 동안 광고 영역을 숨깁니다.
-- **VPN/프록시 자동 차단**: Cloudflare request metadata(`threatScore`, `asOrganization`)로 VPN/프록시/데이터센터 의심 트래픽을 자동 차단합니다.
-- **응답 속도 개선**: 이미지 CDN 캐시, 정적 자산 edge cache, lazy image hints, 기존 stale cache fallback을 함께 사용합니다.
-- **관리 패널 다중 보안 인증**: 1차 `PANEL_SECRET`, 2차 Cloudflare Bot Fight/Bot Score 기준(`PANEL_CF_BOT_MFA`, `PANEL_MIN_BOT_SCORE`)을 적용합니다.
-
----
-
-## 📰 온라인 인터넷신문(언론사) 등록 안내
-
-이 사이트를 뉴스/시사성 콘텐츠를 다루는 매체로 운영해 정식 "인터넷신문사"로 인정받으려면,
-「신문 등의 진흥에 관한 법률」에 따라 사업장 소재지 관할 시·도(광역시청/도청)에
-**인터넷신문사업 등록**을 해야 합니다. 단순히 블로그/뉴스 사이트를 운영하는 것만으로는
-언론사 지위가 자동으로 부여되지 않습니다.
-
-| 절차 | 안내/신청 링크 |
-|------|----------------|
-| 1. 동일 제호(제목) 중복 확인 / 등록 현황 조회 | [정기간행물 등록관리시스템](https://pds.mcst.go.kr/pds/) (제호 검색·등록현황 메뉴 이용) |
-| 2. 등록신청서 서식 다운로드 | [문화체육관광부 – 신문사업·인터넷신문사업 등록신청서](https://mcst.go.kr/site/s_policy/dept/deptView.jsp?pSeq=1048&pDataCD=0417000000&pType=04) |
-| 3. 온라인 민원 접수(정부24) | [정부24 – 신문·인터넷신문 사업 등록](https://www.gov.kr/mw/AA020InfoCappView.do?HighCtgCD=A07002&CappBizCD=13700000050) |
-| 4. (해당 시) 인터넷뉴스서비스사업 등록 | [정부24 – 인터넷뉴스서비스사업 등록](https://www.gov.kr/main?a=AA020InfoCappViewApp&HighCtgCD=A07002&CappBizCD=13710000014) |
-
-**등록 전 준비물(개인/1인 미디어 기준)**
-- 발행인·편집인 기본증명서(발행인·편집인 동일인 지정 가능)
-- 인터넷신문 도메인(발행 주체 명의로 확보된 것)
-- 발행소(사무실/자택 모두 가능) 임대차계약서 사본(임차 시) 또는 건물 등기사항증명서(자가 소유 시)
-- 법인인 경우: 법인 등기사항증명서, 법인 정관(사업목적에 신문 관련 사업이 포함되어야 함), 법인 인감
-
-> ⚠️ 실제 등록 요건(예: 발행인 결격사유, 독자 기사 생산 비율 등)과 처리 기간은 관할 시·도 및
-> 법령 개정에 따라 달라질 수 있으므로, 신청 전 반드시 위 정부 공식 사이트에서 최신 요건을
-> 확인하시기 바랍니다. 이 항목은 법률 자문이 아니며 참고용 안내입니다.
+- Astro는 `output: 'static'`, `build.format: 'file'`로 빌드됩니다 (예: `login.astro` → `login.html`). Cloudflare Workers Assets의 `html_handling = "auto-trailing-slash"`와 조합해, 확장자 없는 URL(`/bp-admin/login`)이 트레일링 슬래시 리다이렉트 없이 바로 해당 HTML에 매핑되도록 맞췄습니다.
+- React는 `client:load`(로그인 폼, 즉시 필요) / `client:idle`(상태 펄스, 급하지 않음)로 구분해 초기 로딩을 최적화했습니다.
+- 비밀번호는 HMAC-SHA256 3,000회 스트레치(자체 KDF)로 해싱됩니다. 기존 프로젝트가 전역적으로 `wasmCore.hmacSha256Hex`(WASM 가속)를 채택하고 있어 동일 계열로 통일했습니다.
