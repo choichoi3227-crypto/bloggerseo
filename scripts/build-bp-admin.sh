@@ -24,16 +24,29 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$ROOT_DIR/bp-admin-src"
 OUT_DIR="$ROOT_DIR/bp-admin-dist"
 
-echo "▶ bp-admin Astro 빌드 시작 ($SRC_DIR)"
+# 패키지 매니저 자동 감지: bun이 있으면 bun, 없으면 npm.
+# (Cloudflare Workers Builds는 환경에서 bun을 감지하면 기본값으로 bun을
+#  쓰므로, 로컬/CI 어디서든 같은 스크립트가 동작하도록 자동 선택한다.)
+if command -v bun >/dev/null 2>&1; then
+  PM="bun"
+  PM_INSTALL="bun install"
+  PM_RUN="bun run build"
+else
+  PM="npm"
+  PM_INSTALL="npm install"
+  PM_RUN="npm run build"
+fi
+
+echo "▶ bp-admin Astro 빌드 시작 ($SRC_DIR) — 패키지 매니저: $PM"
 cd "$SRC_DIR"
 
 if [ ! -d node_modules ]; then
-  echo "  node_modules 없음 → npm install 실행"
-  npm install
+  echo "  node_modules 없음 → $PM_INSTALL 실행"
+  $PM_INSTALL
 fi
 
 rm -rf .astro dist
-npm run build
+$PM_RUN
 
 echo "▶ 산출물을 $OUT_DIR 로 복사"
 rm -rf "$OUT_DIR"
