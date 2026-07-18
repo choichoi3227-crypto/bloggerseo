@@ -1,0 +1,176 @@
+---
+import '../styles/tokens.css';
+import StatusPulse from '../components/StatusPulse.tsx';
+
+interface Props {
+  title: string;
+  active?: 'dashboard' | 'posts' | 'seo' | 'ads' | 'security' | 'performance' | 'settings';
+}
+
+const { title, active = 'dashboard' } = Astro.props;
+
+const nav = [
+  { key: 'dashboard',   label: '대시보드',   href: '/bp-admin',            icon: 'grid' },
+  { key: 'posts',       label: '글 관리',     href: '/bp-admin/posts',      icon: 'doc' },
+  { key: 'seo',         label: 'SEO',        href: '/bp-admin/seo',        icon: 'search' },
+  { key: 'ads',         label: '광고/공유',   href: '/bp-admin/ads',        icon: 'coin' },
+  { key: 'performance', label: '성능/캐시',   href: '/bp-admin/performance',icon: 'bolt' },
+  { key: 'security',    label: '보안',        href: '/bp-admin/security',   icon: 'shield' },
+  { key: 'settings',    label: '설정',        href: '/bp-admin/settings',   icon: 'gear' },
+] as const;
+---
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>{title} · bp-admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">bp</span>
+        <span class="brand-name">admin</span>
+      </div>
+
+      <StatusPulse client:idle />
+
+      <nav class="nav">
+        {nav.map((item) => (
+          <a href={item.href} class={`nav-item ${active === item.key ? 'is-active' : ''}`}>
+            <span class="nav-icon" data-icon={item.icon}></span>
+            {item.label}
+          </a>
+        ))}
+      </nav>
+
+      <form method="post" action="/bp-admin/api/auth/logout" class="logout">
+        <button type="submit">로그아웃</button>
+      </form>
+    </aside>
+
+    <main class="content">
+      <slot />
+    </main>
+  </div>
+
+  <style>
+    .shell {
+      display: grid;
+      grid-template-columns: var(--bp-sidebar-w) 1fr;
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      background: var(--bp-ink);
+      color: var(--bp-text-inv);
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 4px 8px;
+      font-family: var(--bp-font-display);
+    }
+    .brand-mark {
+      background: var(--bp-accent);
+      color: var(--bp-accent-ink);
+      font-weight: 700;
+      font-size: 14px;
+      padding: 2px 7px;
+      border-radius: var(--bp-radius-sm);
+    }
+    .brand-name {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--bp-text-inv-mute);
+    }
+
+    .nav {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      flex: 1;
+    }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--bp-radius-sm);
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--bp-text-inv-mute);
+      text-decoration: none;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+    .nav-item:hover {
+      background: var(--bp-ink-soft);
+      color: var(--bp-text-inv);
+    }
+    .nav-item.is-active {
+      background: var(--bp-ink-soft);
+      color: var(--bp-accent);
+    }
+    .nav-icon {
+      width: 16px;
+      height: 16px;
+      border-radius: 4px;
+      background: currentColor;
+      opacity: 0.55;
+      flex-shrink: 0;
+      mask-size: contain;
+      -webkit-mask-size: contain;
+    }
+
+    .logout {
+      margin: 0;
+    }
+    .logout button {
+      width: 100%;
+      background: transparent;
+      border: 1px solid rgba(241, 241, 238, 0.14);
+      color: var(--bp-text-inv-mute);
+      padding: 9px 12px;
+      border-radius: var(--bp-radius-sm);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .logout button:hover {
+      color: var(--bp-text-inv);
+      border-color: rgba(241, 241, 238, 0.3);
+    }
+
+    .content {
+      padding: 28px 36px 60px;
+      max-width: 1180px;
+    }
+
+    @media (max-width: 880px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar {
+        position: static;
+        height: auto;
+        flex-direction: row;
+        align-items: center;
+        overflow-x: auto;
+      }
+      .nav { flex-direction: row; }
+      .logout { display: none; }
+      .content { padding: 20px; }
+    }
+  </style>
+</body>
+</html>
