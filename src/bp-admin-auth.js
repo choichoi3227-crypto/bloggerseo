@@ -29,7 +29,7 @@ import { wasmCore } from './wasm-loader.js';
 
 const USER_PREFIX    = 'bpadmin:user:';
 const SESSION_PREFIX = 'bpadmin:session:';
-const SESSION_TTL_SEC = 60 * 60 * 12; // 12시간
+const SESSION_TTL_SEC = 30 * 24 * 60 * 60; // 30일 — 로그인 후 별도 재로그인 없이 자동 로그인 유지
 const KDF_ROUNDS = 3000; // ≈80ms/회 — 무차별 대입 저항성과 로그인 응답속도의 균형점
 
 // ── 비밀번호 해싱 ──────────────────────────────────────────────────────
@@ -121,6 +121,8 @@ export async function createSession(env, { username, role }) {
   return sessionId;
 }
 
+const SESSION_RENEW_THRESHOLD_SEC = 7 * 24 * 60 * 60; // 남은 기간이 7일 미만이면 자동 연장
+
 export async function getSession(env, sessionId) {
   if (!sessionId) return null;
   const record = await kvGetJson(env, SESSION_PREFIX + sessionId);
@@ -129,6 +131,18 @@ export async function getSession(env, sessionId) {
     await kvDel(env, SESSION_PREFIX + sessionId).catch(() => {});
     return null;
   }
+
+  // 슬라이딩 세션: 남은 유효기간이 임계값 미만이면 조용히 30일로
+  // 재연장한다. 이렇게 하면 30일 안에 최소 한 번만 접속해도 로그인이
+  // 끊기지 않고 계속 유지된다("자동 로그인"). 매 요청마다 갱신하지 않고
+  // 임계값 이하일 때만 갱신해 불필요한 KV 쓰기를 최소화한다.
+  const remainingMs = record.expiresAt - Date.now();
+  if (remainingMs < SESSION_RENEW_THRESHOLD_SEC * 1000) {
+    const renewed = { ...record, expiresAt: Date.now() + SESSION_TTL_SEC * 1000 };
+    await kvSetJson(env, SESSION_PREFIX + sessionId, renewed, SESSION_TTL_SEC).catch(() => {});
+    return renewed;
+  }
+
   return record;
 }
 

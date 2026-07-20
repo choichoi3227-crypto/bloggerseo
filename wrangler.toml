@@ -88,6 +88,21 @@ VPN_BLOCK_DAYS         = "7"
 PANEL_CF_BOT_MFA       = "true"        # 패널 2차 인증: Cloudflare Bot Fight/봇 점수
 PANEL_MIN_BOT_SCORE    = "30"
 
+# ─── Blogger API 연동 (bp-admin 글 관리) ───────────────────────────────
+# Blogspot에 직접 로그인하지 않고 /bp-admin에서 글을 쓰고 발행하려면
+# Google OAuth2 클라이언트가 필요합니다. 아래 두 값은 절대 [vars]에
+# 평문으로 두지 말고 반드시 시크릿으로 등록하세요:
+#   wrangler secret put GOOGLE_OAUTH_CLIENT_ID
+#   wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET
+#
+# 발급 방법:
+#   1. https://console.cloud.google.com/apis/credentials 접속
+#   2. "OAuth 클라이언트 ID 만들기" → 애플리케이션 유형: 웹 애플리케이션
+#   3. 승인된 리디렉션 URI에 다음을 추가: https://{도메인}/bp-admin/api/blogger/oauth/callback
+#   4. API 및 서비스 > 라이브러리에서 "Blogger API v3" 활성화
+#   5. 발급된 클라이언트 ID/보안 비밀번호를 위 secret 명령으로 등록
+GOOGLE_OAUTH_REDIRECT_PATH = "/bp-admin/api/blogger/oauth/callback"
+
 # Cloudflare API (관리 패널의 "워커/라우트 연동" 기능용 — 토큰은 secret으로 등록)
 CF_ZONE_ID             = ""           # Zone ID (비밀 아님, 여기 직접 입력 가능)
 CF_ACCOUNT_ID          = ""           # Account ID (비밀 아님, 여기 직접 입력 가능)

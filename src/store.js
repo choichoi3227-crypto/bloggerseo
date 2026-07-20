@@ -243,10 +243,13 @@ async function redisScan(env, pattern, count = 100) {
 // 글은 방문 자체가 TTL을 계속 연장한다.
 const MAX_DATA_TTL_SEC = 3600;              // 1시간 — cache:/schema: 등 일시적 데이터
 const SLUG_MAX_TTL_SEC = 30 * 24 * 3600;    // 30일 — slug:* 매핑 (실제 방문 시에만 갱신)
+const BPADMIN_SESSION_MAX_TTL_SEC = 30 * 24 * 3600; // 30일 — bp-admin 로그인 세션(자동 로그인 유지)
 
 function clampTtlForKey(key, ttlSec) {
   const k = typeof key === 'string' ? key : String(key ?? '');
-  const cap = k.startsWith('slug:') ? SLUG_MAX_TTL_SEC : MAX_DATA_TTL_SEC;
+  const cap = k.startsWith('slug:') ? SLUG_MAX_TTL_SEC
+    : k.startsWith('bpadmin:session:') ? BPADMIN_SESSION_MAX_TTL_SEC
+    : MAX_DATA_TTL_SEC;
   if (!ttlSec || ttlSec <= 0) return cap;
   return Math.min(ttlSec, cap);
 }

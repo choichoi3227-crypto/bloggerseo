@@ -20,6 +20,12 @@ import {
 import { kvGetJson, listBlockedIps } from './store.js';
 import { doRedisAvailable, doRedisClusterStats } from './redis-do.js';
 import { cacheReserveStats } from './cache-reserve.js';
+import {
+  buildGoogleAuthUrl, verifyOAuthState, exchangeCodeForTokens,
+  hasGoogleConnection, disconnectGoogle, resolveBlogId,
+  listPosts, getPost, createPost, updatePost, publishPost, revertPostToDraft, deletePost,
+  BloggerApiError,
+} from './blogger-api.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -99,12 +105,52 @@ export async function handleBpAdminApi(request, url, env, ctx) {
     });
   }
 
+  if (subPath === 'blogger/oauth/callback' && method === 'GET') {
+    // Google이 브라우저를 직접 이 URL로 리다이렉트시키는 요청이라 bp-admin
+    // 세션 쿠키가 없을 수도 있다(리다이렉트 체인 도중 SameSite=Strict
+    // 쿠키가 최초 요청에는 실리지 않는 브라우저가 있음). 그래서 이 콜백은
+    // bp-admin 세션 인증 없이도 동작해야 하며, 대신 OAuth 자체의 state
+    // 파라미터(verifyOAuthState)가 CSRF를 막아준다. 응답은 JSON이 아니라
+    // /bp-admin/settings로 돌아가는 302여야 브라우저가 자연스럽게 이어진다.
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state');
+    const settingsUrl = url.origin + '/bp-admin/settings';
+
+    const stateOk = await verifyOAuthState(env, state);
+    if (!stateOk || !code) {
+      return Response.redirect(settingsUrl + '?googleAuth=invalid_state', 302);
+    }
+    try {
+      const redirectUri = url.origin + (env.GOOGLE_OAUTH_REDIRECT_PATH || '/bp-admin/api/blogger/oauth/callback');
+      await exchangeCodeForTokens(env, code, redirectUri);
+      return Response.redirect(settingsUrl + '?googleAuth=connected', 302);
+    } catch (e) {
+      return Response.redirect(settingsUrl + '?googleAuth=error', 302);
+    }
+  }
+
   // ── 이 아래부터는 인증 필요 ──────────────────────────────────────
   const session = await resolveSession(request, env);
   if (!session) {
     return json({ ok: false, message: '인증이 필요합니다.' }, 401);
   }
 
+  const response = await handleAuthenticatedApi(request, url, env, ctx, subPath, method, session);
+
+  // 슬라이딩 쿠키 갱신: bp-admin-auth.js의 getSession()이 서버 쪽 세션
+  // TTL은 이미 슬라이딩으로 연장했지만(임계값 이하일 때), 브라우저에 심긴
+  // 쿠키 자체의 Max-Age는 최초 로그인 시점 기준으로 고정되어 있어 그대로
+  // 두면 서버 세션보다 먼저 만료돼 버린다. 인증이 필요한 모든 API 응답에
+  // 예외 없이 쿠키를 Max-Age=30일로 다시 실어서, 30일 안에 최소 한 번만
+  // 접속하면 로그인이 끊기지 않고 계속 유지되게 한다(추가 KV 쓰기 없이
+  // 쿠키 헤더만 재발급하므로 비용이 거의 없다). 응답 객체를 한 곳에서만
+  // 감싸므로 새 엔드포인트를 추가해도 쿠키 갱신을 빠뜨릴 일이 없다.
+  const cookies = parseCookies(request);
+  response.headers.set('set-cookie', buildSessionCookie(cookies[SESSION_COOKIE_NAME], { secure }));
+  return response;
+}
+
+async function handleAuthenticatedApi(request, url, env, ctx, subPath, method, session) {
   if (subPath === 'auth/session' && method === 'GET') {
     return json({ authenticated: true, username: session.username, role: session.role });
   }
@@ -117,7 +163,103 @@ export async function handleBpAdminApi(request, url, env, ctx) {
     return json(await getDashboardSummary(env));
   }
 
+  // ── Blogger 연동 (OAuth) ────────────────────────────────────────
+  if (subPath === 'blogger/connection-status' && method === 'GET') {
+    const connected = await hasGoogleConnection(env);
+    let blogInfo = null;
+    if (connected) {
+      try {
+        const siteHost = await kvGetJson(env, 'state:site_host');
+        blogInfo = await resolveBlogId(env, siteHost ? `https://${siteHost}` : null);
+      } catch (e) {
+        // blogId 미해결(사이트 도메인 미감지 등)이어도 연동 자체 여부는 보여준다.
+      }
+    }
+    return json({ connected, blog: blogInfo });
+  }
+
+  if (subPath === 'blogger/oauth/start' && method === 'GET') {
+    if (!env.GOOGLE_OAUTH_CLIENT_ID) {
+      return json({ ok: false, message: 'GOOGLE_OAUTH_CLIENT_ID가 설정되지 않았습니다. wrangler secret으로 등록하세요.' }, 500);
+    }
+    const redirectUri = url.origin + (env.GOOGLE_OAUTH_REDIRECT_PATH || '/bp-admin/api/blogger/oauth/callback');
+    const authUrl = await buildGoogleAuthUrl(env, redirectUri);
+    return json({ ok: true, authUrl });
+  }
+
+  if (subPath === 'blogger/disconnect' && method === 'POST') {
+    await disconnectGoogle(env);
+    return json({ ok: true });
+  }
+
+  // ── 글 관리 (Blogger Data API v3) ────────────────────────────────
+  if (subPath === 'posts' && method === 'GET') {
+    return withBloggerApi(async (blogId) => {
+      const status = url.searchParams.get('status') || undefined;
+      const pageToken = url.searchParams.get('pageToken') || undefined;
+      const data = await listPosts(env, blogId, { status, pageToken });
+      return json(data);
+    });
+  }
+
+  const postMatch = subPath.match(/^posts\/([^/]+)$/);
+  if (postMatch && method === 'GET') {
+    return withBloggerApi(async (blogId) => json(await getPost(env, blogId, postMatch[1])));
+  }
+  if (postMatch && method === 'PATCH') {
+    return withBloggerApi(async (blogId) => {
+      const body = await safeJson(request);
+      if (!body) return json({ ok: false, message: '잘못된 요청 본문입니다.' }, 400);
+      return json(await updatePost(env, blogId, postMatch[1], body));
+    });
+  }
+  if (postMatch && method === 'DELETE') {
+    return withBloggerApi(async (blogId) => json(await deletePost(env, blogId, postMatch[1])));
+  }
+
+  if (subPath === 'posts' && method === 'POST') {
+    return withBloggerApi(async (blogId) => {
+      const body = await safeJson(request);
+      if (!body || !body.title || !body.content) {
+        return json({ ok: false, message: 'title과 content는 필수입니다.' }, 400);
+      }
+      return json(await createPost(env, blogId, body));
+    });
+  }
+
+  const publishMatch = subPath.match(/^posts\/([^/]+)\/publish$/);
+  if (publishMatch && method === 'POST') {
+    return withBloggerApi(async (blogId) => json(await publishPost(env, blogId, publishMatch[1])));
+  }
+
+  const revertMatch = subPath.match(/^posts\/([^/]+)\/revert$/);
+  if (revertMatch && method === 'POST') {
+    return withBloggerApi(async (blogId) => json(await revertPostToDraft(env, blogId, revertMatch[1])));
+  }
+
   return json({ ok: false, message: 'Not found' }, 404);
+
+  // ── 헬퍼: blogId 해결 + BloggerApiError를 적절한 HTTP status로 매핑 ──
+  async function withBloggerApi(handler) {
+    return resolveBlogIdAndRun(env, handler);
+  }
+}
+
+async function resolveBlogIdAndRun(env, handler) {
+  try {
+    const siteHost = await kvGetJson(env, 'state:site_host');
+    const blogInfo = await resolveBlogId(env, siteHost ? `https://${siteHost}` : null);
+    return await handler(blogInfo.blogId);
+  } catch (e) {
+    if (e instanceof BloggerApiError) {
+      return json({ ok: false, message: e.message }, e.status || 502);
+    }
+    return json({ ok: false, message: String(e?.message || e) }, 500);
+  }
+}
+
+async function safeJson(request) {
+  try { return await request.json(); } catch { return null; }
 }
 
 async function getStatusPulse(env) {
@@ -144,29 +286,44 @@ async function getStatusPulse(env) {
 }
 
 async function getDashboardSummary(env) {
-  const [siteHost, siteTitle, blockedIps, cacheStats, redisStats] = await Promise.all([
+  const [siteHost, siteTitle, blockedIps, cacheStats, redisStats, googleConnected] = await Promise.all([
     kvGetJson(env, 'state:site_host').catch(() => null),
     kvGetJson(env, 'state:site_title').catch(() => null),
     listBlockedIps(env).catch(() => []),
     cacheReserveStats(env).catch(() => null),
     doRedisAvailable(env) ? doRedisClusterStats(env).catch(() => null) : Promise.resolve(null),
+    hasGoogleConnection(env).catch(() => false),
   ]);
 
   const cacheStatsForHitRate = cacheStats && typeof cacheStats.total === 'number' && cacheStats.total > 0
     ? cacheStats.alive / cacheStats.total
     : null;
 
+  let postsCount = 0;
+  if (googleConnected && siteHost) {
+    try {
+      const blogInfo = await resolveBlogId(env, `https://${siteHost}`);
+      // Blogger API는 총 개수 필드를 제공하지 않는다. 여기서는 최초 1페이지
+      // (최대 500개)만 조회해 대시보드 요약용 근사치로 사용한다. 글이
+      // 500개를 넘는 블로그의 정확한 총계는 posts.astro(글 목록 페이지)에서
+      // nextPageToken을 따라가며 완주 집계해야 한다.
+      const data = await listPosts(env, blogInfo.blogId, { maxResults: 150 });
+      postsCount = Array.isArray(data?.items) ? data.items.length : 0;
+    } catch {
+      postsCount = 0;
+    }
+  }
+
   return {
     siteHost: siteHost || null,
     siteTitle: siteTitle || null,
-    // 발행글 수: Blogger API 연동 전이므로 아직 정확한 카운트를 낼 수 없다.
-    // 다음 단계(Blogger API 연동)에서 실제 값으로 교체한다.
-    postsCount: 0,
+    postsCount,
     cacheHitRate: cacheStatsForHitRate,
     redisShardsActive: redisStats?.shardCount ?? null,
     blockedIpsCount: Array.isArray(blockedIps) ? blockedIps.length : 0,
     lastSitemapAt: null,
     lastRssAt: null,
+    googleConnected,
   };
 }
 
@@ -202,17 +359,5 @@ export async function handleBpAdminStatic(request, url, env) {
     }
   }
 
-  // Astro의 `base: '/bp-admin'` 설정 때문에 dist/ 산출물 자체가 이미
-  // '/bp-admin' 프리픽스를 반영한 경로로 생성된다
-  // (예: dist/bp-admin.html, dist/bp-admin/login.html, dist/_astro/*.js —
-  // 단 _astro는 프리픽스 없이 루트에 그대로 생성됨. 다만 HTML이 참조하는
-  // 스크립트 URL 자체는 '/bp-admin/_astro/...'로 박혀 있으므로 Assets가
-  // 그 요청도 처리할 수 있어야 한다. 그래서 여기서는 프리픽스를 제거하지
-  //않고 요청을 그대로 Assets 바인딩에 전달한다 — Workers Assets가
-  // '/bp-admin/login' → 'dist/bp-admin/login.html'을,
-  // '/bp-admin/_astro/x.js' → 'dist/bp-admin/_astro/x.js' 로 찾는데,
-  // 실제 _astro 산출물은 dist/_astro/에 있으므로 배포 시 이 폴더를
-  // dist/bp-admin/_astro로도 복사(또는 심링크)해 두어야 한다.
-  // (배포 스크립트에서 처리, README 참고)
   return env.BP_ADMIN_ASSETS.fetch(request);
 }

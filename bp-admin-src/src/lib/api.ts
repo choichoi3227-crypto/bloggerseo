@@ -49,10 +49,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  get:  <T>(path: string) => request<T>(path, { method: 'GET' }),
-  post: <T>(path: string, data?: unknown) =>
+  get:   <T>(path: string) => request<T>(path, { method: 'GET' }),
+  post:  <T>(path: string, data?: unknown) =>
     request<T>(path, { method: 'POST', body: data !== undefined ? JSON.stringify(data) : undefined }),
-  del:  <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+  patch: <T>(path: string, data?: unknown) =>
+    request<T>(path, { method: 'PATCH', body: data !== undefined ? JSON.stringify(data) : undefined }),
+  del:   <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 };
 
 export interface SessionInfo {
@@ -70,4 +72,61 @@ export interface DashboardSummary {
   blockedIpsCount: number;
   lastSitemapAt: string | null;
   lastRssAt: string | null;
+  googleConnected?: boolean;
 }
+
+// ── Blogger 연동 ────────────────────────────────────────────────────
+
+export interface BloggerConnectionStatus {
+  connected: boolean;
+  blog: { blogId: string; url: string; name: string } | null;
+}
+
+export interface BloggerPost {
+  id: string;
+  title: string;
+  content: string;
+  url?: string;
+  status?: 'LIVE' | 'DRAFT' | 'SCHEDULED';
+  published?: string;
+  updated?: string;
+  labels?: string[];
+}
+
+export interface BloggerPostList {
+  items: BloggerPost[];
+  nextPageToken?: string;
+}
+
+export const bloggerApi = {
+  connectionStatus: () => api.get<BloggerConnectionStatus>('/blogger/connection-status'),
+
+  startOAuth: async () => {
+    const res = await api.get<{ ok: true; authUrl: string }>('/blogger/oauth/start');
+    window.location.href = res.authUrl;
+  },
+
+  disconnect: () => api.post<{ ok: true }>('/blogger/disconnect'),
+
+  listPosts: (params?: { status?: string; pageToken?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set('status', params.status);
+    if (params?.pageToken) qs.set('pageToken', params.pageToken);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return api.get<BloggerPostList>(`/posts${suffix}`);
+  },
+
+  getPost: (postId: string) => api.get<BloggerPost>(`/posts/${postId}`),
+
+  createPost: (data: { title: string; content: string; labels?: string[]; isDraft?: boolean }) =>
+    api.post<BloggerPost>('/posts', data),
+
+  updatePost: (postId: string, data: { title?: string; content?: string; labels?: string[] }) =>
+    api.patch<BloggerPost>(`/posts/${postId}`, data),
+
+  publishPost: (postId: string) => api.post<BloggerPost>(`/posts/${postId}/publish`),
+
+  revertPost: (postId: string) => api.post<BloggerPost>(`/posts/${postId}/revert`),
+
+  deletePost: (postId: string) => api.del<{ ok: true }>(`/posts/${postId}`),
+};
