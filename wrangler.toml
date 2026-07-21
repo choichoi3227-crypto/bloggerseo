@@ -103,6 +103,19 @@ PANEL_MIN_BOT_SCORE    = "30"
 #   5. 발급된 클라이언트 ID/보안 비밀번호를 위 secret 명령으로 등록
 GOOGLE_OAUTH_REDIRECT_PATH = "/bp-admin/api/blogger/oauth/callback"
 
+# ─── AI 글쓰기/썸네일 생성 (bp-admin) ───────────────────────────────────
+# 아래 값은 절대 [vars]에 평문으로 두지 말고 반드시 시크릿으로 등록하세요:
+#   wrangler secret put GEMINI_API_KEY
+#
+# 발급 방법: https://aistudio.google.com/app/apikey 에서 무료로 발급.
+# 여러 키를 쉼표로 구분해 등록하면 라운드로빈 로테이션 + 레이트리밋
+# (429/503) 자동 우회를 지원합니다. 예:
+#   wrangler secret put GEMINI_API_KEY
+#   (프롬프트에서) AIzaSy...key1,AIzaSy...key2,AIzaSy...key3
+#
+# 썸네일 이미지 실제 렌더링은 별도 API 키가 필요 없습니다 — 이미 위의
+# [ai] binding = "AI" (Cloudflare Workers AI)를 그대로 사용합니다.
+
 # Cloudflare API (관리 패널의 "워커/라우트 연동" 기능용 — 토큰은 secret으로 등록)
 CF_ZONE_ID             = ""           # Zone ID (비밀 아님, 여기 직접 입력 가능)
 CF_ACCOUNT_ID          = ""           # Account ID (비밀 아님, 여기 직접 입력 가능)

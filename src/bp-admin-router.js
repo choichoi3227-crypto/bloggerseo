@@ -26,6 +26,8 @@ import {
   listPosts, getPost, createPost, updatePost, publishPost, revertPostToDraft, deletePost,
   BloggerApiError,
 } from './blogger-api.js';
+import { generateBlogContent, expandSelectedText, AiWriterError } from './ai-writer.js';
+import { generateImagePrompt, renderThumbnailImage, ThumbnailError, STYLE_DIRECTIVES } from './ai-thumbnail.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -40,6 +42,21 @@ function json(data, status = 200, extraHeaders = {}) {
 
 function isSecureRequest(url) {
   return url.protocol === 'https:';
+}
+
+/**
+ * Uint8Array를 base64 문자열로 변환한다. String.fromCharCode(...bytes)를
+ * 한 번에 스프레드하면 큰 이미지(수백 KB)에서 호출 스택 한계를 넘을 수
+ * 있으므로, 8KB씩 청크로 나눠 처리한다.
+ */
+function arrayBufferToBase64(bytes) {
+  const CHUNK_SIZE = 8192;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, i + CHUNK_SIZE);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 }
 
 // 로그인/부트스트랩처럼 세션이 없어도 되는 API는 화이트리스트로 관리한다.
@@ -237,7 +254,78 @@ async function handleAuthenticatedApi(request, url, env, ctx, subPath, method, s
     return withBloggerApi(async (blogId) => json(await revertPostToDraft(env, blogId, revertMatch[1])));
   }
 
+  // ── AI 글쓰기 (Gemini API) ────────────────────────────────────────
+  if (subPath === 'ai/generate-post' && method === 'POST') {
+    try {
+      const body = await safeJson(request);
+      if (!body || !body.topic) {
+        return json({ ok: false, message: '주제(topic)는 필수입니다.' }, 400);
+      }
+      const result = await generateBlogContent(env, body.topic, body.type || 'informational');
+      return json({ ok: true, ...result });
+    } catch (e) {
+      return handleAiError(e);
+    }
+  }
+
+  if (subPath === 'ai/expand-text' && method === 'POST') {
+    try {
+      const body = await safeJson(request);
+      if (!body || !body.selectedText) {
+        return json({ ok: false, message: '확장할 텍스트(selectedText)는 필수입니다.' }, 400);
+      }
+      const result = await expandSelectedText(env, body);
+      return json({ ok: true, ...result });
+    } catch (e) {
+      return handleAiError(e);
+    }
+  }
+
+  // ── AI 썸네일 생성 ────────────────────────────────────────────────
+  if (subPath === 'ai/thumbnail-styles' && method === 'GET') {
+    const styles = Object.entries(STYLE_DIRECTIVES).map(([key, v]) => ({ key, label: v.label }));
+    return json({ styles });
+  }
+
+  if (subPath === 'ai/thumbnail-prompt' && method === 'POST') {
+    try {
+      const body = await safeJson(request);
+      if (!body || !body.topic) {
+        return json({ ok: false, message: '주제(topic)는 필수입니다.' }, 400);
+      }
+      const result = await generateImagePrompt(env, body.topic, body.style || 'poster');
+      return json({ ok: true, ...result });
+    } catch (e) {
+      return handleAiError(e);
+    }
+  }
+
+  if (subPath === 'ai/thumbnail-render' && method === 'POST') {
+    try {
+      const body = await safeJson(request);
+      if (!body || !body.prompt) {
+        return json({ ok: false, message: '프롬프트(prompt)는 필수입니다.' }, 400);
+      }
+      const { imageBytes, mime } = await renderThumbnailImage(env, body.prompt, body.negPrompt);
+      // 이미지 바이너리 응답은 JSON이 아니므로 별도로 반환한다. base64로
+      // 감싸 JSON에 실으면 페이로드가 33% 커지지만, bp-admin 프론트엔드가
+      // <img src="data:...">로 즉시 미리보기하기엔 이 편이 더 간단하다.
+      const base64 = arrayBufferToBase64(imageBytes);
+      return json({ ok: true, dataUrl: `data:${mime};base64,${base64}` });
+    } catch (e) {
+      return handleAiError(e);
+    }
+  }
+
   return json({ ok: false, message: 'Not found' }, 404);
+
+  // ── 헬퍼: AI 관련 에러를 적절한 HTTP status로 매핑 ──────────────────
+  function handleAiError(e) {
+    if (e instanceof AiWriterError || e instanceof ThumbnailError) {
+      return json({ ok: false, message: e.message }, e.status || 502);
+    }
+    return json({ ok: false, message: String(e?.message || e) }, 500);
+  }
 
   // ── 헬퍼: blogId 해결 + BloggerApiError를 적절한 HTTP status로 매핑 ──
   async function withBloggerApi(handler) {

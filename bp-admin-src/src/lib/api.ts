@@ -130,3 +130,57 @@ export const bloggerApi = {
 
   deletePost: (postId: string) => api.del<{ ok: true }>(`/posts/${postId}`),
 };
+
+// ── AI 글쓰기 ───────────────────────────────────────────────────────
+
+export type PostGenerationType = 'informational' | 'utility' | 'policy_guide' | 'review_comparison';
+
+export interface GeneratedPost {
+  ok: true;
+  html: string;
+  metaInfo: { metaDesc: string; slug: string; focusKeyword: string };
+}
+
+export interface ExpandedText {
+  ok: true;
+  text: string;
+}
+
+export const aiWriterApi = {
+  generatePost: (topic: string, type: PostGenerationType = 'informational') =>
+    api.post<GeneratedPost>('/ai/generate-post', { topic, type }),
+
+  expandText: (params: { selectedText: string; fullContent?: string; postTitle?: string }) =>
+    api.post<ExpandedText>('/ai/expand-text', params),
+};
+
+// ── AI 썸네일 ───────────────────────────────────────────────────────
+
+export type ThumbnailStyle = 'poster' | 'minimal' | 'photo_realistic' | 'typography' | 'branding';
+
+export interface ThumbnailStyleOption {
+  key: ThumbnailStyle;
+  label: string;
+}
+
+export interface ThumbnailPromptResult {
+  ok: true;
+  prompt: string;
+  negPrompt: string;
+  styleLabel: string;
+}
+
+export interface ThumbnailRenderResult {
+  ok: true;
+  dataUrl: string;
+}
+
+export const aiThumbnailApi = {
+  listStyles: () => api.get<{ styles: ThumbnailStyleOption[] }>('/ai/thumbnail-styles'),
+
+  generatePrompt: (topic: string, style: ThumbnailStyle = 'poster') =>
+    api.post<ThumbnailPromptResult>('/ai/thumbnail-prompt', { topic, style }),
+
+  render: (prompt: string, negPrompt?: string) =>
+    api.post<ThumbnailRenderResult>('/ai/thumbnail-render', { prompt, negPrompt }),
+};

@@ -1,10 +1,18 @@
-import { useEffect, useState, type FormEvent } from 'react';
-import { bloggerApi, ApiError, type BloggerPost } from '../lib/api';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { bloggerApi, aiWriterApi, ApiError, type PostGenerationType } from '../lib/api';
+import AiThumbnailPanel from './AiThumbnailPanel';
 
 interface Props {
   /** 수정 모드일 때 기존 글 ID. 없으면 새 글 작성 모드. */
   postId?: string;
 }
+
+const POST_TYPE_OPTIONS: { value: PostGenerationType; label: string }[] = [
+  { value: 'informational', label: '정보성' },
+  { value: 'utility', label: '유틸리티 (프로그램/서비스)' },
+  { value: 'policy_guide', label: '정책·공공 정보' },
+  { value: 'review_comparison', label: '리뷰·비교' },
+];
 
 export default function PostEditor({ postId }: Props) {
   const isEditMode = !!postId;
@@ -17,6 +25,16 @@ export default function PostEditor({ postId }: Props) {
   const [saving, setSaving] = useState<'draft' | 'publish' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  // AI 초안 생성
+  const [aiTopic, setAiTopic] = useState('');
+  const [aiType, setAiType] = useState<PostGenerationType>('informational');
+  const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiPanelOpen, setAiPanelOpen] = useState(!isEditMode);
+
+  // 선택 텍스트 확장
+  const [expanding, setExpanding] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (!isEditMode) return;
@@ -42,6 +60,57 @@ export default function PostEditor({ postId }: Props) {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+  }
+
+  async function handleGenerateDraft() {
+    if (!aiTopic.trim()) {
+      setError('AI로 생성할 주제를 입력해 주세요.');
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setAiGenerating(true);
+    try {
+      const result = await aiWriterApi.generatePost(aiTopic.trim(), aiType);
+      setContent((prev) => (prev.trim() ? `${prev}\n${result.html}` : result.html));
+      if (!title.trim()) setTitle(aiTopic.trim());
+      if (!labelsInput.trim() && result.metaInfo.focusKeyword) {
+        setLabelsInput(result.metaInfo.focusKeyword);
+      }
+      setNotice('AI 초안이 생성되어 본문에 추가되었습니다. 내용을 검토한 뒤 저장하세요.');
+      setAiPanelOpen(false);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'AI 초안 생성 중 오류가 발생했습니다.');
+    } finally {
+      setAiGenerating(false);
+    }
+  }
+
+  async function handleExpandSelection() {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const selectedText = content.slice(ta.selectionStart, ta.selectionEnd);
+    if (!selectedText.trim()) {
+      setError('먼저 본문에서 확장할 문장을 드래그해 선택해 주세요.');
+      return;
+    }
+    setError(null);
+    setExpanding(true);
+    try {
+      const result = await aiWriterApi.expandText({
+        selectedText,
+        fullContent: content,
+        postTitle: title,
+      });
+      const before = content.slice(0, ta.selectionStart);
+      const after = content.slice(ta.selectionEnd);
+      setContent(`${before}${result.text}${after}`);
+      setNotice('선택한 문장이 확장되었습니다.');
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '텍스트 확장 중 오류가 발생했습니다.');
+    } finally {
+      setExpanding(false);
+    }
   }
 
   async function handleSave(publish: boolean, e?: FormEvent) {
@@ -88,6 +157,18 @@ export default function PostEditor({ postId }: Props) {
     }
   }
 
+  function handleInsertImage(imgTag: string) {
+    const ta = textareaRef.current;
+    if (ta && document.activeElement === ta) {
+      const before = content.slice(0, ta.selectionStart);
+      const after = content.slice(ta.selectionEnd);
+      setContent(`${before}\n${imgTag}\n${after}`);
+    } else {
+      setContent((prev) => `${prev}\n${imgTag}`);
+    }
+    setNotice('썸네일이 본문에 삽입되었습니다.');
+  }
+
   if (loading) {
     return <div className="editor-skeleton" aria-hidden="true" />;
   }
@@ -96,6 +177,46 @@ export default function PostEditor({ postId }: Props) {
     <form className="editor" onSubmit={(e) => handleSave(false, e)}>
       {notice && <p className="notice notice-success">{notice}</p>}
       {error && <p className="notice notice-error" role="alert">{error}</p>}
+
+      <div className="ai-panel">
+        <button
+          type="button"
+          className="ai-panel-toggle"
+          onClick={() => setAiPanelOpen((v) => !v)}
+        >
+          ✨ AI로 초안 생성 {aiPanelOpen ? '숨기기' : '열기'}
+        </button>
+
+        {aiPanelOpen && (
+          <div className="ai-panel-body">
+            <div className="ai-panel-row">
+              <input
+                type="text"
+                value={aiTopic}
+                onChange={(e) => setAiTopic(e.target.value)}
+                placeholder="주제를 입력하세요 (예: 전세자금대출 한도)"
+                className="ai-topic-input"
+              />
+              <select value={aiType} onChange={(e) => setAiType(e.target.value as PostGenerationType)}>
+                {POST_TYPE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="ai-generate-btn"
+                onClick={handleGenerateDraft}
+                disabled={aiGenerating}
+              >
+                {aiGenerating ? '생성 중… (최대 2~3분)' : '초안 생성'}
+              </button>
+            </div>
+            <small>AI가 SEO 최적화된 초안을 생성해 본문에 추가합니다. 생성 후 반드시 내용을 검토하고 사실관계를 확인하세요.</small>
+          </div>
+        )}
+      </div>
+
+      <AiThumbnailPanel onInsertImage={handleInsertImage} defaultTopic={aiTopic || title} />
 
       <label className="field">
         <span>제목</span>
@@ -119,14 +240,25 @@ export default function PostEditor({ postId }: Props) {
       </label>
 
       <label className="field">
-        <span>본문 (HTML)</span>
+        <div className="field-label-row">
+          <span>본문 (HTML)</span>
+          <button
+            type="button"
+            className="expand-btn"
+            onClick={handleExpandSelection}
+            disabled={expanding}
+          >
+            {expanding ? '확장 중…' : '✨ 선택 문장 AI 확장'}
+          </button>
+        </div>
         <textarea
+          ref={textareaRef}
           value={content}
           onChange={(e) => setContent(e.target.value)}
           placeholder="본문 내용을 입력하세요. HTML 태그를 직접 쓸 수 있습니다."
           rows={18}
         />
-        <small>이미지는 본문 안에 &lt;img src="..."&gt; 형태로 직접 삽입합니다. 다음 단계에서 이미지 업로드 버튼이 추가될 예정입니다.</small>
+        <small>문장을 드래그해 선택한 뒤 위 "선택 문장 AI 확장" 버튼을 누르면 3~4문장으로 풀어씁니다. 이미지는 본문 안에 &lt;img src="..."&gt; 형태로 직접 삽입합니다.</small>
       </label>
 
       <div className="editor-actions">
@@ -167,6 +299,60 @@ export default function PostEditor({ postId }: Props) {
           border-radius: var(--bp-radius-md, 10px);
           padding: 24px;
         }
+        .ai-panel {
+          border: 1px solid rgba(242,193,78,0.4);
+          background: rgba(242,193,78,0.06);
+          border-radius: var(--bp-radius-sm, 6px);
+          padding: 4px;
+        }
+        .ai-panel-toggle {
+          width: 100%;
+          text-align: left;
+          background: transparent;
+          border: none;
+          padding: 10px 12px;
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--bp-text, #1B1D23);
+        }
+        .ai-panel-body {
+          padding: 4px 12px 12px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .ai-panel-row {
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .ai-topic-input {
+          flex: 1;
+          min-width: 200px;
+          font-size: 14px;
+          padding: 9px 12px;
+          border-radius: var(--bp-radius-sm, 6px);
+          border: 1px solid var(--bp-border, #E4E3DD);
+        }
+        .ai-panel-row select {
+          font-size: 13px;
+          padding: 9px 10px;
+          border-radius: var(--bp-radius-sm, 6px);
+          border: 1px solid var(--bp-border, #E4E3DD);
+          background: #fff;
+        }
+        .ai-generate-btn {
+          background: var(--bp-accent, #F2C14E);
+          color: var(--bp-accent-ink, #3A2C00);
+          font-weight: 600;
+          font-size: 13px;
+          padding: 9px 16px;
+          border: none;
+          border-radius: var(--bp-radius-sm, 6px);
+          white-space: nowrap;
+        }
+        .ai-generate-btn:disabled { opacity: 0.6; }
+        .ai-panel small { color: var(--bp-text-mute, #6B6E7A); font-size: 12px; }
         .field {
           display: flex;
           flex-direction: column;
@@ -175,6 +361,21 @@ export default function PostEditor({ postId }: Props) {
           font-weight: 500;
           color: var(--bp-text-mute, #6B6E7A);
         }
+        .field-label-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+        }
+        .expand-btn {
+          background: transparent;
+          border: 1px solid var(--bp-border, #E4E3DD);
+          color: var(--bp-text, #1B1D23);
+          font-size: 12px;
+          font-weight: 600;
+          padding: 5px 10px;
+          border-radius: var(--bp-radius-sm, 6px);
+        }
+        .expand-btn:disabled { opacity: 0.6; }
         .field input, .field textarea {
           font-size: 14px;
           font-family: inherit;
