@@ -1,0 +1,1584 @@
+diff --git a/bp-admin-src/src/components/AiThumbnailPanel.tsx b/bp-admin-src/src/components/AiThumbnailPanel.tsx
+new file mode 100644
+index 00000000..e36de448
+--- /dev/null
++++ b/bp-admin-src/src/components/AiThumbnailPanel.tsx
+@@ -0,0 +1,210 @@
++import { useEffect, useState } from 'react';
++import { aiThumbnailApi, ApiError, type ThumbnailStyle, type ThumbnailStyleOption } from '../lib/api';
++
++interface Props {
++  /** 이미지가 생성되면 <img> 태그를 본문에 삽입할 수 있도록 부모에게 알린다. */
++  onInsertImage: (imgTag: string) => void;
++  /** 에디터의 주제 입력을 재사용하기 위한 기본값 (선택) */
++  defaultTopic?: string;
++}
++
++export default function AiThumbnailPanel({ onInsertImage, defaultTopic = '' }: Props) {
++  const [open, setOpen] = useState(false);
++  const [topic, setTopic] = useState(defaultTopic);
++  const [style, setStyle] = useState<ThumbnailStyle>('poster');
++  const [styles, setStyles] = useState<ThumbnailStyleOption[]>([]);
++  const [generating, setGenerating] = useState(false);
++  const [rendering, setRendering] = useState(false);
++  const [prompt, setPrompt] = useState('');
++  const [negPrompt, setNegPrompt] = useState('');
++  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    if (!open || styles.length > 0) return;
++    aiThumbnailApi.listStyles()
++      .then((res) => setStyles(res.styles))
++      .catch(() => { /* 스타일 목록 실패해도 기본 select 옵션으로 폴백 */ });
++  }, [open]);
++
++  async function handleGeneratePrompt() {
++    if (!topic.trim()) {
++      setError('썸네일 주제를 입력해 주세요.');
++      return;
++    }
++    setError(null);
++    setGenerating(true);
++    setImageDataUrl(null);
++    try {
++      const result = await aiThumbnailApi.generatePrompt(topic.trim(), style);
++      setPrompt(result.prompt);
++      setNegPrompt(result.negPrompt);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : '프롬프트 생성 중 오류가 발생했습니다.');
++    } finally {
++      setGenerating(false);
++    }
++  }
++
++  async function handleRender() {
++    if (!prompt.trim()) {
++      setError('먼저 프롬프트를 생성해 주세요.');
++      return;
++    }
++    setError(null);
++    setRendering(true);
++    try {
++      const result = await aiThumbnailApi.render(prompt, negPrompt);
++      setImageDataUrl(result.dataUrl);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : '이미지 생성 중 오류가 발생했습니다.');
++    } finally {
++      setRendering(false);
++    }
++  }
++
++  function handleInsert() {
++    if (!imageDataUrl) return;
++    const safeAlt = topic.trim().replace(/"/g, '&quot;');
++    onInsertImage(`<img src="${imageDataUrl}" alt="${safeAlt}" />`);
++    setImageDataUrl(null);
++  }
++
++  const fallbackStyles: ThumbnailStyleOption[] = [
++    { key: 'poster', label: '포스터' },
++    { key: 'minimal', label: '미니멀' },
++    { key: 'photo_realistic', label: '사실적 사진' },
++    { key: 'typography', label: '타이포그래피' },
++    { key: 'branding', label: '브랜딩' },
++  ];
++  const styleOptions = styles.length > 0 ? styles : fallbackStyles;
++
++  return (
++    <div className="thumb-panel">
++      <button type="button" className="thumb-toggle" onClick={() => setOpen((v) => !v)}>
++        🎨 AI 썸네일 생성 {open ? '숨기기' : '열기'}
++      </button>
++
++      {open && (
++        <div className="thumb-body">
++          {error && <p className="thumb-error" role="alert">{error}</p>}
++
++          <div className="thumb-row">
++            <input
++              type="text"
++              value={topic}
++              onChange={(e) => setTopic(e.target.value)}
++              placeholder="썸네일 주제 (예: 전세자금대출)"
++              className="thumb-topic-input"
++            />
++            <select value={style} onChange={(e) => setStyle(e.target.value as ThumbnailStyle)}>
++              {styleOptions.map((s) => (
++                <option key={s.key} value={s.key}>{s.label}</option>
++              ))}
++            </select>
++            <button type="button" onClick={handleGeneratePrompt} disabled={generating} className="thumb-btn">
++              {generating ? '생성 중…' : '프롬프트 생성'}
++            </button>
++          </div>
++
++          {prompt && (
++            <div className="thumb-prompt-preview">
++              <textarea
++                value={prompt}
++                onChange={(e) => setPrompt(e.target.value)}
++                rows={3}
++                placeholder="생성된 프롬프트 (직접 수정 가능)"
++              />
++              <button type="button" onClick={handleRender} disabled={rendering} className="thumb-render-btn">
++                {rendering ? '이미지 생성 중… (10~30초)' : '이 프롬프트로 이미지 생성'}
++              </button>
++            </div>
++          )}
++
++          {imageDataUrl && (
++            <div className="thumb-result">
++              <img src={imageDataUrl} alt="생성된 썸네일 미리보기" />
++              <button type="button" onClick={handleInsert} className="thumb-insert-btn">
++                본문에 삽입
++              </button>
++            </div>
++          )}
++
++          <small>AI가 만든 이미지는 실제와 다를 수 있습니다. 삽입 전 미리보기로 확인하세요.</small>
++        </div>
++      )}
++
++      <style>{`
++        .thumb-panel {
++          border: 1px solid var(--bp-border, #E4E3DD);
++          border-radius: var(--bp-radius-sm, 6px);
++        }
++        .thumb-toggle {
++          width: 100%;
++          text-align: left;
++          background: transparent;
++          border: none;
++          padding: 10px 12px;
++          font-size: 13px;
++          font-weight: 600;
++          color: var(--bp-text, #1B1D23);
++        }
++        .thumb-body {
++          padding: 4px 12px 12px;
++          display: flex;
++          flex-direction: column;
++          gap: 10px;
++        }
++        .thumb-row { display: flex; gap: 8px; flex-wrap: wrap; }
++        .thumb-topic-input {
++          flex: 1;
++          min-width: 180px;
++          font-size: 13px;
++          padding: 8px 10px;
++          border-radius: var(--bp-radius-sm, 6px);
++          border: 1px solid var(--bp-border, #E4E3DD);
++        }
++        .thumb-row select {
++          font-size: 13px;
++          padding: 8px 10px;
++          border-radius: var(--bp-radius-sm, 6px);
++          border: 1px solid var(--bp-border, #E4E3DD);
++          background: #fff;
++        }
++        .thumb-btn, .thumb-render-btn, .thumb-insert-btn {
++          background: var(--bp-canvas, #F7F7F5);
++          border: 1px solid var(--bp-border, #E4E3DD);
++          color: var(--bp-text, #1B1D23);
++          font-size: 12px;
++          font-weight: 600;
++          padding: 8px 12px;
++          border-radius: var(--bp-radius-sm, 6px);
++          white-space: nowrap;
++        }
++        .thumb-insert-btn { background: var(--bp-accent, #F2C14E); border: none; color: var(--bp-accent-ink, #3A2C00); }
++        .thumb-btn:disabled, .thumb-render-btn:disabled { opacity: 0.6; }
++        .thumb-prompt-preview {
++          display: flex;
++          flex-direction: column;
++          gap: 6px;
++        }
++        .thumb-prompt-preview textarea {
++          font-size: 12px;
++          font-family: var(--bp-font-mono, monospace);
++          padding: 8px 10px;
++          border-radius: var(--bp-radius-sm, 6px);
++          border: 1px solid var(--bp-border, #E4E3DD);
++          resize: vertical;
++        }
++        .thumb-result { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
++        .thumb-result img {
++          max-width: 100%;
++          border-radius: var(--bp-radius-sm, 6px);
++          border: 1px solid var(--bp-border, #E4E3DD);
++        }
++        .thumb-error { margin: 0; font-size: 12px; color: var(--bp-danger, #D64545); }
++        .thumb-body small { color: var(--bp-text-mute, #6B6E7A); font-size: 11px; }
++      `}</style>
++    </div>
++  );
++}
+diff --git a/bp-admin-src/src/components/PostEditor.tsx b/bp-admin-src/src/components/PostEditor.tsx
+index c15b5dc9..daea2c5c 100644
+--- a/bp-admin-src/src/components/PostEditor.tsx
++++ b/bp-admin-src/src/components/PostEditor.tsx
+@@ -1,11 +1,19 @@
+-import { useEffect, useState, type FormEvent } from 'react';
+-import { bloggerApi, ApiError, type BloggerPost } from '../lib/api';
++import { useEffect, useRef, useState, type FormEvent } from 'react';
++import { bloggerApi, aiWriterApi, ApiError, type PostGenerationType } from '../lib/api';
++import AiThumbnailPanel from './AiThumbnailPanel';
+ 
+ interface Props {
+   /** 수정 모드일 때 기존 글 ID. 없으면 새 글 작성 모드. */
+   postId?: string;
+ }
+ 
++const POST_TYPE_OPTIONS: { value: PostGenerationType; label: string }[] = [
++  { value: 'informational', label: '정보성' },
++  { value: 'utility', label: '유틸리티 (프로그램/서비스)' },
++  { value: 'policy_guide', label: '정책·공공 정보' },
++  { value: 'review_comparison', label: '리뷰·비교' },
++];
++
+ export default function PostEditor({ postId }: Props) {
+   const isEditMode = !!postId;
+ 
+@@ -18,6 +26,16 @@ export default function PostEditor({ postId }: Props) {
+   const [error, setError] = useState<string | null>(null);
+   const [notice, setNotice] = useState<string | null>(null);
+ 
++  // AI 초안 생성
++  const [aiTopic, setAiTopic] = useState('');
++  const [aiType, setAiType] = useState<PostGenerationType>('informational');
++  const [aiGenerating, setAiGenerating] = useState(false);
++  const [aiPanelOpen, setAiPanelOpen] = useState(!isEditMode);
++
++  // 선택 텍스트 확장
++  const [expanding, setExpanding] = useState(false);
++  const textareaRef = useRef<HTMLTextAreaElement>(null);
++
+   useEffect(() => {
+     if (!isEditMode) return;
+     let cancelled = false;
+@@ -44,6 +62,57 @@ export default function PostEditor({ postId }: Props) {
+       .filter(Boolean);
+   }
+ 
++  async function handleGenerateDraft() {
++    if (!aiTopic.trim()) {
++      setError('AI로 생성할 주제를 입력해 주세요.');
++      return;
++    }
++    setError(null);
++    setNotice(null);
++    setAiGenerating(true);
++    try {
++      const result = await aiWriterApi.generatePost(aiTopic.trim(), aiType);
++      setContent((prev) => (prev.trim() ? `${prev}\n${result.html}` : result.html));
++      if (!title.trim()) setTitle(aiTopic.trim());
++      if (!labelsInput.trim() && result.metaInfo.focusKeyword) {
++        setLabelsInput(result.metaInfo.focusKeyword);
++      }
++      setNotice('AI 초안이 생성되어 본문에 추가되었습니다. 내용을 검토한 뒤 저장하세요.');
++      setAiPanelOpen(false);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : 'AI 초안 생성 중 오류가 발생했습니다.');
++    } finally {
++      setAiGenerating(false);
++    }
++  }
++
++  async function handleExpandSelection() {
++    const ta = textareaRef.current;
++    if (!ta) return;
++    const selectedText = content.slice(ta.selectionStart, ta.selectionEnd);
++    if (!selectedText.trim()) {
++      setError('먼저 본문에서 확장할 문장을 드래그해 선택해 주세요.');
++      return;
++    }
++    setError(null);
++    setExpanding(true);
++    try {
++      const result = await aiWriterApi.expandText({
++        selectedText,
++        fullContent: content,
++        postTitle: title,
++      });
++      const before = content.slice(0, ta.selectionStart);
++      const after = content.slice(ta.selectionEnd);
++      setContent(`${before}${result.text}${after}`);
++      setNotice('선택한 문장이 확장되었습니다.');
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : '텍스트 확장 중 오류가 발생했습니다.');
++    } finally {
++      setExpanding(false);
++    }
++  }
++
+   async function handleSave(publish: boolean, e?: FormEvent) {
+     e?.preventDefault();
+     if (!title.trim()) {
+@@ -88,6 +157,18 @@ export default function PostEditor({ postId }: Props) {
+     }
+   }
+ 
++  function handleInsertImage(imgTag: string) {
++    const ta = textareaRef.current;
++    if (ta && document.activeElement === ta) {
++      const before = content.slice(0, ta.selectionStart);
++      const after = content.slice(ta.selectionEnd);
++      setContent(`${before}\n${imgTag}\n${after}`);
++    } else {
++      setContent((prev) => `${prev}\n${imgTag}`);
++    }
++    setNotice('썸네일이 본문에 삽입되었습니다.');
++  }
++
+   if (loading) {
+     return <div className="editor-skeleton" aria-hidden="true" />;
+   }
+@@ -97,6 +178,46 @@ export default function PostEditor({ postId }: Props) {
+       {notice && <p className="notice notice-success">{notice}</p>}
+       {error && <p className="notice notice-error" role="alert">{error}</p>}
+ 
++      <div className="ai-panel">
++        <button
++          type="button"
++          className="ai-panel-toggle"
++          onClick={() => setAiPanelOpen((v) => !v)}
++        >
++          ✨ AI로 초안 생성 {aiPanelOpen ? '숨기기' : '열기'}
++        </button>
++
++        {aiPanelOpen && (
++          <div className="ai-panel-body">
++            <div className="ai-panel-row">
++              <input
++                type="text"
++                value={aiTopic}
++                onChange={(e) => setAiTopic(e.target.value)}
++                placeholder="주제를 입력하세요 (예: 전세자금대출 한도)"
++                className="ai-topic-input"
++              />
++              <select value={aiType} onChange={(e) => setAiType(e.target.value as PostGenerationType)}>
++                {POST_TYPE_OPTIONS.map((opt) => (
++                  <option key={opt.value} value={opt.value}>{opt.label}</option>
++                ))}
++              </select>
++              <button
++                type="button"
++                className="ai-generate-btn"
++                onClick={handleGenerateDraft}
++                disabled={aiGenerating}
++              >
++                {aiGenerating ? '생성 중… (최대 2~3분)' : '초안 생성'}
++              </button>
++            </div>
++            <small>AI가 SEO 최적화된 초안을 생성해 본문에 추가합니다. 생성 후 반드시 내용을 검토하고 사실관계를 확인하세요.</small>
++          </div>
++        )}
++      </div>
++
++      <AiThumbnailPanel onInsertImage={handleInsertImage} defaultTopic={aiTopic || title} />
++
+       <label className="field">
+         <span>제목</span>
+         <input
+@@ -119,14 +240,25 @@ export default function PostEditor({ postId }: Props) {
+       </label>
+ 
+       <label className="field">
+-        <span>본문 (HTML)</span>
++        <div className="field-label-row">
++          <span>본문 (HTML)</span>
++          <button
++            type="button"
++            className="expand-btn"
++            onClick={handleExpandSelection}
++            disabled={expanding}
++          >
++            {expanding ? '확장 중…' : '✨ 선택 문장 AI 확장'}
++          </button>
++        </div>
+         <textarea
++          ref={textareaRef}
+           value={content}
+           onChange={(e) => setContent(e.target.value)}
+           placeholder="본문 내용을 입력하세요. HTML 태그를 직접 쓸 수 있습니다."
+           rows={18}
+         />
+-        <small>이미지는 본문 안에 &lt;img src="..."&gt; 형태로 직접 삽입합니다. 다음 단계에서 이미지 업로드 버튼이 추가될 예정입니다.</small>
++        <small>문장을 드래그해 선택한 뒤 위 "선택 문장 AI 확장" 버튼을 누르면 3~4문장으로 풀어씁니다. 이미지는 본문 안에 &lt;img src="..."&gt; 형태로 직접 삽입합니다.</small>
+       </label>
+ 
+       <div className="editor-actions">
+@@ -167,6 +299,60 @@ export default function PostEditor({ postId }: Props) {
+           border-radius: var(--bp-radius-md, 10px);
+           padding: 24px;
+         }
++        .ai-panel {
++          border: 1px solid rgba(242,193,78,0.4);
++          background: rgba(242,193,78,0.06);
++          border-radius: var(--bp-radius-sm, 6px);
++          padding: 4px;
++        }
++        .ai-panel-toggle {
++          width: 100%;
++          text-align: left;
++          background: transparent;
++          border: none;
++          padding: 10px 12px;
++          font-size: 13px;
++          font-weight: 600;
++          color: var(--bp-text, #1B1D23);
++        }
++        .ai-panel-body {
++          padding: 4px 12px 12px;
++          display: flex;
++          flex-direction: column;
++          gap: 8px;
++        }
++        .ai-panel-row {
++          display: flex;
++          gap: 8px;
++          flex-wrap: wrap;
++        }
++        .ai-topic-input {
++          flex: 1;
++          min-width: 200px;
++          font-size: 14px;
++          padding: 9px 12px;
++          border-radius: var(--bp-radius-sm, 6px);
++          border: 1px solid var(--bp-border, #E4E3DD);
++        }
++        .ai-panel-row select {
++          font-size: 13px;
++          padding: 9px 10px;
++          border-radius: var(--bp-radius-sm, 6px);
++          border: 1px solid var(--bp-border, #E4E3DD);
++          background: #fff;
++        }
++        .ai-generate-btn {
++          background: var(--bp-accent, #F2C14E);
++          color: var(--bp-accent-ink, #3A2C00);
++          font-weight: 600;
++          font-size: 13px;
++          padding: 9px 16px;
++          border: none;
++          border-radius: var(--bp-radius-sm, 6px);
++          white-space: nowrap;
++        }
++        .ai-generate-btn:disabled { opacity: 0.6; }
++        .ai-panel small { color: var(--bp-text-mute, #6B6E7A); font-size: 12px; }
+         .field {
+           display: flex;
+           flex-direction: column;
+@@ -175,6 +361,21 @@ export default function PostEditor({ postId }: Props) {
+           font-weight: 500;
+           color: var(--bp-text-mute, #6B6E7A);
+         }
++        .field-label-row {
++          display: flex;
++          align-items: center;
++          justify-content: space-between;
++        }
++        .expand-btn {
++          background: transparent;
++          border: 1px solid var(--bp-border, #E4E3DD);
++          color: var(--bp-text, #1B1D23);
++          font-size: 12px;
++          font-weight: 600;
++          padding: 5px 10px;
++          border-radius: var(--bp-radius-sm, 6px);
++        }
++        .expand-btn:disabled { opacity: 0.6; }
+         .field input, .field textarea {
+           font-size: 14px;
+           font-family: inherit;
+diff --git a/bp-admin-src/src/lib/api.ts b/bp-admin-src/src/lib/api.ts
+index a0f84e88..06b1b0b6 100644
+--- a/bp-admin-src/src/lib/api.ts
++++ b/bp-admin-src/src/lib/api.ts
+@@ -130,3 +130,57 @@ export const bloggerApi = {
+ 
+   deletePost: (postId: string) => api.del<{ ok: true }>(`/posts/${postId}`),
+ };
++
++// ── AI 글쓰기 ───────────────────────────────────────────────────────
++
++export type PostGenerationType = 'informational' | 'utility' | 'policy_guide' | 'review_comparison';
++
++export interface GeneratedPost {
++  ok: true;
++  html: string;
++  metaInfo: { metaDesc: string; slug: string; focusKeyword: string };
++}
++
++export interface ExpandedText {
++  ok: true;
++  text: string;
++}
++
++export const aiWriterApi = {
++  generatePost: (topic: string, type: PostGenerationType = 'informational') =>
++    api.post<GeneratedPost>('/ai/generate-post', { topic, type }),
++
++  expandText: (params: { selectedText: string; fullContent?: string; postTitle?: string }) =>
++    api.post<ExpandedText>('/ai/expand-text', params),
++};
++
++// ── AI 썸네일 ───────────────────────────────────────────────────────
++
++export type ThumbnailStyle = 'poster' | 'minimal' | 'photo_realistic' | 'typography' | 'branding';
++
++export interface ThumbnailStyleOption {
++  key: ThumbnailStyle;
++  label: string;
++}
++
++export interface ThumbnailPromptResult {
++  ok: true;
++  prompt: string;
++  negPrompt: string;
++  styleLabel: string;
++}
++
++export interface ThumbnailRenderResult {
++  ok: true;
++  dataUrl: string;
++}
++
++export const aiThumbnailApi = {
++  listStyles: () => api.get<{ styles: ThumbnailStyleOption[] }>('/ai/thumbnail-styles'),
++
++  generatePrompt: (topic: string, style: ThumbnailStyle = 'poster') =>
++    api.post<ThumbnailPromptResult>('/ai/thumbnail-prompt', { topic, style }),
++
++  render: (prompt: string, negPrompt?: string) =>
++    api.post<ThumbnailRenderResult>('/ai/thumbnail-render', { prompt, negPrompt }),
++};
+diff --git a/src/ai-thumbnail.js b/src/ai-thumbnail.js
+new file mode 100644
+index 00000000..0906c997
+--- /dev/null
++++ b/src/ai-thumbnail.js
+@@ -0,0 +1,273 @@
++/**
++ * AI 썸네일 생성 엔진
++ * ─────────────────────────────────────────────────────────────────────
++ * aibp-pro의 2단계 이미지 생성 파이프라인(Phase A: 주제 리서치 →
++ * Phase B: SDXL 프롬프트 생성)을 이식하되, 실제 이미지 렌더링은
++ * 원본의 외부 Cloudflare Worker + Pollinations 대신 이 프로젝트
++ * 자체의 env.AI 바인딩(Cloudflare Workers AI, stable-diffusion-xl)을
++ * 직접 사용한다. 이렇게 하면:
++ *   - 별도 Worker 배포/URL 설정이 필요 없다 (원본은
++ *     aibp_cf_worker_url 옵션으로 외부 Worker를 호출해야 했음).
++ *   - 같은 리전에서 실행되어 왕복 지연시간이 줄어든다.
++ *   - Workers AI 무료 티어(일 100,000 호출)로 별도 이미지 API 비용이
++ *     들지 않는다.
++ *
++ * 파이프라인:
++ *   1. Phase A (Gemini): 주제를 한국 맥락에서 조사해 실제 의미·시각
++ *      요소·오역 위험을 파악 (예: "토스"는 핀테크 앱이지 동사가 아님)
++ *   2. Phase B (Gemini): 조사 결과 + 스타일 디렉티브로 SDXL 프롬프트 생성
++ *   3. 렌더링 (Workers AI): env.AI.run()으로 실제 이미지 생성
++ *
++ * "AI 스키마 마크업" 기능은 이식하지 않았다 — src/ai-writer.js 상단
++ * 주석에 이유 설명(src/schema.js가 이미 동일 기능 제공).
++ */
++
++import { callGeminiApi, extractText } from './ai-writer.js';
++
++const NO_PEOPLE = 'no people, no person, no human, no face, no portrait, no character, no figure, no body parts, no hands, no eyes, no silhouette of person';
++
++const STYLE_DIRECTIVES = {
++  poster: {
++    label: '포스터',
++    core: 'clean professional POSTER background, flat solid color blocks or very simple smooth gradient, bold harmonious color palette, large EMPTY CENTER SPACE for title text, minimal composition, no complex shapes, no busy patterns',
++    subject: 'single simple geometric accent element at edge only — keep center completely clear for text',
++    color: 'harmonious two-tone palette: deep navy + warm cream, or rich burgundy + soft gold, or forest green + white',
++    quality: '(masterpiece:1.4), (best quality:1.3), sharp clean edges, professional poster quality',
++    avoid: `complex lines, diagonal intersecting lines, chaotic abstract shapes, busy patterns, noisy background, watercolor, ${NO_PEOPLE}`,
++  },
++  minimal: {
++    label: '미니멀',
++    core: 'pure SOLID SINGLE COLOR background, no gradient, no pattern, no texture, completely flat and clean, Bauhaus zen simplicity, large empty center space',
++    subject: 'nothing at center — absolutely flat solid background only',
++    color: 'single rich solid background color: deep navy blue, or charcoal dark gray, or deep forest green, or rich burgundy',
++    quality: '(masterpiece:1.4), (best quality:1.3), perfectly flat solid color, no noise, no grain',
++    avoid: `gradient, texture, pattern, multiple colors, bright white background, complex shapes, neon, ${NO_PEOPLE}`,
++  },
++  photo_realistic: {
++    label: '사실적 사진',
++    core: 'ultra-photorealistic DSLR photography, shot on Sony A7R5, 50mm f/1.4 lens, shallow depth of field, cinematic natural lighting, editorial quality',
++    subject: 'the exact real-world object, place, or scene the topic refers to — photographed authentically',
++    color: 'true-to-life color grading, warm filmic tone, rich shadows, luminous highlights',
++    quality: '(RAW photo:1.4), (photorealistic:1.4), (hyperrealistic:1.3), 8k uhd, DSLR, award-winning',
++    avoid: 'illustration, cartoon, anime, painting, CGI, artificial look, plastic, oversaturated',
++  },
++  typography: {
++    label: '타이포그래피',
++    core: 'PURE SOLID BLACK background, completely dark #000000, no gradients, no light, no bright areas, absolute darkness, clean matte black surface, empty center reserved for bold typography overlay',
++    subject: 'nothing — pure black void only, center must be completely dark and clear',
++    color: 'pure black only, #000000, absolutely no other colors, no gradients, solid darkness',
++    quality: '(masterpiece:1.4), (best quality:1.3), pure black, solid dark background, no light leaks',
++    avoid: `bright areas, gradients, colors, patterns, textures, light sources, ${NO_PEOPLE}`,
++  },
++  branding: {
++    label: '브랜딩',
++    core: 'high-end advertising campaign BACKGROUND, luxury brand aesthetic, clean sophisticated layout with large CENTER space, premium brand design, aspirational atmosphere',
++    subject: 'abstract brand-style background elements — premium textures, subtle patterns placed at edges only, center reserved for title',
++    color: 'premium palette: deep charcoal + pure white + metallic gold, or all-white with bold color edge accent',
++    quality: '(masterpiece:1.4), (best quality:1.3), (commercial quality:1.2), pristine, premium brand feel',
++    avoid: `amateur, stock-photo feel, cluttered center, neon overload, ${NO_PEOPLE}`,
++  },
++};
++
++const DEFAULT_NEGATIVE_PROMPT =
++  '(text:1.5), (letters:1.5), (words:1.5), (writing:1.5), (font:1.4), (watermark:1.4), (bad quality:1.4), (worst quality:1.5), blurry, distorted, deformed, ugly, low resolution';
++
++export class ThumbnailError extends Error {
++  constructor(message, status = 502) {
++    super(message);
++    this.status = status;
++  }
++}
++
++function stripJsonFence(text) {
++  return text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
++}
++
++function safeJsonParse(text) {
++  try {
++    return JSON.parse(text);
++  } catch {
++    const match = text.match(/\{[\s\S]*\}/m);
++    if (match) {
++      try { return JSON.parse(match[0]); } catch { /* fall through */ }
++    }
++    return null;
++  }
++}
++
++// ── Phase A: 주제 리서치 (한국 맥락 오역 방지) ───────────────────────────
++async function researchTopic(env, topic) {
++  const prompt = `당신은 한국 미디어·문화·서비스·브랜드에 정통한 비주얼 콘텐츠 전문가입니다.
++아래 키워드를 심층 조사하여 최고 품질 이미지 생성에 필요한 정보를 추출하세요.
++
++[키워드]: ${topic}
++
++【오역 방지 — 한국 특수 맥락 필수 확인】
++- "알약" → 한국 보안SW (약이 아님)
++- "토스" → 핀테크앱 (동사 아님)
++- "카카오" → IT대기업 (열매 아님)
++- "네이버" → 검색엔진 (이웃 아님)
++- "배민" → 배달앱
++- "당근" → 중고거래앱 (채소 아님)
++- "쿠팡" → 이커머스
++위 패턴처럼 한국 고유 맥락이 있으면 반드시 적용하세요.
++
++【분석 항목】
++1. 이 키워드가 한국 독자에게 실제로 의미하는 것
++2. 최고 품질 이미지로 표현할 때 사용해야 할 구체적 시각 요소
++3. 가장 임팩트 있는 단일 핵심 장면/오브젝트
++4. 색상 분위기 (따뜻한/차가운/중성, 대표 색상)
++5. 잘못 그릴 경우 발생할 오류
++
++【JSON 출력 (코드블록 없이)】
++{
++  "actual_meaning": "실제 의미 (1문장, 정확하게)",
++  "visual_context": "이미지화 대상 (구체적 장면/오브젝트, 영문 묘사 포함)",
++  "hero_shot": "가장 임팩트 있는 단 하나의 시각 장면 (영어로)",
++  "color_mood": "색상 분위기 (영어로, 예: warm golden tones, cool tech blues)",
++  "key_visuals": ["영어 시각요소1", "영어 시각요소2", "영어 시각요소3", "영어 시각요소4"],
++  "wrong_interpretation": "잘못 해석 시 오류 (간결하게, 없으면 빈 문자열)"
++}`;
++
++  try {
++    const data = await callGeminiApi(env, {
++      contents: [{ parts: [{ text: prompt }] }],
++      generationConfig: { temperature: 0.2, maxOutputTokens: 700, topP: 0.75 },
++      tools: [{ google_search: {} }],
++    }, { timeoutMs: 35_000, model: 'gemini-2.5-flash-lite' });
++
++    const raw = extractText(data);
++    const parsed = safeJsonParse(stripJsonFence(raw));
++    return parsed || {};
++  } catch {
++    // 리서치 실패해도 이미지 생성은 topic 그대로 진행할 수 있어야 하므로
++    // 여기서는 에러를 던지지 않고 빈 결과로 폴백한다.
++    return {};
++  }
++}
++
++// ── Phase B: SDXL 프롬프트 생성 ──────────────────────────────────────────
++async function buildImagePrompt(env, topic, style, research) {
++  const dir = STYLE_DIRECTIVES[style] || STYLE_DIRECTIVES.poster;
++
++  const actualMeaning = research.actual_meaning || topic;
++  const visualContext = research.visual_context || topic;
++  const heroShot = research.hero_shot || '';
++  const colorMood = research.color_mood || '';
++  const keyVisuals = Array.isArray(research.key_visuals) ? research.key_visuals.join(', ') : '';
++  const wrongInterp = research.wrong_interpretation || '';
++
++  const promptInstruction = `당신은 Stable Diffusion XL 전문 프롬프트 엔지니어로, Imagen·DALL-E 3 동급의 결과를 SDXL에서 구현합니다.
++아래 조사 데이터를 바탕으로 [${dir.label}] 스타일의 완벽한 블로그 썸네일 프롬프트를 작성하세요.
++
++━━━ 주제 조사 결과 ━━━
++• 원본 키워드: ${topic}
++• 실제 의미: ${actualMeaning}
++• 시각화 대상: ${visualContext}
++• 히어로 장면: ${heroShot}
++• 색상 분위기: ${colorMood}
++• 핵심 시각 요소: ${keyVisuals}
++• 오역 방지: ${wrongInterp}
++
++━━━ 스타일 스펙 [${dir.label}] ━━━
++• 핵심 디렉션: ${dir.core}
++• 주제 표현법: ${dir.subject}
++• 색상 팔레트: ${dir.color}
++
++━━━ SDXL 프롬프트 작성 규칙 ━━━
++① 주제 정확도: "${actualMeaning}"를 오해 없이 표현하는 시각 요소를 최우선 배치
++② 구도 명시: 반드시 16:9 widescreen landscape orientation 명시
++③ 품질 태그: (masterpiece:1.4), (best quality:1.3) 등 SDXL 가중치 문법 사용
++④ 글자·문자 완전 금지: "no text", "no letters", "no writing", "text-free" 반드시 포함
++⑤ 인물·얼굴 완전 금지(photo_realistic 제외): "no people, no person, no face, no human" 반드시 포함
++⑥ 텍스트 삽입 공간 확보: "clear center area for text overlay" 포함
++
++━━━ 출력 형식 (순수 JSON만, 마크다운 없이) ━━━
++{
++  "prompt": "완성된 영어 SDXL 프롬프트 (200단어 이내, 쉼표 구분)",
++  "neg_prompt": "네거티브 프롬프트 (텍스트·워터마크·저품질 관련 토큰 포함)"
++}`;
++
++  const data = await callGeminiApi(env, {
++    contents: [{ parts: [{ text: promptInstruction }] }],
++    generationConfig: { temperature: 0.4, maxOutputTokens: 500 },
++  }, { timeoutMs: 35_000, model: 'gemini-2.5-flash-lite' });
++
++  const raw = extractText(data);
++  const parsed = safeJsonParse(stripJsonFence(raw));
++
++  if (parsed && parsed.prompt) {
++    return {
++      prompt: parsed.prompt,
++      negPrompt: parsed.neg_prompt || DEFAULT_NEGATIVE_PROMPT,
++      styleLabel: dir.label,
++    };
++  }
++
++  // 파싱 실패 시 디렉티브 필드를 직접 조합해 최소한의 프롬프트를 보장한다.
++  const fallbackPrompt = [
++    dir.core, dir.subject, dir.color, dir.quality,
++    '16:9 widescreen landscape orientation', 'no text, no letters, no writing, text-free',
++    'clear center area for text overlay',
++  ].join(', ');
++
++  return { prompt: fallbackPrompt, negPrompt: `${dir.avoid}, ${DEFAULT_NEGATIVE_PROMPT}`, styleLabel: dir.label };
++}
++
++/**
++ * 주제 + 스타일로 SDXL 프롬프트를 생성한다 (이미지 렌더링 전 단계).
++ * 프론트엔드가 프롬프트를 먼저 확인/수정하고 싶을 때 이 단계만 별도 호출 가능.
++ */
++export async function generateImagePrompt(env, topic, style = 'poster') {
++  if (!topic || !topic.trim()) {
++    throw new ThumbnailError('주제가 없습니다.', 400);
++  }
++  const research = await researchTopic(env, topic);
++  return buildImagePrompt(env, topic, style, research);
++}
++
++/**
++ * 실제 이미지를 Cloudflare Workers AI(SDXL)로 렌더링한다.
++ * @returns {Promise<{imageBytes: Uint8Array, mime: string}>}
++ */
++export async function renderThumbnailImage(env, prompt, negPrompt) {
++  if (!env.AI) {
++    throw new ThumbnailError('Workers AI 바인딩(env.AI)이 설정되지 않았습니다. wrangler.toml의 [ai] 섹션을 확인하세요.', 500);
++  }
++  if (!prompt || !prompt.trim()) {
++    throw new ThumbnailError('이미지 프롬프트가 없습니다.', 400);
++  }
++
++  let result;
++  try {
++    result = await env.AI.run('@cf/stabilityai/stable-diffusion-xl-base-1.0', {
++      prompt: prompt.trim(),
++      negative_prompt: (negPrompt || DEFAULT_NEGATIVE_PROMPT).trim(),
++      num_steps: 20,
++    });
++  } catch (err) {
++    throw new ThumbnailError(`이미지 생성 실패: ${err.message}`, 502);
++  }
++
++  // env.AI.run의 text-to-image 모델은 ReadableStream(PNG 바이너리)을 반환한다.
++  const imageBytes = result instanceof Uint8Array
++    ? result
++    : new Uint8Array(await new Response(result).arrayBuffer());
++
++  if (imageBytes.byteLength < 1000) {
++    throw new ThumbnailError('이미지 데이터가 너무 작습니다. 다시 시도해주세요.', 502);
++  }
++
++  return { imageBytes, mime: 'image/png' };
++}
++
++/**
++ * 전체 파이프라인 원스톱 실행: 리서치 → 프롬프트 생성 → 이미지 렌더링.
++ */
++export async function generateThumbnail(env, topic, style = 'poster') {
++  const { prompt, negPrompt, styleLabel } = await generateImagePrompt(env, topic, style);
++  const { imageBytes, mime } = await renderThumbnailImage(env, prompt, negPrompt);
++  return { imageBytes, mime, prompt, negPrompt, styleLabel };
++}
++
++export { STYLE_DIRECTIVES };
+diff --git a/src/ai-writer.js b/src/ai-writer.js
+new file mode 100644
+index 00000000..d046a8fc
+--- /dev/null
++++ b/src/ai-writer.js
+@@ -0,0 +1,604 @@
++/**
++ * AI 블로그 글쓰기 엔진
++ * ─────────────────────────────────────────────────────────────────────
++ * aibp-pro(워드프레스 플러그인)의 AI 콘텐츠 생성 로직을 Cloudflare
++ * Workers 환경으로 이식한 모듈. Gemini API(Google Generative Language)를
++ * 호출해 SEO 최적화된 블로그 글 초안을 생성한다.
++ *
++ * 원본 플러그인과의 차이:
++ *   - API 키 로테이션(get_next_api_key)은 워드프레스 옵션/transient
++ *     기반이었으나, 여기서는 KV(store.js)로 재구현했다.
++ *   - "AI 스키마 마크업 생성" 기능은 이식하지 않았다 — bloggerseo에는
++ *     이미 src/schema.js가 Article/FAQ/Breadcrumb/Product 스키마를
++ *     Workers AI 기반으로 자동 생성하고 있어 완전히 중복된다.
++ *   - "SEO 메타 태그 자동 삽입" 기능도 이식하지 않았다 — src/schema.js,
++ *     src/seo-features.js가 이미 동일하고 더 폭넓은 기능(hreflang,
++ *     breadcrumb, OG, Twitter Card 등)을 제공한다.
++ *   - AI 썸네일 생성은 이 파일이 아니라 src/ai-thumbnail.js에서
++ *     Cloudflare Workers AI(env.AI, SDXL)로 재구현했다(원본은 외부
++ *     Cloudflare Worker + Pollinations를 썼으나, 이 프로젝트 자체가
++ *     이미 Workers이므로 env.AI를 직접 쓰는 편이 지연시간과 운영
++ *     복잡도 양쪽에서 더 낫다).
++ *
++ * API 키: GEMINI_API_KEY를 wrangler secret으로 등록해야 한다.
++ *   wrangler secret put GEMINI_API_KEY
++ * 여러 키를 쉼표로 구분해 등록하면 라운드로빈 + 레이트리밋(429/503)
++ * 자동 우회를 지원한다(원본 플러그인의 다중 키 전략과 동일).
++ */
++
++import { kvGetJson, kvSetJson } from './store.js';
++
++const GEMINI_MODEL = 'gemini-2.5-flash';
++const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
++
++export class AiWriterError extends Error {
++  constructor(message, status = 502) {
++    super(message);
++    this.status = status;
++  }
++}
++
++// ── API 키 로테이션 ────────────────────────────────────────────────────
++function parseApiKeys(env) {
++  const raw = (env.GEMINI_API_KEY || '').trim();
++  if (!raw) return [];
++  return raw.split(',').map((s) => s.trim()).filter(Boolean);
++}
++
++const KEY_INDEX_KV_PREFIX = 'aiwriter:keyidx:';
++
++async function getNextApiKey(env, keys, excluded) {
++  const available = keys.filter((k) => !excluded.includes(k));
++  if (available.length === 0) return null;
++
++  // 라운드로빈 인덱스를 KV에 저장(원본 플러그인의 transient와 동일한 역할).
++  // 키 목록 자체를 해시해 인덱스 키를 만들어, 키 목록이 바뀌면 자동으로
++  // 새 로테이션이 시작되게 한다.
++  const idxKey = KEY_INDEX_KV_PREFIX + (await simpleHash(keys.join(',')));
++  const stored = await kvGetJson(env, idxKey);
++  const idx = (typeof stored === 'number' ? stored : 0) % available.length;
++  await kvSetJson(env, idxKey, (idx + 1) % available.length, 3600);
++  return available[idx];
++}
++
++async function simpleHash(str) {
++  const data = new TextEncoder().encode(str);
++  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
++  return Array.from(new Uint8Array(hashBuffer)).slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('');
++}
++
++// ── Gemini API 호출 (재시도 + 키 로테이션 + 지수 백오프) ────────────────
++export async function callGeminiApi(env, body, { timeoutMs = 130_000, model = GEMINI_MODEL } = {}) {
++  const keys = parseApiKeys(env);
++  if (keys.length === 0) {
++    throw new AiWriterError('Gemini API 키가 설정되지 않았습니다. wrangler secret put GEMINI_API_KEY 로 등록하세요.', 500);
++  }
++
++  const excluded = [];
++  const maxTry = Math.min(keys.length * 2, 6);
++
++  for (let attempt = 0; attempt < maxTry; attempt++) {
++    let apiKey = await getNextApiKey(env, keys, excluded);
++    if (!apiKey) {
++      // 모든 키가 일시 제한 → 잠시 대기 후 초기화
++      await sleep(3000);
++      excluded.length = 0;
++      apiKey = keys[0];
++    }
++
++    const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${apiKey}`;
++
++    let res;
++    try {
++      const controller = new AbortController();
++      const timer = setTimeout(() => controller.abort(), timeoutMs);
++      res = await fetch(url, {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify(body),
++        signal: controller.signal,
++      });
++      clearTimeout(timer);
++    } catch (err) {
++      if (attempt < maxTry - 1) { await sleep(1500); continue; }
++      throw new AiWriterError(`API 요청 실패: ${err.message}`, 502);
++    }
++
++    if (res.status === 200) {
++      return res.json();
++    }
++
++    if (res.status === 429 || res.status === 503) {
++      excluded.push(apiKey);
++      const wait = Math.min(2 ** attempt, 16) * 1000;
++      await sleep(wait);
++      continue;
++    }
++
++    const data = await res.json().catch(() => null);
++    const message = data?.error?.message || `HTTP ${res.status}`;
++    throw new AiWriterError(`Gemini API 오류: ${message}`, 502);
++  }
++
++  throw new AiWriterError('API 요청이 여러 번 실패했습니다. 잠시 후 다시 시도해주세요.', 502);
++}
++
++function sleep(ms) {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++export function extractText(data) {
++  const parts = data?.candidates?.[0]?.content?.parts;
++  if (!parts) throw new AiWriterError('API 응답에 텍스트가 없습니다.', 502);
++  const texts = parts.map((p) => p.text).filter(Boolean);
++  if (texts.length === 0) throw new AiWriterError('API 응답에 텍스트가 없습니다.', 502);
++  return texts.join('\n\n');
++}
++
++// ── 후처리: 마크다운/H4 정리 ────────────────────────────────────────────
++function cleanupHtml(raw) {
++  let text = raw;
++  text = text.replace(/```[\s\S]*?```/gi, '');
++  text = text.replace(/\*\*(.+?)\*\*/gsu, '<strong>$1</strong>');
++  text = text.replace(/\*(.+?)\*/gsu, '$1');
++  text = text.replace(/\*/g, '');
++  // H4 완전 제거: h4 → h3로 상향 변환 (콘텐츠 손실 없이)
++  text = text.replace(/<h4([^>]*)>/gi, '<h3$1>');
++  text = text.replace(/<\/h4>/gi, '</h3>');
++  return text;
++}
++
++function stripSeoComments(html) {
++  let text = html.replace(/<!--\s*(TITLE|META_DESC|SLUG|FOCUS_KEYWORD):[\s\S]*?-->\s*/gi, '');
++  text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>\s*/gi, '');
++  text = text.replace(/\n{3,}/g, '\n\n');
++  return text.trim();
++}
++
++function extractMetaInfo(content) {
++  const info = { metaDesc: '', slug: '', focusKeyword: '' };
++  const descMatch = content.match(/<!--\s*META_DESC:\s*(.+?)\s*-->/);
++  if (descMatch) info.metaDesc = descMatch[1].trim();
++  const slugMatch = content.match(/<!--\s*SLUG:\s*(.+?)\s*-->/);
++  if (slugMatch) info.slug = slugMatch[1].trim();
++  const kwMatch = content.match(/<!--\s*FOCUS_KEYWORD:\s*(.+?)\s*-->/);
++  if (kwMatch) info.focusKeyword = kwMatch[1].trim();
++  return info;
++}
++
++function ensureFirstParagraph(html, metaDesc, topic) {
++  const trimmed = html.trim();
++  if (!trimmed) return trimmed;
++  const firstTagMatch = trimmed.match(/^\s*<(\w+)[^>]*>/i);
++  if (!firstTagMatch) return trimmed;
++  const tag = firstTagMatch[1].toLowerCase();
++  if (tag === 'p') return trimmed;
++  if (['h1', 'h2', 'h3', 'h5', 'h6'].includes(tag)) {
++    const year = new Date().getFullYear();
++    const p = metaDesc
++      ? `<p>${escapeHtml(metaDesc)}</p>`
++      : topic
++        ? `<p>${escapeHtml(`${year}년 ${topic}에 대한 핵심 정보를 완벽하게 정리했습니다.`)}</p>`
++        : '<p>이 글에서 핵심 정보를 안내합니다.</p>';
++    return `${p}\n${trimmed}`;
++  }
++  return trimmed;
++}
++
++function escapeHtml(str) {
++  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
++}
++
++// ── 허용 태그(참고용 — 실제 sanitize는 응답을 그대로 신뢰하지 않고
++//    posts.astro/PostEditor가 최종 저장 전에 사람이 검수하는 것을
++//    전제로 한다. 완전 자동 발행 파이프라인에 연결할 경우 이 목록
++//    기준의 화이트리스트 sanitizer를 추가해야 한다.) ──────────────────
++export const ALLOWED_TAGS_TABLE = [
++  'h2', 'h3', 'p', 'ul', 'ol', 'li', 'strong', 'b', 'em', 'i', 'u', 'br',
++  'a', 'img', 'figure', 'figcaption', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
++  'div', 'span',
++];
++export const ALLOWED_TAGS_NO_TABLE = ALLOWED_TAGS_TABLE.filter((t) => !['table', 'thead', 'tbody', 'tr', 'th', 'td'].includes(t));
++
++// ── 프롬프트 빌더 (원본 플러그인의 4개 글 유형별 가이드 완전 이식) ──────
++const POST_TYPES = ['informational', 'utility', 'policy_guide', 'review_comparison'];
++
++const INTROS = [
++  '도입부A: 독자가 지금 막 겪는 구체적 상황을 2문장으로 묘사하고 즉시 핵심 정보로 전환',
++  '도입부B: 가장 흔한 실수 2가지를 먼저 짚고 올바른 방법으로 자연 전환',
++  '도입부C: 핵심 수치(금액/기간/비율)를 첫 문장에 배치 — 역피라미드 결론 먼저',
++  '도입부D: 이 글에서 다룰 3가지 핵심 포인트를 첫 단락에 명시하는 약속형',
++  '도입부E: 실무 경험자 관점의 1인칭 사례 소개 → E-E-A-T 신뢰 즉시 구축',
++  '도입부F: 독자가 검색창에 치는 질문 그 자체로 시작 → 즉시 답변 제공',
++  '도입부G: 최신 변화·정책 변경 강조 → 신선도 어필로 클릭 유지',
++  '도입부H: 비용 절감·시간 단축·리스크 회피 3가지 실익을 수치와 함께 배치',
++  '도입부I: 흔한 오해를 먼저 지적하고 실제와 대비하는 교정 구조',
++  '도입부J: 자가진단 체크리스트 3항목으로 시작 → 해당되면 이 글이 필요하다는 흐름',
++  '도입부K: 최근 통계·연구 수치로 시작 → 신뢰도와 검색 의도 동시 공략',
++  '도입부L: 성공 사례(구체적 숫자)와 실패 사례를 대조하는 스토리텔링',
++  '도입부M: 비교 대상 2~3가지를 첫 문단에 나열 → 선택 의도 직격',
++  '도입부N: 독자가 얻는 구체적 이득을 약속 형식으로 명시',
++  '도입부O: 시간순 흐름 (예전에는~, 지금은~) → 변화 맥락으로 필요성 설득',
++  '도입부P: 한 줄 요약(TL;DR) 먼저 제시 후 심화 전개',
++  '도입부Q: 독자가 실제로 궁금해하는 생활 밀착형 질문으로 시작',
++  '도입부R: 주변 사람 사례를 들어 공감 확보 후 해결책 제시',
++  '도입부S: 관련 제도·정책의 핵심 변경 사항을 첫 줄에 배치',
++  '도입부T: 이 주제를 모르면 손해 보는 이유를 3줄로 압축해 위기감 조성',
++];
++
++const H2_STYLES = [
++  '소제목 형식: 질문형 ("왜 ~인가?", "어떻게 ~하나?", "~이 중요한 이유?")',
++  '소제목 형식: 숫자 포함형 ("3가지 핵심", "5단계 가이드", "7가지 주의사항")',
++  '소제목 형식: 결과 중심형 ("~하면 달라지는 것", "~의 실제 효과", "~로 해결")',
++  '소제목 형식: 직접 키워드형 ("~의 모든 것", "~를 위한 핵심", "~완벽 정리")',
++];
++
++const TONE_STYLES = [
++  '문장: 단문 위주(20~35자), 명확 빠른 호흡, 정보 전달 최우선',
++  '문장: 중문 위주(35~60자), 이유·근거를 같은 문장에 포함',
++  '문장: 단문·중문 교차, 강조는 단문·설명은 중문, 리듬감',
++  '문장: 구어체 혼합(~입니다/~합니다+~이에요/~거든요), 친근·신뢰감',
++];
++
++const TYPE_GUIDES = {
++  informational: `
++【정보성 — SEO Content Specialist 기준 + 애드센스 수익화 최적화】
++━━ 제목 전략 ━━
++- 연관 키워드 최소 30개를 본문 전체에 자연 분산 배치
++- '|' 절대 금지 / 연도 삽입 절대 금지
++
++━━ 메타 디스크립션 ━━
++- 공백 포함 120~160자, 메인+서브 키워드 필수 포함
++- "~에 대해 알아봅니다" 금지 → 문제 해결 약속형
++
++━━ 본문 구조 (H2/H3만 — H4 완전 금지) ━━
++[본론 H2] FAQ 제외 반드시 3개 이상 (FAQ 포함 총 H2 최소 4개)
++- 각 H2 직후: 섹션 요약 <p> 1개 (1~2문장)
++- 각 H2 내부에 H3 반드시 2~3개
++- H3 직후: <p> 1~3문장 → <ul> (li 최소 3개)
++
++━━ strong / <u> ━━
++- <strong>: 핵심 수치·키워드·결론에 섹션당 2~4개 (단어·구문 단위)
++- <u>: 중요 용어·핵심 개념에 섹션당 1~2개
++
++━━ 표(table) — 정보성 글에서 절대 사용 금지 ━━
++비교·요약은 반드시 <ul>/<ol>로만.
++
++━━ 애드센스 수익화 ━━
++- 고단가 키워드(금융·보험·건강·법률·부동산) 자연 배치 — 본문 3~5회
++- 각 H2가 단일 주제에 집중 → 문맥 매칭 정확도 상승`,
++
++  utility: `
++【유틸리티 — 표 2개 필수 + 애드센스 최적화】
++독자가 이 글 한 편으로 다운로드·설치·발급·신청을 완전히 끝낼 수 있어야 합니다.
++
++━━ 표 2개 필수 (도입부 직후, 본론 H2 전 배치) ━━
++[표1 기본 정보] 카테고리·운영체제·개발사·공식사이트·버전·비용·라이선스
++[표2 사양·조건] CPU·메모리·저장공간 또는 자격조건·필요서류·신청기간·비용
++(두 표 모두 thead+tbody 구조 / <th> 필수)
++
++━━ 본문 구조 (H2/H3만 — H4 완전 금지) ━━
++[본론 H2] FAQ 제외 3개 이상 / 각 H2 내부 H3 2~3개
++- H3 직후: <p> 1~3문장 → <ul> 또는 <ol> (li 최소 3개)
++- 설치·신청 단계는 <ol> 사용
++
++━━ 쉬운 설명 필수 ━━
++전문 용어 사용 즉시 괄호로 쉬운 말 병기.`,
++
++  policy_guide: `
++【정책·공공 — 표 선택사항(최대 2개) + 애드센스 최적화】
++정확한 공공 정보를 신뢰도 높게 전달합니다.
++
++━━ 표 (선택사항, 최대 2개) ━━
++대상/조건/금액/기간 정보가 표가 더 명확할 때만 사용 (thead+tbody, <th> 필수)
++
++━━ 본문 구조 (H2/H3만 — H4 완전 금지) ━━
++[본론 H2] FAQ 제외 3개 이상 / 각 H2 내부 H3 2~3개
++- H3 직후: <p> 1~3문장 (핵심 정보·수치) → <ul> 또는 <ol>
++
++━━ strong / <u> ━━
++- <strong>: 지원 금액·신청 기간·자격 조건 수치에 섹션당 2~4개
++- <u>: 중요 정책 용어·기관명에 섹션당 1~2개
++
++━━ 정확성 ━━
++허위·과장 표현 금지 / 검증 가능한 수치만.`,
++
++  review_comparison: `
++【리뷰·비교 — 구매 전환 극대화 + 애드센스 문맥 매칭】
++━━ 제목 전략 ━━
++- 비교 대상 + 선정 기준 구조 (연도 삽입 절대 금지, '|' 절대 금지)
++- '추천', '비교', '순위', '후기', '가성비' 키워드 포함
++
++━━ 본문 구조 (H2/H3만 — H4 완전 금지) ━━
++[본론 H2] FAQ 제외 3개 이상 / 각 H2 내부 H3 2~3개
++- H3 직후: <p> 1~3문장 (제품 설명·특징·수치) → <ul> (장점·단점·특징)
++
++⚠️ 리뷰에서 표(table) 절대 금지 — 모든 비교는 <ul>/<ol>로만
++
++━━ strong / <u> ━━
++- <strong>: 가격·평점·핵심 기능 수치·최종 추천 제품명에 섹션당 2~4개
++- <u>: 제품명·브랜드명에 섹션당 1~2개
++
++━━ 애드센스 문맥 매칭 ━━
++- 각 H2가 단일 제품 카테고리에 집중 → 쇼핑 광고 매칭 정확도 상승
++- 제품 스펙은 일상 언어로 풀어 설명 (예: '램 16GB = 여러 앱 동시 실행 가능')`,
++};
++
++const FAQ_RULE = `
++━━ FAQ 섹션 필수 (반드시 4~6개 — 전 유형 공통) ━━
++본문 마지막 본론 H2 직후에 반드시 포함.
++독자가 실제로 검색하는 질문 형태로 작성.
++
++⚠️ FAQ H2 태그 필수: <h2> 사용 (h3·h4 사용 금지)
++⚠️ 각 질문은 반드시 <h3> 사용 — 4개 이상 6개 이하
++
++구조 (반드시 이 태그 그대로 사용):
++<h2>자주 묻는 질문</h2>
++<h3>질문 내용? (실제 검색어 형태)</h3>
++<p>2~4문장 답변. 수치·기간·조건 포함.</p>
++(4~6개 반복)
++⚠️ FAQ 답변 <p>에 <ul> 사용 금지 — 답변은 반드시 <p>만`;
++
++/**
++ * 유사문서(중복 콘텐츠) 방지를 위한 시드 기반 다양화 요소를 뽑는다.
++ * 원본 플러그인의 "매 생성마다 완전히 다른 구조" 전략을 그대로 재현.
++ */
++function pickDiversitySeed(topic) {
++  const ts = Date.now();
++  const th = crc32(topic);
++  const micro = Math.floor(performance.now() * 1000) % 997;
++  const randExt = Math.floor(Math.random() * 10000);
++  const seedIdx = Math.abs(ts + th + micro + randExt) % INTROS.length;
++
++  return {
++    uniqueId: `${ts}-${th}-${micro}-${randExt}`,
++    intro: INTROS[seedIdx],
++    h2Style: H2_STYLES[Math.abs(th + micro) % H2_STYLES.length],
++    toneStyle: TONE_STYLES[Math.abs(th * 3 + micro) % TONE_STYLES.length],
++  };
++}
++
++function crc32(str) {
++  // 간단한 CRC32 근사(다양화 시드용이므로 정확한 표준 구현일 필요는 없다).
++  let h = 0;
++  for (let i = 0; i < str.length; i++) {
++    h = (h << 5) - h + str.charCodeAt(i);
++    h |= 0;
++  }
++  return h >>> 0;
++}
++
++function buildPrompt(topic, type) {
++  const now = new Date();
++  const currentDate = `${now.getFullYear()}년 ${now.getMonth() + 1}월 ${now.getDate()}일`;
++
++  const seed = pickDiversitySeed(topic);
++  const guide = TYPE_GUIDES[type] || TYPE_GUIDES.informational;
++
++  return `당신은 SEO Content Specialist입니다. 검색엔진 최적화 + 애드센스 광고 문맥 매칭 + 유사문서·템플릿 0%에 특화된 한국어 블로그 전문 작가입니다. 목표는 검색엔진을 위한 기계적인 글이 아닌, '사용자의 문제를 해결해 주는 글'을 작성하는 것입니다.
++
++오늘 날짜: ${currentDate} / 주제: '${topic}' / 글 유형: ${type}
++
++⚡ 최신 정보 우선: Google Search 결과를 바탕으로 최신 수치·정책·가격을 반영하세요.
++
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++🚫 절대 준수 — 위반 즉시 재작성
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++- 한자 0개 / 별표(*) 0개 / 마크다운 문법 0개
++- 공백 제외 반드시 700자 이상
++- 제목(TITLE)에 '|' 문자 절대 금지
++- 본문 내 <h1>, <h4>, <title> 태그 절대 사용 금지
++- 이미지 URL: 확인 불가한 URL 금지 — img 태그 생략하고 HTML 주석으로만 표기
++- 템플릿식 글쓰기 절대 금지 (매 생성마다 완전히 다른 구조·표현·흐름)
++
++━━ [규칙 1] H2 개수 ━━
++- FAQ H2 포함 총 H2 반드시 4개 이상 / 본론 H2 FAQ 제외 3개 이상
++
++━━ [규칙 2] H3 배치 ━━
++- 모든 본론 H2에 H3 반드시 2~3개 / FAQ 각 질문도 H3 사용
++
++━━ [규칙 3] H3 직후 구조 ━━
++[H3 직후] 반드시 이 순서: ① <p> 1~3문장 → ② <ul>/<ol> (li 최소 3개)
++[H2 직후] <p> 1개 (1~2문장 섹션 요약)
++
++━━ [규칙 4] strong 태그 & 밑줄(<u>) ━━
++- <strong>: 섹션당 2~4개 (단어·구문 단위만) / <u>: 섹션당 1~2개
++- 남용 금지 (전체 텍스트의 10~15% 이내)
++
++━━ [규칙 5] 비자연스러운 어구 완전 금지 ━━
++- 반말 절대 금지 (전체 존댓말)
++- 인공적 마무리: 이상으로~, 지금까지~, 살펴보았습니다 등 금지
++- 구조 안내: 본문에서는~, 다음 섹션에서는~ 등 금지
++
++━━ 기타 공통 규칙 ━━
++- HTML 태그만 출력 (마크다운 코드블록 금지)
++- itemscope·itemtype·itemprop·<script> 본문 삽입 금지
++
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++📋 SEO 메타 정보 (첫 3줄 필수 출력)
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++첫 줄  : <!-- META_DESC: [120~160자 — 메인키워드+서브키워드+문제해결약속형] -->
++둘째 줄: <!-- SLUG: [핵심키워드 하이픈 연결] -->
++셋째 줄: <!-- FOCUS_KEYWORD: [3~5개 쉼표 구분] -->
++주석 3줄 직후 첫 요소 = 반드시 <p> 태그
++⚠️ TITLE 주석 출력 완전 금지 — 제목은 사용자가 직접 작성함
++
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++🔒 유사문서 완전 차단
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++[고유 ID] ${seed.uniqueId} / [도입부] ${seed.intro} / [소제목] ${seed.h2Style} / [문장] ${seed.toneStyle}
++
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++📌 글 유형 전용 가이드 [${type}]
++━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++${guide}
++${FAQ_RULE}
++
++지금 바로 작성하세요! (반드시 700자 이상, H4 금지, FAQ 4~6개 필수, 템플릿 금지, 유사문서 금지)`;
++}
++
++// ── 공백 제외 글자수 계산 ────────────────────────────────────────────────
++function plainCharCount(html) {
++  const stripped = html.replace(/<[^>]+>/g, '');
++  const decoded = stripped
++    .replace(/&nbsp;/g, ' ')
++    .replace(/&amp;/g, '&')
++    .replace(/&lt;/g, '<')
++    .replace(/&gt;/g, '>')
++    .replace(/&quot;/g, '"');
++  const noSpace = decoded.replace(/[\s\u00A0\u3000]+/g, '');
++  return [...noSpace].length; // 유니코드 안전 카운트
++}
++
++// ── 메인 진입점: 블로그 글 생성 ──────────────────────────────────────────
++/**
++ * @param {object} env - Workers 환경 (GEMINI_API_KEY 시크릿 필요)
++ * @param {string} topic - 주제 키워드
++ * @param {string} type - 'informational' | 'utility' | 'policy_guide' | 'review_comparison'
++ * @returns {Promise<{html: string, metaInfo: {metaDesc, slug, focusKeyword}}>}
++ */
++export async function generateBlogContent(env, topic, type = 'informational') {
++  if (!topic || !topic.trim()) {
++    throw new AiWriterError('주제를 입력해주세요.', 400);
++  }
++  if (!POST_TYPES.includes(type)) type = 'informational';
++
++  const prompt = buildPrompt(topic, type);
++  const body = {
++    contents: [{ parts: [{ text: prompt }] }],
++    generationConfig: { temperature: 0.3, topK: 40, topP: 0.9, maxOutputTokens: 8000 },
++    tools: [{ google_search: {} }], // Google Search Grounding: 최신 정보 자동 검색
++  };
++
++  const data = await callGeminiApi(env, body, { timeoutMs: 160_000 });
++  let text = extractText(data);
++
++  const metaInfoRaw = extractMetaInfo(text);
++  text = text.replace(/<!--\s*(TITLE|META_DESC|SLUG|FOCUS_KEYWORD):[\s\S]*?-->\s*/gi, '');
++  text = cleanupHtml(text);
++  let html = stripSeoComments(text);
++  html = ensureFirstParagraph(html, metaInfoRaw.metaDesc, topic);
++
++  // 이어쓰기: 공백 제외 700자 미달 시 최대 2회 추가 생성
++  const targetChars = 700;
++  let charCount = plainCharCount(html);
++
++  for (let i = 0; i < 2 && charCount < targetChars; i++) {
++    const strippedTail = html.replace(/<[^>]+>/g, '');
++    const tail = strippedTail.slice(-500);
++    const remain = targetChars - charCount;
++    const tableNote = ['policy_guide', 'utility'].includes(type)
++      ? '- <table>: 이 유형(policy_guide/utility)에서만 허용 — H3 직후 1~2개만 사용'
++      : '- <table>: 이 유형에서 절대 사용 금지 — 비교·요약은 반드시 <ul>/<ol>로만';
++
++    const continuePrompt = `블로그 글이 공백제외 ${charCount}자입니다. 목표 800자까지 ${remain}자 이상 추가 작성하세요.
++
++━━ 반드시 준수 ━━
++- 허용 태그: h2/h3/p/ul/ol/li/strong/u/img (별표·한자·마크다운 금지)
++- H1·H4 태그 절대 금지 / <title> 태그 절대 금지
++${tableNote}
++- <img>: src는 실제 접근 가능한 URL만 (불확실하면 HTML 주석으로 대체)
++
++━━ 구조 규칙 ━━
++- H2 섹션 1~2개 추가 (FAQ 포함 총 H2 최소 4개 유지)
++- 각 H2 직후 요약 <p> 1개 / 각 H2 안에 H3 2~3개
++- 각 H3 직후 <p> 1~3문장 → <ul>/<ol> (li 최소 3개)
++- 새로운 관점·심화 정보만 추가 (기존 내용 반복 금지)
++
++이전 글 끝부분:
++${tail}
++
++이어서 (HTML만 출력):`;
++
++    let continueData;
++    try {
++      continueData = await callGeminiApi(env, {
++        contents: [{ parts: [{ text: continuePrompt }] }],
++        generationConfig: { temperature: 0.3, maxOutputTokens: 3000 },
++        tools: [{ google_search: {} }],
++      }, { timeoutMs: 120_000 });
++    } catch {
++      break;
++    }
++
++    let continueText;
++    try {
++      continueText = extractText(continueData);
++    } catch {
++      break;
++    }
++
++    continueText = continueText.replace(/<!--[\s\S]*?-->/g, '');
++    continueText = cleanupHtml(continueText);
++    html = `${html}\n${continueText.trim()}`;
++    charCount = plainCharCount(html);
++  }
++
++  // 최종 H4 잔존 방어 처리
++  html = html.replace(/<h4([^>]*)>/gi, '<h3$1>').replace(/<\/h4>/gi, '</h3>');
++
++  return {
++    html,
++    metaInfo: {
++      metaDesc: metaInfoRaw.metaDesc,
++      slug: metaInfoRaw.slug,
++      focusKeyword: metaInfoRaw.focusKeyword,
++    },
++  };
++}
++
++/**
++ * 선택한 문장을 3~4문장으로 인라인 확장한다 (에디터의 "선택 확장" 기능).
++ */
++export async function expandSelectedText(env, { selectedText, fullContent = '', postTitle = '' }) {
++  if (!selectedText || !selectedText.trim()) {
++    throw new AiWriterError('확장할 텍스트를 선택해주세요.', 400);
++  }
++
++  let contextBlock = '';
++  if (postTitle) contextBlock += `글 제목: ${postTitle}\n`;
++  if (fullContent) contextBlock += `전체 글 내용(일부):\n${fullContent.slice(0, 1500)}\n`;
++
++  const prompt = `당신은 한국어 블로그 전문 작가입니다.
++아래 [원본 문장]을 3~4개 문장으로 확장하여 반환하세요.
++
++[전체 글 컨텍스트]
++${contextBlock}
++
++[원본 문장 — 이 문장을 3~4개 문장으로 확장]
++${selectedText}
++
++【핵심 지시사항】
++1. 원본 문장의 핵심 내용과 의미를 반드시 유지하세요.
++2. 원본 문장을 더 구체적이고 상세하게 풀어서 3~4개 문장으로 확장하세요.
++3. 원본 문장의 내용을 첫 문장에 자연스럽게 포함시키세요.
++4. 추가 문장들은 구체적인 수치·예시·이유로 원본 내용을 뒷받침하세요.
++5. 각 문장은 반드시 20~70자 이내로 작성하세요.
++
++⚠️ 절대 금지
++- 원본 문장과 무관한 새로운 주제 도입 금지
++- 새로운 H2/H3 섹션 생성 금지 (인라인 확장만)
++- 마크다운, 별표(*), 한자 금지
++- 마무리·안내 표현('결론적으로', '이상으로' 등) 금지
++- 15자 미만/80자 초과 문장 금지, 500자 초과 금지
++
++✅ 출력 형식
++- 확장된 3~4개 문장만 출력, HTML 태그 완전 금지, 마크다운 완전 금지
++- 줄바꿈 없이 이어지는 하나의 단락, 한국어만 사용
++
++오직 확장된 3~4개 문장만 출력하세요:`;
++
++  const data = await callGeminiApi(env, {
++    contents: [{ parts: [{ text: prompt }] }],
++    generationConfig: { temperature: 0.7, maxOutputTokens: 600 },
++    tools: [{ google_search: {} }],
++  }, { timeoutMs: 60_000 });
++
++  let text = extractText(data);
++  text = text.replace(/```[\s\S]*?```/gi, '');
++  text = text.replace(/\*\*(.+?)\*\*/gsu, '$1');
++  text = text.replace(/\*/g, '');
++  text = text.replace(/<[^>]+>/g, ''); // 순수 텍스트만 반환
++
++  return { text: text.trim() };
++}
+diff --git a/src/bp-admin-router.js b/src/bp-admin-router.js
+index 91bd9600..fd106f9d 100644
+--- a/src/bp-admin-router.js
++++ b/src/bp-admin-router.js
+@@ -26,6 +26,8 @@ import {
+   listPosts, getPost, createPost, updatePost, publishPost, revertPostToDraft, deletePost,
+   BloggerApiError,
+ } from './blogger-api.js';
++import { generateBlogContent, expandSelectedText, AiWriterError } from './ai-writer.js';
++import { generateImagePrompt, renderThumbnailImage, ThumbnailError, STYLE_DIRECTIVES } from './ai-thumbnail.js';
+ 
+ function json(data, status = 200, extraHeaders = {}) {
+   return new Response(JSON.stringify(data), {
+@@ -42,6 +44,21 @@ function isSecureRequest(url) {
+   return url.protocol === 'https:';
+ }
+ 
++/**
++ * Uint8Array를 base64 문자열로 변환한다. String.fromCharCode(...bytes)를
++ * 한 번에 스프레드하면 큰 이미지(수백 KB)에서 호출 스택 한계를 넘을 수
++ * 있으므로, 8KB씩 청크로 나눠 처리한다.
++ */
++function arrayBufferToBase64(bytes) {
++  const CHUNK_SIZE = 8192;
++  let binary = '';
++  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
++    const chunk = bytes.subarray(i, i + CHUNK_SIZE);
++    binary += String.fromCharCode(...chunk);
++  }
++  return btoa(binary);
++}
++
+ // 로그인/부트스트랩처럼 세션이 없어도 되는 API는 화이트리스트로 관리한다.
+ const PUBLIC_API_PATHS = new Set([
+   'auth/login',
+@@ -237,8 +254,79 @@ async function handleAuthenticatedApi(request, url, env, ctx, subPath, method, s
+     return withBloggerApi(async (blogId) => json(await revertPostToDraft(env, blogId, revertMatch[1])));
+   }
+ 
++  // ── AI 글쓰기 (Gemini API) ────────────────────────────────────────
++  if (subPath === 'ai/generate-post' && method === 'POST') {
++    try {
++      const body = await safeJson(request);
++      if (!body || !body.topic) {
++        return json({ ok: false, message: '주제(topic)는 필수입니다.' }, 400);
++      }
++      const result = await generateBlogContent(env, body.topic, body.type || 'informational');
++      return json({ ok: true, ...result });
++    } catch (e) {
++      return handleAiError(e);
++    }
++  }
++
++  if (subPath === 'ai/expand-text' && method === 'POST') {
++    try {
++      const body = await safeJson(request);
++      if (!body || !body.selectedText) {
++        return json({ ok: false, message: '확장할 텍스트(selectedText)는 필수입니다.' }, 400);
++      }
++      const result = await expandSelectedText(env, body);
++      return json({ ok: true, ...result });
++    } catch (e) {
++      return handleAiError(e);
++    }
++  }
++
++  // ── AI 썸네일 생성 ────────────────────────────────────────────────
++  if (subPath === 'ai/thumbnail-styles' && method === 'GET') {
++    const styles = Object.entries(STYLE_DIRECTIVES).map(([key, v]) => ({ key, label: v.label }));
++    return json({ styles });
++  }
++
++  if (subPath === 'ai/thumbnail-prompt' && method === 'POST') {
++    try {
++      const body = await safeJson(request);
++      if (!body || !body.topic) {
++        return json({ ok: false, message: '주제(topic)는 필수입니다.' }, 400);
++      }
++      const result = await generateImagePrompt(env, body.topic, body.style || 'poster');
++      return json({ ok: true, ...result });
++    } catch (e) {
++      return handleAiError(e);
++    }
++  }
++
++  if (subPath === 'ai/thumbnail-render' && method === 'POST') {
++    try {
++      const body = await safeJson(request);
++      if (!body || !body.prompt) {
++        return json({ ok: false, message: '프롬프트(prompt)는 필수입니다.' }, 400);
++      }
++      const { imageBytes, mime } = await renderThumbnailImage(env, body.prompt, body.negPrompt);
++      // 이미지 바이너리 응답은 JSON이 아니므로 별도로 반환한다. base64로
++      // 감싸 JSON에 실으면 페이로드가 33% 커지지만, bp-admin 프론트엔드가
++      // <img src="data:...">로 즉시 미리보기하기엔 이 편이 더 간단하다.
++      const base64 = arrayBufferToBase64(imageBytes);
++      return json({ ok: true, dataUrl: `data:${mime};base64,${base64}` });
++    } catch (e) {
++      return handleAiError(e);
++    }
++  }
++
+   return json({ ok: false, message: 'Not found' }, 404);
+ 
++  // ── 헬퍼: AI 관련 에러를 적절한 HTTP status로 매핑 ──────────────────
++  function handleAiError(e) {
++    if (e instanceof AiWriterError || e instanceof ThumbnailError) {
++      return json({ ok: false, message: e.message }, e.status || 502);
++    }
++    return json({ ok: false, message: String(e?.message || e) }, 500);
++  }
++
+   // ── 헬퍼: blogId 해결 + BloggerApiError를 적절한 HTTP status로 매핑 ──
+   async function withBloggerApi(handler) {
+     return resolveBlogIdAndRun(env, handler);
+diff --git a/wrangler.toml b/wrangler.toml
+index 699515d0..39ce378c 100644
+--- a/wrangler.toml
++++ b/wrangler.toml
+@@ -103,6 +103,19 @@ PANEL_MIN_BOT_SCORE    = "30"
+ #   5. 발급된 클라이언트 ID/보안 비밀번호를 위 secret 명령으로 등록
+ GOOGLE_OAUTH_REDIRECT_PATH = "/bp-admin/api/blogger/oauth/callback"
+ 
++# ─── AI 글쓰기/썸네일 생성 (bp-admin) ───────────────────────────────────
++# 아래 값은 절대 [vars]에 평문으로 두지 말고 반드시 시크릿으로 등록하세요:
++#   wrangler secret put GEMINI_API_KEY
++#
++# 발급 방법: https://aistudio.google.com/app/apikey 에서 무료로 발급.
++# 여러 키를 쉼표로 구분해 등록하면 라운드로빈 로테이션 + 레이트리밋
++# (429/503) 자동 우회를 지원합니다. 예:
++#   wrangler secret put GEMINI_API_KEY
++#   (프롬프트에서) AIzaSy...key1,AIzaSy...key2,AIzaSy...key3
++#
++# 썸네일 이미지 실제 렌더링은 별도 API 키가 필요 없습니다 — 이미 위의
++# [ai] binding = "AI" (Cloudflare Workers AI)를 그대로 사용합니다.
++
+ # Cloudflare API (관리 패널의 "워커/라우트 연동" 기능용 — 토큰은 secret으로 등록)
+ CF_ZONE_ID             = ""           # Zone ID (비밀 아님, 여기 직접 입력 가능)
+ CF_ACCOUNT_ID          = ""           # Account ID (비밀 아님, 여기 직접 입력 가능)
