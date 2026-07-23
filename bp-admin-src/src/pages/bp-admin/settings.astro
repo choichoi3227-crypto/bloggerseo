@@ -1,6 +1,7 @@
 ---
 import AdminLayout from '../../layouts/AdminLayout.astro';
 import GoogleConnectionPanel from '../../components/GoogleConnectionPanel.tsx';
+import CustomCodeSettings from '../../components/CustomCodeSettings.tsx';
 ---
 <AdminLayout title="설정" active="settings">
   <header class="page-head">
@@ -8,11 +9,19 @@ import GoogleConnectionPanel from '../../components/GoogleConnectionPanel.tsx';
     <p>사이트 기본 정보, 도메인, 알림, 계정을 관리합니다.</p>
   </header>
 
-  <GoogleConnectionPanel client:load />
+  <div class="settings-stack">
+    <GoogleConnectionPanel client:load />
+    <CustomCodeSettings client:load />
+  </div>
 
   <style>
     .page-head { margin-bottom: 24px; }
     .page-head h1 { font-size: 26px; margin-bottom: 6px; }
     .page-head p { margin: 0; color: var(--bp-text-mute); font-size: 14px; }
+    .settings-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
   </style>
 </AdminLayout>

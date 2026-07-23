@@ -28,6 +28,8 @@ import {
 } from './blogger-api.js';
 import { generateBlogContent, expandSelectedText, AiWriterError } from './ai-writer.js';
 import { generateImagePrompt, renderThumbnailImage, ThumbnailError, STYLE_DIRECTIVES } from './ai-thumbnail.js';
+import { getCustomCodeConfig, saveCustomCodeConfig } from './custom-code.js';
+import { getShareConfig, saveShareConfig, getScrollPopupConfig, saveScrollPopupConfig } from './page-widgets.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -315,6 +317,36 @@ async function handleAuthenticatedApi(request, url, env, ctx, subPath, method, s
     } catch (e) {
       return handleAiError(e);
     }
+  }
+
+  // ── 커스텀 헤더/바디/푸터 코드 (alpack 헤더/푸터 코드 삽입 이식) ────
+  if (subPath === 'widgets/custom-code' && method === 'GET') {
+    return json(await getCustomCodeConfig(env));
+  }
+  if (subPath === 'widgets/custom-code' && method === 'POST') {
+    const body = await safeJson(request);
+    if (!body) return json({ ok: false, message: '잘못된 요청 본문입니다.' }, 400);
+    return json(await saveCustomCodeConfig(env, body));
+  }
+
+  // ── SNS 공유 버튼 (alpack share.php 이식) ──────────────────────────
+  if (subPath === 'widgets/share' && method === 'GET') {
+    return json(await getShareConfig(env));
+  }
+  if (subPath === 'widgets/share' && method === 'POST') {
+    const body = await safeJson(request);
+    if (!body) return json({ ok: false, message: '잘못된 요청 본문입니다.' }, 400);
+    return json(await saveShareConfig(env, body));
+  }
+
+  // ── 스크롤 트리거 팝업 (alpack scroll.php 이식) ────────────────────
+  if (subPath === 'widgets/scroll-popup' && method === 'GET') {
+    return json(await getScrollPopupConfig(env));
+  }
+  if (subPath === 'widgets/scroll-popup' && method === 'POST') {
+    const body = await safeJson(request);
+    if (!body) return json({ ok: false, message: '잘못된 요청 본문입니다.' }, 400);
+    return json(await saveScrollPopupConfig(env, body));
   }
 
   return json({ ok: false, message: 'Not found' }, 404);

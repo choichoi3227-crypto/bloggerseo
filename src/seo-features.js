@@ -404,7 +404,13 @@ export function injectEncodingHints(headers) {
   return h;
 }
 
-// ── 22. IndexNow 핑 (Bing + Yandex) ─────────────────────────────────────
+// ── 22. IndexNow 핑 (Bing + Yandex + Naver) ─────────────────────────────
+// 네이버 서치어드바이저는 2023-07-25부터 IndexNow 프로토콜을 그대로
+// 지원한다(별도 API 키 불필요 — 동일한 키/keyLocation을 그대로 사용).
+// alpack-2(presslearn) 플러그인의 "오토 인덱싱" 기능이 정확히 이 역할을
+// 했는데, 그쪽은 별도 네이버 전용 API 키(presslearn_indexnow_api_key)를
+// 요구했지만 실제로는 같은 IndexNow 키를 그대로 재사용해도 된다. 여기서는
+// 기존 env.INDEXNOW_KEY 하나로 Bing/Yandex/Naver 3곳에 동시에 핑한다.
 export async function pingIndexNow(url, apiKey, host) {
   if (!apiKey || !host) return { ok: false, reason: 'no-config' };
   const body = {
@@ -414,7 +420,7 @@ export async function pingIndexNow(url, apiKey, host) {
     urlList    : [url],
   };
   try {
-    const [bing, yandex] = await Promise.allSettled([
+    const [bing, yandex, naver] = await Promise.allSettled([
       fetch('https://api.indexnow.org/indexnow', {
         method : 'POST',
         headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -425,11 +431,17 @@ export async function pingIndexNow(url, apiKey, host) {
         headers: { 'content-type': 'application/json; charset=utf-8' },
         body   : JSON.stringify(body),
       }),
+      fetch('https://searchadvisor.naver.com/indexnow', {
+        method : 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body   : JSON.stringify(body),
+      }),
     ]);
     return {
       ok    : true,
       bing  : bing.status === 'fulfilled' ? bing.value.status : null,
       yandex: yandex.status === 'fulfilled' ? yandex.value.status : null,
+      naver : naver.status === 'fulfilled' ? naver.value.status : null,
     };
   } catch (e) {
     return { ok: false, error: e.message };

@@ -1,32 +1,27 @@
 ---
 import AdminLayout from '../../layouts/AdminLayout.astro';
+import ShareButtonSettings from '../../components/ShareButtonSettings.tsx';
+import ScrollPopupSettings from '../../components/ScrollPopupSettings.tsx';
 ---
 <AdminLayout title="광고/공유" active="ads">
   <header class="page-head">
     <h1>광고/공유</h1>
-    <p>애드센스 배치, 공유 버튼(카카오/네이버/트위터), 부정 클릭 방지 설정을 관리합니다.</p>
+    <p>SNS 공유 버튼과 스크롤 유도 팝업을 관리합니다. 부정 클릭 방지는 보안 메뉴에서 관리합니다.</p>
   </header>
 
-  <div class="placeholder">
-    <strong>다음 단계에서 구현됩니다</strong>
-    <span>이 화면의 실제 기능은 다음 작업 단계에서 채워집니다.</span>
+  <div class="widgets-grid">
+    <ShareButtonSettings client:load />
+    <ScrollPopupSettings client:load />
   </div>
 
   <style>
     .page-head { margin-bottom: 24px; }
     .page-head h1 { font-size: 26px; margin-bottom: 6px; }
     .page-head p { margin: 0; color: var(--bp-text-mute); font-size: 14px; }
-    .placeholder {
+    .widgets-grid {
       display: flex;
       flex-direction: column;
-      gap: 6px;
-      padding: 22px 24px;
-      border: 1px dashed var(--bp-border);
-      border-radius: var(--bp-radius-md);
-      color: var(--bp-text-mute);
-      background: var(--bp-surface);
+      gap: 20px;
     }
-    .placeholder strong { color: var(--bp-text); font-size: 14px; }
-    .placeholder span { font-size: 13px; }
   </style>
 </AdminLayout>

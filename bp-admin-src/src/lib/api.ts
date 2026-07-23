@@ -184,3 +184,49 @@ export const aiThumbnailApi = {
   render: (prompt: string, negPrompt?: string) =>
     api.post<ThumbnailRenderResult>('/ai/thumbnail-render', { prompt, negPrompt }),
 };
+
+// ── 커스텀 헤더/바디/푸터 코드 ────────────────────────────────────────
+
+export interface CustomCodeConfig {
+  enabled: boolean;
+  headCode: string;
+  bodyOpenCode: string;
+  beforeClosingBodyCode: string;
+  footerCode: string;
+}
+
+export const customCodeApi = {
+  get: () => api.get<CustomCodeConfig>('/widgets/custom-code'),
+  save: (config: CustomCodeConfig) => api.post<CustomCodeConfig>('/widgets/custom-code', config),
+};
+
+// ── SNS 공유 버튼 ─────────────────────────────────────────────────────
+
+export type ShareNetwork = 'facebook' | 'twitter' | 'kakaotalk' | 'naver' | 'band' | 'line';
+
+export interface ShareConfig {
+  enabled: boolean;
+  networks: ShareNetwork[];
+  kakaoJsKey: string;
+  position: 'top' | 'bottom';
+}
+
+export const shareConfigApi = {
+  get: () => api.get<ShareConfig>('/widgets/share'),
+  save: (config: ShareConfig) => api.post<ShareConfig>('/widgets/share', config),
+};
+
+// ── 스크롤 트리거 팝업 ─────────────────────────────────────────────────
+
+export interface ScrollPopupConfig {
+  enabled: boolean;
+  content: string;
+  scrollPercentage: number;
+  animation: 'fade' | 'slide' | 'zoom';
+  repeatOncePerMonth: boolean;
+}
+
+export const scrollPopupApi = {
+  get: () => api.get<ScrollPopupConfig>('/widgets/scroll-popup'),
+  save: (config: ScrollPopupConfig) => api.post<ScrollPopupConfig>('/widgets/scroll-popup', config),
+};

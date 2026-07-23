@@ -126,6 +126,8 @@ import {
 import { enforceVpnBlock, hasCloudflareBotMfa, handleAdsClick, injectAdSenseClickGuard, shouldHideAds, hideAds, securitySettings, isKnownSearchEngineCrawler } from './src/security.js';
 import { googleIntegrationStatus, runGoogleSync } from './src/google-integrations.js';
 import { detectBunnyCdn, buildCdnCacheControl, buildStaticAssetHeaders } from './src/cdn-detect.js';
+import { getCustomCodeConfig, injectCustomCode } from './src/custom-code.js';
+import { getShareConfig, injectShareButtons, getScrollPopupConfig, injectScrollPopup } from './src/page-widgets.js';
 import { handleBpAdminApi, handleBpAdminStatic } from './src/bp-admin-router.js';
 
 // MyDurableObject: Cloudflare Durable Objects 바인딩에서 이 클래스를 찾으려면
@@ -628,6 +630,31 @@ async function transformHtml(html, ctx, url, env, pRoute, request = null) {
   } else {
     o = safeTransform(o, injectAdSenseClickGuard);
   }
+
+  // 관리자가 /bp-admin/settings에서 등록한 커스텀 헤더/바디/푸터 코드
+  // (GA4, 네이버 웹마스터도구 인증, 광고 스크립트 등)를 삽입한다.
+  try {
+    const customCodeConfig = await getCustomCodeConfig(env);
+    o = safeTransform(o, h => injectCustomCode(h, customCodeConfig));
+  } catch (_) {}
+
+  // SNS 공유 버튼 (글 상세 페이지에만) + 스크롤 트리거 팝업 (전체 페이지)
+  try {
+    const isPostPage = ctx?.type === 'post';
+    const [shareConfig, scrollPopupConfig] = await Promise.all([
+      getShareConfig(env),
+      getScrollPopupConfig(env),
+    ]);
+    if (isPostPage) {
+      o = safeTransform(o, h => injectShareButtons(h, shareConfig, {
+        pageUrl: url.toString(),
+        pageTitle: ctx?.title || '',
+        isPostPage,
+      }));
+    }
+    o = safeTransform(o, h => injectScrollPopup(h, scrollPopupConfig));
+  } catch (_) {}
+
   return o;
 }
 

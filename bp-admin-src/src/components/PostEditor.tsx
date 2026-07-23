@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { bloggerApi, aiWriterApi, ApiError, type PostGenerationType } from '../lib/api';
 import AiThumbnailPanel from './AiThumbnailPanel';
+import QuickButtonInserter from './QuickButtonInserter';
 
 interface Props {
   /** 수정 모드일 때 기존 글 ID. 없으면 새 글 작성 모드. */
@@ -169,6 +170,18 @@ export default function PostEditor({ postId }: Props) {
     setNotice('썸네일이 본문에 삽입되었습니다.');
   }
 
+  function handleInsertButton(buttonHtml: string) {
+    const ta = textareaRef.current;
+    if (ta && document.activeElement === ta) {
+      const before = content.slice(0, ta.selectionStart);
+      const after = content.slice(ta.selectionEnd);
+      setContent(`${before}\n${buttonHtml}\n${after}`);
+    } else {
+      setContent((prev) => `${prev}\n${buttonHtml}`);
+    }
+    setNotice('버튼이 본문에 삽입되었습니다.');
+  }
+
   if (loading) {
     return <div className="editor-skeleton" aria-hidden="true" />;
   }
@@ -217,6 +230,7 @@ export default function PostEditor({ postId }: Props) {
       </div>
 
       <AiThumbnailPanel onInsertImage={handleInsertImage} defaultTopic={aiTopic || title} />
+      <QuickButtonInserter onInsertButton={handleInsertButton} />
 
       <label className="field">
         <span>제목</span>
