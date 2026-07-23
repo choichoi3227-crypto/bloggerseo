@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { bloggerApi, aiWriterApi, ApiError, type PostGenerationType } from '../lib/api';
 import AiThumbnailPanel from './AiThumbnailPanel';
 import QuickButtonInserter from './QuickButtonInserter';
+import RichTextEditor, { type RichTextEditorHandle } from './RichTextEditor';
 
 interface Props {
   /** 수정 모드일 때 기존 글 ID. 없으면 새 글 작성 모드. */
@@ -35,7 +36,7 @@ export default function PostEditor({ postId }: Props) {
 
   // 선택 텍스트 확장
   const [expanding, setExpanding] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<RichTextEditorHandle>(null);
 
   useEffect(() => {
     if (!isEditMode) return;
@@ -73,7 +74,7 @@ export default function PostEditor({ postId }: Props) {
     setAiGenerating(true);
     try {
       const result = await aiWriterApi.generatePost(aiTopic.trim(), aiType);
-      setContent((prev) => (prev.trim() ? `${prev}\n${result.html}` : result.html));
+      editorRef.current?.insertHtml(result.html);
       if (!title.trim()) setTitle(aiTopic.trim());
       if (!labelsInput.trim() && result.metaInfo.focusKeyword) {
         setLabelsInput(result.metaInfo.focusKeyword);
@@ -88,9 +89,7 @@ export default function PostEditor({ postId }: Props) {
   }
 
   async function handleExpandSelection() {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const selectedText = content.slice(ta.selectionStart, ta.selectionEnd);
+    const selectedText = editorRef.current?.getSelectedText() || '';
     if (!selectedText.trim()) {
       setError('먼저 본문에서 확장할 문장을 드래그해 선택해 주세요.');
       return;
@@ -100,12 +99,10 @@ export default function PostEditor({ postId }: Props) {
     try {
       const result = await aiWriterApi.expandText({
         selectedText,
-        fullContent: content,
+        fullContent: editorRef.current?.getPlainText() || '',
         postTitle: title,
       });
-      const before = content.slice(0, ta.selectionStart);
-      const after = content.slice(ta.selectionEnd);
-      setContent(`${before}${result.text}${after}`);
+      editorRef.current?.replaceSelection(result.text);
       setNotice('선택한 문장이 확장되었습니다.');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '텍스트 확장 중 오류가 발생했습니다.');
@@ -159,26 +156,12 @@ export default function PostEditor({ postId }: Props) {
   }
 
   function handleInsertImage(imgTag: string) {
-    const ta = textareaRef.current;
-    if (ta && document.activeElement === ta) {
-      const before = content.slice(0, ta.selectionStart);
-      const after = content.slice(ta.selectionEnd);
-      setContent(`${before}\n${imgTag}\n${after}`);
-    } else {
-      setContent((prev) => `${prev}\n${imgTag}`);
-    }
+    editorRef.current?.insertHtml(imgTag);
     setNotice('썸네일이 본문에 삽입되었습니다.');
   }
 
   function handleInsertButton(buttonHtml: string) {
-    const ta = textareaRef.current;
-    if (ta && document.activeElement === ta) {
-      const before = content.slice(0, ta.selectionStart);
-      const after = content.slice(ta.selectionEnd);
-      setContent(`${before}\n${buttonHtml}\n${after}`);
-    } else {
-      setContent((prev) => `${prev}\n${buttonHtml}`);
-    }
+    editorRef.current?.insertHtml(buttonHtml);
     setNotice('버튼이 본문에 삽입되었습니다.');
   }
 
@@ -253,9 +236,9 @@ export default function PostEditor({ postId }: Props) {
         />
       </label>
 
-      <label className="field">
+      <div className="field">
         <div className="field-label-row">
-          <span>본문 (HTML)</span>
+          <span>본문</span>
           <button
             type="button"
             className="expand-btn"
@@ -265,15 +248,14 @@ export default function PostEditor({ postId }: Props) {
             {expanding ? '확장 중…' : '✨ 선택 문장 AI 확장'}
           </button>
         </div>
-        <textarea
-          ref={textareaRef}
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          placeholder="본문 내용을 입력하세요. HTML 태그를 직접 쓸 수 있습니다."
-          rows={18}
+        <RichTextEditor
+          ref={editorRef}
+          content={content}
+          onChange={setContent}
+          placeholder="본문을 입력하거나, 워드/한글/네이버블로그 등에서 복사한 글을 붙여넣어 보세요. 자동으로 서식이 정리됩니다."
         />
-        <small>문장을 드래그해 선택한 뒤 위 "선택 문장 AI 확장" 버튼을 누르면 3~4문장으로 풀어씁니다. 이미지는 본문 안에 &lt;img src="..."&gt; 형태로 직접 삽입합니다.</small>
-      </label>
+        <small>문장을 드래그해 선택한 뒤 위 "선택 문장 AI 확장" 버튼을 누르면 3~4문장으로 풀어씁니다.</small>
+      </div>
 
       <div className="editor-actions">
         {isEditMode && (
@@ -390,16 +372,14 @@ export default function PostEditor({ postId }: Props) {
           border-radius: var(--bp-radius-sm, 6px);
         }
         .expand-btn:disabled { opacity: 0.6; }
-        .field input, .field textarea {
+        .field input {
           font-size: 14px;
           font-family: inherit;
           padding: 10px 12px;
           border-radius: var(--bp-radius-sm, 6px);
           border: 1px solid var(--bp-border, #E4E3DD);
           color: var(--bp-text, #1B1D23);
-          resize: vertical;
         }
-        .field textarea { font-family: var(--bp-font-mono, monospace); font-size: 13px; line-height: 1.6; }
         .field small { font-weight: 400; color: var(--bp-text-mute, #6B6E7A); }
         .notice {
           margin: 0;

@@ -12,6 +12,15 @@
     "astro": "astro"
   },
   "dependencies": {
+    "@tiptap/extension-color": "^2.11.0",
+    "@tiptap/extension-image": "^2.11.0",
+    "@tiptap/extension-link": "^2.11.0",
+    "@tiptap/extension-placeholder": "^2.11.0",
+    "@tiptap/extension-text-style": "^2.11.0",
+    "@tiptap/extension-underline": "^2.11.0",
+    "@tiptap/pm": "^2.11.0",
+    "@tiptap/react": "^2.11.0",
+    "@tiptap/starter-kit": "^2.11.0",
     "astro": "^7.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
